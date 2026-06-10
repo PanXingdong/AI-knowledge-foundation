@@ -1,0 +1,4 @@
+task_id,group,agent,source_docs,answer_correct,missed_constraints,wrong_claims,citation_correct,token_cost,elapsed_minutes,human_fix_count,context_pack_tokens,retrieved_span_count,useful_span_count,irrelevant_span_count,retrieval_failure,notes
+qnx-task-001,baseline,待填写,待填写,待评分,待评分,待评分,待评分,待填写,待填写,待填写,N/A,N/A,N/A,N/A,N/A,待填写
+qnx-task-001,context_pack,待填写,待填写,待评分,待评分,待评分,待评分,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写
+

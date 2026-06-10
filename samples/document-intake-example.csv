@@ -1,0 +1,4 @@
+candidate_id,slot_type,source_location,document_title,document_version,owner,is_scanned,has_tables,has_multicolumn,confidentiality,allowed_for_experiment,candidate_reason,notes
+doc-example-001,高通平台/BSP/接口约束文档,\\share\project\supplier\qualcomm\bsp_interface_constraints_v2.3.pdf,Qualcomm BSP Interface Constraints,v2.3,张三,no,yes,no,internal,yes,包含接口限制、版本约束、配置要求和异常处理说明。,示例行，请勿当作真实输入
+doc-example-002,博世供应商接口/诊断/通信文档,\\share\project\supplier\bosch\diagnostic_interface_reference_v1.5.pdf,Bosch Diagnostic Interface Reference,v1.5,张三,no,yes,yes,internal,yes,包含诊断接口、通信限制、多栏说明和关键表格。,示例行，请勿当作真实输入
+doc-example-003,内部测试设计/测试报告,\\share\project\internal\interface_constraint_test_review_2026.docx,Interface Constraint Test Review,2026-05,李四,yes,no,no,internal,yes,包含历史测试遗漏和扫描/OCR 风险，用于验证测试关注点生成。,示例行，请勿当作真实输入

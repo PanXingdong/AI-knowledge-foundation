@@ -1,0 +1,41 @@
+{
+  "status": "success",
+  "task_context": {
+    "project": "待填写",
+    "domain": "混合工程文档样本",
+    "task_type": "待填写",
+    "query": "待填写"
+  },
+  "summary": "待填写",
+  "constraints": [
+    {
+      "title": "待填写",
+      "summary": "待填写",
+      "confidence": 0.0,
+      "evidence_ids": ["span_001"]
+    }
+  ],
+  "relevant_sections": [
+    {
+      "document": "待填写",
+      "version": "待填写",
+      "page": 0,
+      "section": "待填写",
+      "reason": "待填写",
+      "evidence_id": "span_001"
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "span_001",
+      "document": "待填写",
+      "version": "待填写",
+      "page": 0,
+      "section": "待填写",
+      "span_id": "待填写",
+      "text": "待填写"
+    }
+  ],
+  "open_questions": [],
+  "token_count": 0
+}

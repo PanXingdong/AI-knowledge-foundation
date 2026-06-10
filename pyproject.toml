@@ -1,0 +1,25 @@
+[project]
+name = "ai-knowledge-foundation"
+version = "0.1.0"
+description = "Engineering document knowledge foundation for traceable Context Packs used by humans and AI agents."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "pydantic",
+  "pypdf",
+  "python-docx",
+]
+
+[project.optional-dependencies]
+ocr = [
+  "pymupdf",
+  "rapidocr",
+  "onnxruntime",
+]
+test = [
+  "pytest",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

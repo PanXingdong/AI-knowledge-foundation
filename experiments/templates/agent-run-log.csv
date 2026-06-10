@@ -1,0 +1,3 @@
+run_id,task_id,group,attempt,agent,model,context_source,source_docs,context_pack_id,prompt_path,started_at,ended_at,token_input,token_output,elapsed_minutes,raw_output_path,scorer,score_status,notes
+run-001,qnx-task-001,baseline,1,待填写,待填写,raw_files,待填写,N/A,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,pending,待填写
+run-001,qnx-task-001,context_pack,1,待填写,待填写,context_pack,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,pending,待填写

@@ -1,0 +1,4 @@
+candidate_id,task_type,domain,real_source,monthly_frequency,task_description,allowed_documents,gold_answer_points,required_constraints,expected_evidence,owner,scorer,needs_evidence,selected,notes
+task-example-001,查约束,混合工程文档样本,接口改动评审中发现供应商限制和内部 SPEC 对齐关系遗漏,4,修改某供应商接口调用逻辑前，需要确认哪些接口限制、版本约束、配置项和测试要求？,doc-example-001;doc-example-003,必须说明供应商接口限制；必须说明版本约束；必须说明配置项；必须提示相关测试点,接口限制；版本约束；配置项；异常处理；测试覆盖,高通接口文档约束章节；内部测试设计验证章节,张三,李四,yes,yes,示例行，请勿当作真实输入
+task-example-002,查接口/机制,混合工程文档样本,诊断接口集成任务中多次不清楚供应商机制限制,3,某模块接入博世诊断接口时，Agent 需要说明使用方式、限制条件和不能忽略的错误处理。,doc-example-002,必须说明接口适用场景；必须列出限制条件；必须说明错误处理和返回码关注点,接口适用范围；限制条件；错误处理；返回码,博世诊断接口文档机制说明章节和限制章节,张三,李四,yes,yes,示例行，请勿当作真实输入
+task-example-003,生成测试关注点,混合工程文档样本,历史测试遗漏导致供应商接口异常场景未覆盖,2,基于供应商接口约束和内部测试复盘，生成测试关注点和必须覆盖的异常场景。,doc-example-001;doc-example-002;doc-example-003,必须包含版本兼容、配置异常、接口调用失败、超时恢复和回归测试点,版本兼容；配置异常；接口失败；超时恢复；回归测试,测试复盘文档测试遗漏章节；供应商接口文档相关章节,李四,王五,yes,yes,示例行，请勿当作真实输入

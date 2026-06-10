@@ -1,0 +1,6 @@
+candidate_id,task_type,domain,real_source,monthly_frequency,task_description,allowed_documents,gold_answer_points,required_constraints,expected_evidence,owner,scorer,needs_evidence,selected,notes
+task-candidate-001,查约束,混合工程文档样本,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待确认,待定,待填写
+task-candidate-002,查接口/机制,混合工程文档样本,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待确认,待定,待填写
+task-candidate-003,生成测试关注点,混合工程文档样本,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待确认,待定,待填写
+task-candidate-004,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待确认,待定,待填写
+task-candidate-005,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待填写,待确认,待定,待填写

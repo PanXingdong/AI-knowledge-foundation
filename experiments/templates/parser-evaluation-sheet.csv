@@ -1,0 +1,5 @@
+document_id,file_path,parser,page_metadata_rate,span_traceability_rate,table_accuracy,reading_order_accuracy,ocr_accuracy,parse_minutes,critical_failures,notes
+sample-001,待填写,Docling,待评分,待评分,待评分,待评分,待评分,待填写,待填写,待填写
+sample-001,待填写,MinerU,待评分,待评分,待评分,待评分,待评分,待填写,待填写,待填写
+sample-001,待填写,Unstructured,待评分,待评分,待评分,待评分,待评分,待填写,待填写,待填写
+

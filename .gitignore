@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local generated data
+data/
+processed/
+outputs/
+artifacts/
+agent-artifacts/
+eval-run/
+experiments/runs/*
+!experiments/runs/README.md
+
+# Confidential or raw documents
+samples/raw/*
+!samples/raw/README.md
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.xls
+*.xlsx
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Local env
+.env
+.env.*
+!.env.example
