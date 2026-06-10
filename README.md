@@ -120,6 +120,7 @@ Start here:
 - [Detailed design](docs/detailed-design.md)
 - [API contract](docs/api-contract.md)
 - [Development](docs/development.md)
+- [Branching strategy](docs/branching-strategy.md)
 - [Evaluation](docs/evaluation.md)
 - [Operations](docs/operations.md)
 

@@ -7,6 +7,7 @@ Read these first:
 - [Detailed design](detailed-design.md)
 - [API contract](api-contract.md)
 - [Development](development.md)
+- [Branching strategy](branching-strategy.md)
 - [Evaluation](evaluation.md)
 - [Operations](operations.md)
 

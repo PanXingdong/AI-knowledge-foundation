@@ -3,8 +3,9 @@
 ## Before You Start
 
 1. Read [docs/README.md](docs/README.md) and [docs/detailed-design.md](docs/detailed-design.md).
-2. Check the current phase boundary before adding new platform features.
-3. Keep generated artifacts and confidential documents out of git.
+2. Read [docs/branching-strategy.md](docs/branching-strategy.md) before opening a PR.
+3. Check the current phase boundary before adding new platform features.
+4. Keep generated artifacts and confidential documents out of git.
 
 ## Development Setup
 
@@ -37,6 +38,8 @@ pip install -r requirements-ocr.txt
 ## Pull Request Checklist
 
 - [ ] Tests pass with `pytest -q`.
+- [ ] The PR targets the correct branch: normal work to `main`, stable promotion to `R2`.
+- [ ] The PR has at least one approval from someone other than the author before merge.
 - [ ] No raw confidential documents are committed.
 - [ ] No generated `data/`, `processed/`, eval output, cache, or pyc files are committed.
 - [ ] README or docs are updated when behavior changes.
