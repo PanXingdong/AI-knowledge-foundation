@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_knowledge_hub.models import CANONICAL_DOCUMENT_SCHEMA_VERSION
 from agent_knowledge_hub.pipeline import ingest_file, ingest_manifest
 from agent_knowledge_hub.parsers import UnsupportedDocumentFormatError
 
@@ -50,6 +51,7 @@ def test_ingest_markdown_builds_canonical_document_and_chunks(tmp_path: Path):
     ]
 
     assert result.status == "processed"
+    assert document["schema_version"] == CANONICAL_DOCUMENT_SCHEMA_VERSION
     assert document["document"]["title"] == "Startup SPEC"
     assert document["document_version"]["version"] == "v1"
     assert document["parse_report"]["source_format"] == "markdown"

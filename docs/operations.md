@@ -69,6 +69,45 @@ python -m agent_knowledge_hub.cli parse-quality-summary `
   --output-dir ".\data\parse-quality-summary"
 ```
 
+Validate Layer1 processed contract:
+
+```powershell
+python -m agent_knowledge_hub.cli validate-processed `
+  --processed-dir ".\data\processed" `
+  --require-valid
+```
+
+Validate the public synthetic golden samples when checking a fresh checkout:
+
+```powershell
+python -m agent_knowledge_hub.cli validate-processed `
+  --processed-dir ".\samples\golden" `
+  --require-valid
+```
+
+Run the full Layer2 acceptance loop:
+
+```powershell
+python -m agent_knowledge_hub.cli layer2-run `
+  --processed-dir ".\data\processed" `
+  --output-dir ".\agent-artifacts\layer2-run" `
+  --query "你的真实问题" `
+  --top-k 8 `
+  --per-document-limit 2 `
+  --require-ready
+```
+
+Expected outputs:
+
+- `layer2-run-summary.json`
+- `layer2-run-summary.md`
+- `contract/processed-contract-validation.json`
+- `indexes/chunks.fts.sqlite`
+- `indexes/chunks.vector.json`
+- `context-pack/context_pack.json`
+- `context-pack/context_pack.md`
+- `evidence-trace.json`
+
 Generate Context Pack:
 
 ```powershell
@@ -85,6 +124,8 @@ Before treating results as useful:
 
 - `pytest -q` passes.
 - Processed documents have `canonical-document.json` and `chunks.jsonl`.
+- `validate-processed --require-valid` passes.
+- `layer2-run --require-ready` passes for at least one real question.
 - Parse quality summary has allowed documents.
 - Context Pack evidence includes source document, version, section or page, and evidence id.
 - Low-quality documents are either excluded or clearly warned.

@@ -1,0 +1,78 @@
+{
+  "blocks": [
+    {
+      "block_id": "blk_demo_1",
+      "block_type": "paragraph",
+      "document_version_id": "docver_demo_v1",
+      "metadata": {},
+      "order": 1,
+      "page_end": 1,
+      "page_start": 1,
+      "section_path": [
+        "1"
+      ],
+      "text": "Important data outbound transfer requires safety assessment."
+    }
+  ],
+  "document": {
+    "created_at": "2026-06-10T00:00:00Z",
+    "document_id": "doc_demo",
+    "owner": "checker",
+    "project": "demo",
+    "source_type": "internal_spec",
+    "supplier": "internal",
+    "title": "Demo SPEC"
+  },
+  "document_version": {
+    "created_at": "2026-06-10T00:00:00Z",
+    "document_id": "doc_demo",
+    "document_version_id": "docver_demo_v1",
+    "file_hash": "sha256_synthetic_demo",
+    "file_path": "samples/golden/demo-spec.md",
+    "version": "v1"
+  },
+  "evidence_spans": [
+    {
+      "bbox": null,
+      "block_id": "blk_demo_1",
+      "document_version_id": "docver_demo_v1",
+      "evidence_id": "span_demo_1",
+      "page": 1,
+      "section_path": [
+        "1"
+      ],
+      "text": "Important data outbound transfer requires safety assessment.",
+      "text_hash": "18c67a919bd8a28bf334fb073a11b82c220627b2b98c2ea383fce5adfc699668"
+    }
+  ],
+  "parse_report": {
+    "block_count": 1,
+    "has_page_numbers": true,
+    "page_count": 1,
+    "parser_name": "manual-golden-sample",
+    "quality_report": {
+      "fallback_parser": null,
+      "fallback_used": false,
+      "reason_codes": [],
+      "score": 100.0,
+      "status": "ok"
+    },
+    "section_count": 1,
+    "source_format": "manual",
+    "table_count": 0,
+    "warnings": []
+  },
+  "schema_version": "layer1.processed.v1",
+  "sections": [
+    {
+      "document_version_id": "docver_demo_v1",
+      "page_end": 1,
+      "page_start": 1,
+      "section_id": "sec_demo_1",
+      "section_path": [
+        "1"
+      ],
+      "title": "Safety Constraint"
+    }
+  ]
+}

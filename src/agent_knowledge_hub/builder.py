@@ -4,6 +4,7 @@ from pathlib import Path
 
 from agent_knowledge_hub.models import (
     Block,
+    CANONICAL_DOCUMENT_SCHEMA_VERSION,
     CanonicalDocument,
     Document,
     DocumentVersion,
@@ -146,6 +147,7 @@ def build_canonical_document(
     )
 
     return CanonicalDocument(
+        schema_version=CANONICAL_DOCUMENT_SCHEMA_VERSION,
         document=document,
         document_version=version,
         sections=sections,

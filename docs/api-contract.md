@@ -24,6 +24,8 @@ powershell -ExecutionPolicy Bypass -File ".\scripts\start-context-pack-api.ps1" 
 | `POST` | `/api/ingest-manifest` | P0 | Ingest documents from a manifest |
 | `POST` | `/api/context-pack` | P0 | Retrieve and assemble a Context Pack |
 | `POST` | `/api/search` | P0 | Retrieve ranked chunks |
+| `POST` | `/api/build-fts-index` | P1 | Build a persistent SQLite FTS5 index |
+| `POST` | `/api/build-vector-index` | P1 | Build a local JSON vector index |
 | `POST` | `/api/gap-report` | P0 | Compare generated Context Pack against a reference pack |
 | `GET` | `/api/evidence/{evidence_id}` | P0 | Trace evidence to source document text |
 | `GET` | `/api/parse-quality-summary` | P0 | Summarize parser quality and Context Pack eligibility |
@@ -37,18 +39,37 @@ Request:
   "processed_dir": "D:/runs/processed",
   "query": "重要数据出境有什么限制？",
   "top_k": 8,
-  "per_document_limit": 2
+  "per_document_limit": 2,
+  "fts_index_path": "D:/runs/index/chunks.db",
+  "vector_index_path": "D:/runs/index/chunks.vector.json",
+  "metadata_filters": {
+    "supplier": ["Bosch"],
+    "project": ["cockpit"],
+    "document_version": ["v7.0"],
+    "source_type": ["supplier spec"]
+  }
 }
 ```
+
+Supported P0 filter keys:
+
+- `supplier`
+- `project`
+- `document_version`
+- `source_type`
 
 Response shape:
 
 ```json
 {
   "data": {
+    "schema_version": "context-pack.v1",
     "query": "...",
     "normalized_query": "...",
     "processed_dir": "...",
+    "applied_filters": {
+      "supplier": ["Bosch"]
+    },
     "chunk_count": 3,
     "document_count": 2,
     "sections": [],
@@ -58,7 +79,32 @@ Response shape:
 }
 ```
 
-Selected chunks include document title, source path, source type, section path, section titles, page range, evidence ids, matched clauses, quality status, quality score, gate reasons, and warnings.
+Selected chunks include document title, document version, supplier, project, source path, source type, section path, section titles, page range, evidence ids, matched clauses, quality status, quality score, gate reasons, and warnings.
+
+Selected chunks also include `retrieval_signals`, which explains which retrieval signals contributed to the selection. Current values can include `lexical`, `bm25`, `fts`, `vector`, `topic`, or `fallback`.
+
+`sections[].items[]` is the stable P0/P1 transition payload for agent consumption. Each item currently includes:
+
+- `evidence_number`
+- `summary`
+- `document_title`
+- `document_version`
+- `supplier`
+- `project`
+- `source_type`
+- `source_path`
+- `section_titles`
+- `section_path`
+- `matched_clauses`
+- `score`
+- `retrieval_signals`
+- `evidence_ids`
+- `quality_status`
+- `quality_score`
+- `allowed_for_context_pack`
+- `quality_gate_reasons`
+- `warnings`
+- `chunk`
 
 ## POST /api/search
 
@@ -71,6 +117,9 @@ Response shape:
   "data": {
     "query": "...",
     "normalized_query": "...",
+    "applied_filters": {
+      "supplier": ["Bosch"]
+    },
     "result_count": 3,
     "document_count": 2,
     "results": []
@@ -79,6 +128,59 @@ Response shape:
 ```
 
 Use this when the caller wants raw retrieval results instead of a full Context Pack.
+
+## POST /api/build-fts-index
+
+Request:
+
+```json
+{
+  "processed_dir": "D:/runs/processed",
+  "index_path": "D:/runs/index/chunks.db"
+}
+```
+
+Response shape:
+
+```json
+{
+  "data": {
+    "processed_dir": "D:/runs/processed",
+    "index_path": "D:/runs/index/chunks.db",
+    "indexed_chunk_count": 128,
+    "indexed_document_count": 12
+  }
+}
+```
+
+This builds a persistent SQLite FTS5 index over processed chunks. `/api/context-pack` and `/api/search` can use that index through `fts_index_path`.
+
+## POST /api/build-vector-index
+
+Request:
+
+```json
+{
+  "processed_dir": "D:/runs/processed",
+  "index_path": "D:/runs/index/chunks.vector.json"
+}
+```
+
+Response shape:
+
+```json
+{
+  "data": {
+    "processed_dir": "D:/runs/processed",
+    "index_path": "D:/runs/index/chunks.vector.json",
+    "indexed_chunk_count": 128,
+    "indexed_document_count": 12,
+    "embedding_strategy": "local-hashed-token-v1"
+  }
+}
+```
+
+This builds a local JSON sparse-vector index over processed chunks. It is a dependency-free retrieval plumbing prototype, not a production semantic embedding model. `/api/context-pack` and `/api/search` can use that index through `vector_index_path`.
 
 ## GET /api/evidence/{evidence_id}
 
@@ -182,3 +284,41 @@ agent-knowledge status
 ```
 
 Current CLI implementation is still under `python -m agent_knowledge_hub.cli`.
+
+Current internal CLI filter shape:
+
+```powershell
+python -m agent_knowledge_hub.cli context-pack `
+  --processed-dir ".\\data\\processed" `
+  --query "诊断模块修改需要注意什么？" `
+  --supplier "Bosch" `
+  --document-version "v7.0" `
+  --project-filter "cockpit" `
+  --source-type "supplier spec"
+```
+
+Current internal CLI FTS shape:
+
+```powershell
+python -m agent_knowledge_hub.cli build-fts-index `
+  --processed-dir ".\\data\\processed" `
+  --index-path ".\\data\\index\\chunks.db"
+
+python -m agent_knowledge_hub.cli context-pack `
+  --processed-dir ".\\data\\processed" `
+  --query "runtime_requir" `
+  --fts-index-path ".\\data\\index\\chunks.db"
+```
+
+Current internal CLI local vector shape:
+
+```powershell
+python -m agent_knowledge_hub.cli build-vector-index `
+  --processed-dir ".\\data\\processed" `
+  --index-path ".\\data\\index\\chunks.vector.json"
+
+python -m agent_knowledge_hub.cli context-pack `
+  --processed-dir ".\\data\\processed" `
+  --query "海外批准要求" `
+  --vector-index-path ".\\data\\index\\chunks.vector.json"
+```

@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Any
 
 
+CANONICAL_DOCUMENT_SCHEMA_VERSION = "layer1.processed.v1"
+
+
 @dataclass(frozen=True)
 class Document:
     document_id: str
@@ -89,6 +92,7 @@ class ParseReport:
 
 @dataclass(frozen=True)
 class CanonicalDocument:
+    schema_version: str
     document: Document
     document_version: DocumentVersion
     sections: list[Section]

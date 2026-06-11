@@ -6,9 +6,11 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from agent_knowledge_hub.dependencies import check_runtime_dependencies
+from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.incremental import ingest_manifest_incremental
 from agent_knowledge_hub.inventory import build_document_inventory
 from agent_knowledge_hub.pipeline import ingest_manifest
+from agent_knowledge_hub.vector_index import build_vector_index
 from agent_knowledge_hub.retrieval import (
     build_context_pack_for_processed_dir,
     compare_context_pack_against_reference,
@@ -23,6 +25,9 @@ class ContextPackRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(8, ge=1, le=100)
     per_document_limit: int = Field(2, ge=1, le=20)
+    metadata_filters: dict[str, list[str]] = Field(default_factory=dict)
+    fts_index_path: str | None = None
+    vector_index_path: str | None = None
 
 
 class GapReportRequest(ContextPackRequest):
@@ -49,6 +54,16 @@ class IngestManifestRequest(BaseModel):
     overlap_chars: int = Field(160, ge=0, le=5000)
     fail_fast: bool = False
     incremental: bool = True
+
+
+class BuildFtsIndexRequest(BaseModel):
+    processed_dir: str = Field(..., min_length=1)
+    index_path: str = Field(..., min_length=1)
+
+
+class BuildVectorIndexRequest(BaseModel):
+    processed_dir: str = Field(..., min_length=1)
+    index_path: str = Field(..., min_length=1)
 
 
 def create_app() -> FastAPI:
@@ -80,6 +95,9 @@ def create_app() -> FastAPI:
                 query=request.query,
                 top_k=request.top_k,
                 per_document_limit=request.per_document_limit,
+                metadata_filters=request.metadata_filters,
+                fts_index_path=request.fts_index_path,
+                vector_index_path=request.vector_index_path,
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -101,6 +119,9 @@ def create_app() -> FastAPI:
                 query=request.query,
                 top_k=request.top_k,
                 per_document_limit=request.per_document_limit,
+                metadata_filters=request.metadata_filters,
+                fts_index_path=request.fts_index_path,
+                vector_index_path=request.vector_index_path,
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -161,6 +182,34 @@ def create_app() -> FastAPI:
 
         return {"data": result.to_dict()}
 
+    @app.post("/api/build-fts-index")
+    def build_fts_index_endpoint(request: BuildFtsIndexRequest) -> dict[str, object]:
+        try:
+            result = build_fts_index(
+                processed_dir=request.processed_dir,
+                index_path=request.index_path,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {"data": result.to_dict()}
+
+    @app.post("/api/build-vector-index")
+    def build_vector_index_endpoint(request: BuildVectorIndexRequest) -> dict[str, object]:
+        try:
+            result = build_vector_index(
+                processed_dir=request.processed_dir,
+                index_path=request.index_path,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {"data": result.to_dict()}
+
     @app.post("/api/gap-report")
     def gap_report(request: GapReportRequest) -> dict[str, object]:
         try:
@@ -169,6 +218,9 @@ def create_app() -> FastAPI:
                 query=request.query,
                 top_k=request.top_k,
                 per_document_limit=request.per_document_limit,
+                metadata_filters=request.metadata_filters,
+                fts_index_path=request.fts_index_path,
+                vector_index_path=request.vector_index_path,
             )
             report = compare_context_pack_against_reference(
                 auto_result=context_pack,

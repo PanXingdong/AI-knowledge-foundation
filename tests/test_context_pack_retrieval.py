@@ -1,12 +1,14 @@
 import json
 from pathlib import Path
 
+from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.pipeline import ingest_file
 from agent_knowledge_hub.retrieval import (
     _normalize_query_text,
     build_context_pack_for_processed_dir,
     trace_evidence_in_processed_dir,
 )
+from agent_knowledge_hub.vector_index import build_vector_index
 
 
 def test_build_context_pack_retrieves_cross_document_constraints(tmp_path: Path):
@@ -99,6 +101,267 @@ def test_build_context_pack_retrieves_cross_document_constraints(tmp_path: Path)
     assert "# Context Pack" in result.markdown
     assert "Query:" in result.markdown
     assert "Source: `安全治理`" in result.markdown
+
+
+def test_context_pack_json_includes_v1_schema_and_applied_filters(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    source = tmp_path / "bosch-diagnostic.md"
+    source.write_text(
+        "\n".join(
+            [
+                "# 诊断约束",
+                "",
+                "诊断模块修改时必须检查 DTC 状态同步。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="Bosch Diagnostic Constraint",
+        source_type="supplier spec",
+        owner="checker",
+        project="cockpit",
+        supplier="Bosch",
+        document_version="v7.0",
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="诊断模块修改需要注意什么？",
+        top_k=3,
+        per_document_limit=2,
+        metadata_filters={
+            "supplier": ["Bosch"],
+            "project": ["cockpit"],
+            "document_version": ["v7.0"],
+            "source_type": ["supplier spec"],
+        },
+    )
+
+    payload = result.to_json_dict()
+
+    assert payload["schema_version"] == "context-pack.v1"
+    assert payload["applied_filters"] == {
+        "supplier": ["Bosch"],
+        "project": ["cockpit"],
+        "document_version": ["v7.0"],
+        "source_type": ["supplier spec"],
+    }
+    item = payload["sections"][0]["items"][0]
+    assert item["document_version"] == "v7.0"
+    assert item["supplier"] == "Bosch"
+    assert item["project"] == "cockpit"
+    assert item["source_type"] == "supplier spec"
+    assert item["chunk"]["document_version"] == "v7.0"
+    assert item["chunk"]["supplier"] == "Bosch"
+    assert item["chunk"]["project"] == "cockpit"
+
+
+def test_build_context_pack_metadata_filters_limit_results_to_matching_documents(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+
+    bosch = tmp_path / "bosch.md"
+    bosch.write_text(
+        "# 诊断\n\n诊断模块修改时必须检查 DTC 状态同步。",
+        encoding="utf-8",
+    )
+    qualcomm = tmp_path / "qualcomm.md"
+    qualcomm.write_text(
+        "# 诊断\n\n诊断模块修改时必须检查 BSP 电源状态同步。",
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=bosch,
+        out_dir=processed_root,
+        title="Bosch Diagnostic Constraint",
+        source_type="supplier spec",
+        owner="checker",
+        project="cockpit",
+        supplier="Bosch",
+        document_version="v7.0",
+    )
+    ingest_file(
+        file_path=qualcomm,
+        out_dir=processed_root,
+        title="Qualcomm Diagnostic Constraint",
+        source_type="supplier spec",
+        owner="checker",
+        project="cockpit",
+        supplier="Qualcomm",
+        document_version="v8.0",
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="诊断模块修改需要注意什么？",
+        top_k=4,
+        per_document_limit=2,
+        metadata_filters={"supplier": ["Bosch"], "document_version": ["v7.0"]},
+    )
+
+    assert result.selected_chunks
+    assert {chunk.document_title for chunk in result.selected_chunks} == {"Bosch Diagnostic Constraint"}
+    assert {chunk.supplier for chunk in result.selected_chunks} == {"Bosch"}
+    assert {chunk.document_version for chunk in result.selected_chunks} == {"v7.0"}
+
+
+def test_build_context_pack_prefers_compact_exact_term_chunk_for_symbol_query(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+
+    short = tmp_path / "short-api.md"
+    short.write_text(
+        "\n".join(
+            [
+                "# API",
+                "",
+                "runtime_requires_approval 表示任务等待人工审批。",
+                "调用方收到该事件后必须暂停执行并等待审批结果。",
+                "该事件只在高风险操作下出现。",
+                "返回后继续执行或终止执行。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    long = tmp_path / "long-runbook.md"
+    long.write_text(
+        "# Runbook\n\n"
+        "本节描述很多通用背景。runtime_requires_approval 表示任务等待人工审批。\n"
+        + "额外背景说明。" * 120
+        + "\n调用方收到该事件后必须暂停执行并等待审批结果。\n",
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=short,
+        out_dir=processed_root,
+        title="Z Short API",
+        source_type="internal api",
+        owner="checker",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=long,
+        out_dir=processed_root,
+        title="A Long Runbook",
+        source_type="internal guide",
+        owner="checker",
+        document_version="v1",
+        max_chunk_chars=2200,
+        overlap_chars=0,
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="runtime_requires_approval",
+        top_k=2,
+        per_document_limit=2,
+    )
+
+    assert result.selected_chunks
+    assert result.selected_chunks[0].document_title == "Z Short API"
+    assert result.selected_chunks[0].score > result.selected_chunks[1].score
+
+
+def test_build_context_pack_uses_fts_index_for_prefix_symbol_query(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "fts" / "chunks.db"
+
+    api = tmp_path / "api.md"
+    api.write_text(
+        "# API\n\nruntime_requires_approval 事件用于审批。\n",
+        encoding="utf-8",
+    )
+    unrelated = tmp_path / "notes.md"
+    unrelated.write_text(
+        "# Notes\n\n运行时相关的通用 requirement 汇总。\n",
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=api,
+        out_dir=processed_root,
+        title="API",
+        source_type="internal api",
+        owner="checker",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=unrelated,
+        out_dir=processed_root,
+        title="A Notes",
+        source_type="internal guide",
+        owner="checker",
+        document_version="v1",
+    )
+
+    build_fts_index(
+        processed_dir=processed_root,
+        index_path=index_path,
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="runtime_requir",
+        top_k=1,
+        per_document_limit=1,
+        fts_index_path=index_path,
+    )
+
+    assert result.selected_chunks
+    assert result.selected_chunks[0].document_title == "API"
+    assert "runtime_requires_approval" in result.selected_chunks[0].text
+    assert "fts" in result.selected_chunks[0].retrieval_signals
+
+
+def test_build_context_pack_uses_vector_index_for_semantic_like_query(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "vector" / "chunks.vector.json"
+
+    safety = tmp_path / "safety.md"
+    safety.write_text(
+        "# 出境限制\n\n车辆重要数据出境传输需要进行安全评估，并记录证据。\n",
+        encoding="utf-8",
+    )
+    diagnostics = tmp_path / "diagnostics.md"
+    diagnostics.write_text(
+        "# 诊断\n\nDTC 状态同步需要覆盖上电、下电和异常恢复场景。\n",
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=safety,
+        out_dir=processed_root,
+        title="Z 出境限制",
+        source_type="internal spec",
+        owner="checker",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=diagnostics,
+        out_dir=processed_root,
+        title="A 诊断",
+        source_type="internal spec",
+        owner="checker",
+        document_version="v1",
+    )
+    build_vector_index(processed_dir=processed_root, index_path=index_path)
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="海外批准要求",
+        top_k=1,
+        per_document_limit=1,
+        vector_index_path=index_path,
+    )
+
+    assert result.selected_chunks
+    assert result.selected_chunks[0].document_title == "Z 出境限制"
+    assert "安全评估" in result.selected_chunks[0].text
+    assert "vector" in result.selected_chunks[0].retrieval_signals
 
 
 def test_build_context_pack_honors_per_document_limit(tmp_path: Path):

@@ -4,8 +4,10 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.pipeline import ingest_file
 from agent_knowledge_hub.service import create_app
+from agent_knowledge_hub.vector_index import build_vector_index
 
 
 def test_context_pack_api_returns_markdown_and_sections(tmp_path: Path):
@@ -109,6 +111,235 @@ def test_search_api_returns_ranked_results(tmp_path: Path):
 
     assert payload["result_count"] >= 1
     assert any("默认不开放无限网络" in item["text"] for item in payload["results"])
+
+
+def test_context_pack_api_applies_metadata_filters(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    bosch = tmp_path / "bosch.md"
+    bosch.write_text(
+        "# 诊断\n\n诊断模块修改时必须检查 DTC 状态同步。",
+        encoding="utf-8",
+    )
+    qualcomm = tmp_path / "qualcomm.md"
+    qualcomm.write_text(
+        "# 诊断\n\n诊断模块修改时必须检查 BSP 电源状态同步。",
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=bosch,
+        out_dir=processed_root,
+        title="Bosch Diagnostic Constraint",
+        source_type="supplier spec",
+        owner="checker",
+        project="cockpit",
+        supplier="Bosch",
+        document_version="v7.0",
+    )
+    ingest_file(
+        file_path=qualcomm,
+        out_dir=processed_root,
+        title="Qualcomm Diagnostic Constraint",
+        source_type="supplier spec",
+        owner="checker",
+        project="cockpit",
+        supplier="Qualcomm",
+        document_version="v8.0",
+    )
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/api/context-pack",
+        json={
+            "processed_dir": str(processed_root),
+            "query": "诊断模块修改需要注意什么？",
+            "top_k": 4,
+            "per_document_limit": 2,
+            "metadata_filters": {
+                "supplier": ["Bosch"],
+                "document_version": ["v7.0"],
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["schema_version"] == "context-pack.v1"
+    assert payload["applied_filters"] == {
+        "supplier": ["Bosch"],
+        "document_version": ["v7.0"],
+    }
+    assert {item["document_title"] for item in payload["selected_chunks"]} == {
+        "Bosch Diagnostic Constraint"
+    }
+
+
+def test_context_pack_api_uses_fts_index_for_prefix_symbol_query(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "fts" / "chunks.db"
+
+    api = tmp_path / "api.md"
+    api.write_text(
+        "# API\n\nruntime_requires_approval 事件用于审批。\n",
+        encoding="utf-8",
+    )
+    generic = tmp_path / "generic.md"
+    generic.write_text(
+        "# A Generic Requirement\n\nruntime requirement guidance for workflows.\n",
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=api,
+        out_dir=processed_root,
+        title="Z API",
+        source_type="internal api",
+        owner="checker",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=generic,
+        out_dir=processed_root,
+        title="A Generic Requirement",
+        source_type="internal guide",
+        owner="checker",
+        document_version="v1",
+    )
+
+    build_fts_index(processed_dir=processed_root, index_path=index_path)
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/api/context-pack",
+        json={
+            "processed_dir": str(processed_root),
+            "query": "runtime_requir",
+            "top_k": 1,
+            "per_document_limit": 1,
+            "fts_index_path": str(index_path),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["selected_chunks"][0]["document_title"] == "Z API"
+
+
+def test_build_fts_index_api_returns_index_summary(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "fts" / "chunks.db"
+    source = tmp_path / "api.md"
+    source.write_text(
+        "# API\n\nruntime_requires_approval 事件用于审批。\n",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="API",
+        source_type="internal api",
+        owner="checker",
+        document_version="v1",
+    )
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/api/build-fts-index",
+        json={
+            "processed_dir": str(processed_root),
+            "index_path": str(index_path),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["indexed_chunk_count"] >= 1
+    assert payload["indexed_document_count"] == 1
+    assert index_path.exists()
+
+
+def test_context_pack_api_uses_vector_index_for_local_similarity_query(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "vector" / "chunks.vector.json"
+
+    safety = tmp_path / "safety.md"
+    safety.write_text(
+        "# 出境限制\n\n车辆重要数据出境传输需要进行安全评估，并记录证据。\n",
+        encoding="utf-8",
+    )
+    diagnostics = tmp_path / "diagnostics.md"
+    diagnostics.write_text(
+        "# 诊断\n\nDTC 状态同步需要覆盖上电、下电和异常恢复场景。\n",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=safety,
+        out_dir=processed_root,
+        title="Z 出境限制",
+        source_type="internal spec",
+        owner="checker",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=diagnostics,
+        out_dir=processed_root,
+        title="A 诊断",
+        source_type="internal spec",
+        owner="checker",
+        document_version="v1",
+    )
+    build_vector_index(processed_dir=processed_root, index_path=index_path)
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/api/context-pack",
+        json={
+            "processed_dir": str(processed_root),
+            "query": "海外批准要求",
+            "top_k": 1,
+            "per_document_limit": 1,
+            "vector_index_path": str(index_path),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["selected_chunks"][0]["document_title"] == "Z 出境限制"
+
+
+def test_build_vector_index_api_returns_index_summary(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "vector" / "chunks.vector.json"
+
+    source = tmp_path / "safety.md"
+    source.write_text(
+        "# 出境限制\n\n车辆重要数据跨境传输需要进行出境安全评估。\n",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="Z 出境限制",
+        source_type="internal spec",
+        owner="checker",
+        document_version="v1",
+    )
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/api/build-vector-index",
+        json={
+            "processed_dir": str(processed_root),
+            "index_path": str(index_path),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["indexed_chunk_count"] >= 1
+    assert payload["indexed_document_count"] == 1
+    assert payload["embedding_strategy"] == "local-hashed-token-v1"
+    assert index_path.exists()
 
 
 def test_gap_report_api_returns_missing_items(tmp_path: Path):
