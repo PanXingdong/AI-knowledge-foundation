@@ -156,7 +156,40 @@ Blocked documents can still be reported and traced, but selected evidence must c
 
 ## Retrieval Design
 
-P0 retrieval is lexical and file-based. It reads `chunks.jsonl`, scores candidates, dedupes overlapping chunks, applies document limits, and preserves evidence metadata.
+Current P0 retrieval is file-based and reads `chunks.jsonl`. It now combines:
+
+- rule-based lexical scoring
+- in-memory BM25 scoring
+- optional SQLite FTS5 persistent index signal
+- optional local JSON vector index signal
+- metadata filtering
+- overlap-aware selection
+- document limits
+- evidence-preserving ranking output
+
+This keeps the implementation lightweight while improving exact-term retrieval quality for symbols, event names, versions, and compact reference chunks.
+
+The current P1 prototype indexes are:
+
+SQLite FTS5:
+
+```text
+processed_dir
+  -> build-fts-index
+  -> chunks.db
+  -> context-pack/search with fts_index_path
+```
+
+Local sparse vector JSON:
+
+```text
+processed_dir
+  -> build-vector-index
+  -> chunks.vector.json
+  -> context-pack/search with vector_index_path
+```
+
+FTS/vector hits can participate in ranking even when the matched chunk is blocked by parse-quality gate, but selected chunks still preserve quality warnings and gate reasons. The current vector index uses `local-hashed-token-v1`; it exists to prove the retrieval plumbing without requiring another local LLM or external embedding service. Production semantic embeddings can replace this module later without changing the Context Pack contract.
 
 P1 retrieval should become hybrid:
 

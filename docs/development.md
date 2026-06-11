@@ -26,6 +26,7 @@ pytest -q
 ```text
 src/agent_knowledge_hub/   Core Python package
 scripts/                   PowerShell wrappers and smoke tests
+schemas/                   Versioned public contracts for processed outputs
 tests/                     pytest tests
 docs/                      GitHub-facing docs and archive
 samples/                   sample manifests and raw sample placeholder
@@ -48,6 +49,7 @@ pyproject.toml             project metadata and pytest config
 | Incremental ingest | `src/agent_knowledge_hub/incremental.py` |
 | Quality gate | `src/agent_knowledge_hub/quality.py` |
 | Retrieval and Context Pack | `src/agent_knowledge_hub/retrieval.py` |
+| Layer2 acceptance runner | `src/agent_knowledge_hub/layer2_run.py` |
 | API | `src/agent_knowledge_hub/service.py` |
 | CLI | `src/agent_knowledge_hub/cli.py` |
 | Eval harness | `src/agent_knowledge_hub/eval_setup.py` |
@@ -100,6 +102,38 @@ python -m agent_knowledge_hub.cli parse-quality-summary `
   --processed-dir ".\data\processed" `
   --output-dir ".\data\parse-quality-summary"
 ```
+
+Layer1 processed contract validation:
+
+```powershell
+python -m agent_knowledge_hub.cli validate-processed `
+  --processed-dir ".\data\processed" `
+  --require-valid
+```
+
+Validate the public synthetic golden samples:
+
+```powershell
+python -m agent_knowledge_hub.cli validate-processed `
+  --processed-dir ".\samples\golden" `
+  --require-valid
+```
+
+Layer2 acceptance run:
+
+```powershell
+python -m agent_knowledge_hub.cli layer2-run `
+  --processed-dir ".\samples\golden" `
+  --output-dir ".\agent-artifacts\layer2-golden-run" `
+  --query "What constraints should the agent use?" `
+  --top-k 6 `
+  --per-document-limit 3 `
+  --require-ready
+```
+
+This command is the local acceptance entry for Layer2. It validates the Layer1
+processed contract, builds FTS and local vector indexes, assembles a Context Pack,
+traces one selected evidence id, and writes `layer2-run-summary.json/md`.
 
 ## Development Rules
 

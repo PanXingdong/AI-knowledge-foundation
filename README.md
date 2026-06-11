@@ -17,12 +17,16 @@ documents
   -> API / CLI / eval harness
 ```
 
-The product direction is:
+For current collaboration, Layer2 starts from Layer1 processed outputs:
 
 ```text
-Knowledge Hub Core
-  -> group bot entry
-  -> local agent entry
+canonical-document.json + chunks.jsonl
+  -> contract validation
+  -> FTS + local vector indexes
+  -> retrieval
+  -> Context Pack
+  -> evidence trace
+  -> group bot / local agent entry
 ```
 
 MCP is not the current product route. Existing MCP code is kept only as historical experimental code.
@@ -35,10 +39,13 @@ The first sample scope is mixed engineering documents (`混合工程文档样本
 - Document ingestion for PDF, DOCX, Markdown, HTML, and TXT.
 - Canonical document model: `Document`, `DocumentVersion`, `Section`, `Block`, `EvidenceSpan`, `Chunk`.
 - Section-aware chunk generation.
+- Layer1 -> Layer2 processed output contract and validator.
 - Parse quality summary and context-pack quality gate.
 - Lexical/rule-based retrieval prototype.
+- SQLite FTS5 index prototype and dependency-free local sparse-vector index prototype.
 - Context Pack generation in Markdown and JSON.
 - Evidence trace by `evidence_id`.
+- `layer2-run` acceptance command for validation, indexing, retrieval, Context Pack, and evidence trace.
 - FastAPI service for core operations.
 - CLI and PowerShell wrappers.
 - Evaluation harness for baseline vs Context Pack comparison.
@@ -47,7 +54,7 @@ The first sample scope is mixed engineering documents (`混合工程文档样本
 
 - Production Feishu / WeCom / DingTalk bot adapter.
 - Productized local agent integration.
-- Production BM25/FTS + vector hybrid retrieval.
+- Production-grade hybrid retrieval and reranking.
 - Stable local knowledge pack schema.
 - Graph augmentation, review console, version invalidation, and impact analysis.
 
@@ -110,6 +117,18 @@ python -m agent_knowledge_hub.cli context-pack `
   --per-document-limit 2
 ```
 
+Run the full Layer2 acceptance loop on processed outputs:
+
+```powershell
+python -m agent_knowledge_hub.cli layer2-run `
+  --processed-dir ".\samples\golden" `
+  --output-dir ".\agent-artifacts\layer2-golden-run" `
+  --query "What constraints should the agent use?" `
+  --top-k 6 `
+  --per-document-limit 3 `
+  --require-ready
+```
+
 ## Documentation
 
 Start here:
@@ -137,5 +156,5 @@ Start here:
 The cleaned project is expected to pass:
 
 ```text
-96 passed, 6 skipped
+128 passed, 6 skipped
 ```

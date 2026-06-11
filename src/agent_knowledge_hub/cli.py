@@ -9,6 +9,10 @@ from agent_knowledge_hub.dependencies import (
     check_runtime_dependencies,
     write_runtime_dependency_report_bundle,
 )
+from agent_knowledge_hub.contract import (
+    validate_processed_dir,
+    write_processed_contract_summary_bundle,
+)
 from agent_knowledge_hub.eval_setup import (
     build_eval_run_status,
     check_eval_business_readiness,
@@ -24,6 +28,9 @@ from agent_knowledge_hub.inventory import (
     build_document_inventory,
     write_document_inventory_bundle,
 )
+from agent_knowledge_hub.fts_index import build_fts_index
+from agent_knowledge_hub.layer2_run import run_layer2_acceptance
+from agent_knowledge_hub.vector_index import build_vector_index
 from agent_knowledge_hub.pipeline import ingest_file, ingest_manifest
 from agent_knowledge_hub.quality import (
     build_parse_quality_summary,
@@ -110,6 +117,9 @@ def main(argv: list[str] | None = None) -> int:
                 query=query,
                 top_k=args.top_k,
                 per_document_limit=args.per_document_limit,
+                metadata_filters=_build_metadata_filters_from_args(args),
+                fts_index_path=args.fts_index_path,
+                vector_index_path=args.vector_index_path,
             )
             if args.output_dir:
                 bundle_paths = write_context_pack_bundle(
@@ -159,6 +169,30 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 _emit_text(summary.markdown)
                 return 0
+        elif args.command == "build-fts-index":
+            summary = build_fts_index(
+                processed_dir=args.processed_dir,
+                index_path=args.index_path,
+            )
+            payload = summary.to_dict()
+        elif args.command == "build-vector-index":
+            summary = build_vector_index(
+                processed_dir=args.processed_dir,
+                index_path=args.index_path,
+            )
+            payload = summary.to_dict()
+        elif args.command == "layer2-run":
+            summary = run_layer2_acceptance(
+                processed_dir=args.processed_dir,
+                output_dir=args.output_dir,
+                query=_resolve_query_text(args.query, args.query_file),
+                top_k=args.top_k,
+                per_document_limit=args.per_document_limit,
+            )
+            payload = summary.to_dict()
+            if args.require_ready and not summary.is_ready:
+                _emit_json(payload)
+                return 1
         elif args.command == "prepare-eval-run":
             summary = prepare_eval_run(
                 eval_cases_path=args.eval_cases,
@@ -253,6 +287,29 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 _emit_text(report.markdown)
                 return 0
+        elif args.command == "validate-processed":
+            summary = validate_processed_dir(args.processed_dir)
+            if args.output_dir:
+                bundle_paths = write_processed_contract_summary_bundle(
+                    output_dir=args.output_dir,
+                    summary=summary,
+                )
+                payload = {
+                    **summary.to_dict(),
+                    **{key: str(value) for key, value in bundle_paths.items()},
+                }
+            elif args.json:
+                payload = summary.to_dict()
+            else:
+                _emit_text(summary.markdown)
+                if args.require_valid and not summary.is_valid:
+                    _emit_validation_errors(summary.errors)
+                    return 1
+                return 0
+            if args.require_valid and not summary.is_valid:
+                _emit_validation_errors(summary.errors)
+                _emit_json(payload)
+                return 1
         else:  # pragma: no cover - argparse prevents this branch
             parser.error(f"Unknown command: {args.command}")
             return 2
@@ -321,6 +378,12 @@ def _build_parser() -> argparse.ArgumentParser:
     query_group.add_argument("--query-file", type=Path)
     context_pack_parser.add_argument("--top-k", type=int, default=8)
     context_pack_parser.add_argument("--per-document-limit", type=int, default=2)
+    context_pack_parser.add_argument("--source-type", action="append")
+    context_pack_parser.add_argument("--project-filter", action="append")
+    context_pack_parser.add_argument("--supplier", action="append")
+    context_pack_parser.add_argument("--document-version", action="append")
+    context_pack_parser.add_argument("--fts-index-path", type=Path)
+    context_pack_parser.add_argument("--vector-index-path", type=Path)
     context_pack_parser.add_argument("--output-dir", type=Path)
     context_pack_parser.add_argument("--output-path", type=Path)
 
@@ -338,6 +401,37 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     quality_parser.add_argument("--processed-dir", required=True, type=Path)
     quality_parser.add_argument("--output-dir", type=Path)
+
+    fts_parser = subparsers.add_parser(
+        "build-fts-index",
+        help="Build a persistent SQLite FTS5 index from processed chunks.",
+    )
+    fts_parser.add_argument("--processed-dir", required=True, type=Path)
+    fts_parser.add_argument("--index-path", required=True, type=Path)
+
+    vector_parser = subparsers.add_parser(
+        "build-vector-index",
+        help="Build a local JSON vector index from processed chunks.",
+    )
+    vector_parser.add_argument("--processed-dir", required=True, type=Path)
+    vector_parser.add_argument("--index-path", required=True, type=Path)
+
+    layer2_parser = subparsers.add_parser(
+        "layer2-run",
+        help="Run the full Layer2 acceptance loop over Layer1 processed outputs.",
+    )
+    layer2_parser.add_argument("--processed-dir", required=True, type=Path)
+    layer2_parser.add_argument("--output-dir", required=True, type=Path)
+    layer2_query_group = layer2_parser.add_mutually_exclusive_group(required=True)
+    layer2_query_group.add_argument("--query")
+    layer2_query_group.add_argument("--query-file", type=Path)
+    layer2_parser.add_argument("--top-k", type=int, default=8)
+    layer2_parser.add_argument("--per-document-limit", type=int, default=2)
+    layer2_parser.add_argument(
+        "--require-ready",
+        action="store_true",
+        help="Return non-zero when validation, retrieval, or evidence trace is not ready.",
+    )
 
     eval_parser = subparsers.add_parser(
         "prepare-eval-run",
@@ -462,6 +556,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     dependency_parser.add_argument("--output-dir", type=Path)
 
+    contract_parser = subparsers.add_parser(
+        "validate-processed",
+        help="Validate processed Layer1 outputs against the Layer1 -> Layer2 contract.",
+    )
+    contract_parser.add_argument("--processed-dir", required=True, type=Path)
+    contract_parser.add_argument("--output-dir", type=Path)
+    contract_parser.add_argument("--json", action="store_true")
+    contract_parser.add_argument(
+        "--require-valid",
+        action="store_true",
+        help="Return a non-zero exit code when contract errors are found.",
+    )
+
     return parser
 
 
@@ -495,6 +602,28 @@ def _emit_json(payload: dict[str, object]) -> None:
     except UnicodeEncodeError:
         fallback = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True)
         sys.stdout.write(fallback + "\n")
+
+
+def _emit_validation_errors(errors: list[dict[str, object]]) -> None:
+    for error in errors:
+        print(
+            f"VALIDATION ERROR [{error.get('code')}]: {error.get('message')} "
+            f"({error.get('path')})",
+            file=sys.stderr,
+        )
+
+
+def _build_metadata_filters_from_args(args: argparse.Namespace) -> dict[str, list[str]]:
+    filters: dict[str, list[str]] = {}
+    if getattr(args, "source_type", None):
+        filters["source_type"] = list(args.source_type)
+    if getattr(args, "project_filter", None):
+        filters["project"] = list(args.project_filter)
+    if getattr(args, "supplier", None):
+        filters["supplier"] = list(args.supplier)
+    if getattr(args, "document_version", None):
+        filters["document_version"] = list(args.document_version)
+    return filters
 
 
 if __name__ == "__main__":

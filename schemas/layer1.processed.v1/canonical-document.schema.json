@@ -1,0 +1,308 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://panxingdong.github.io/AI-knowledge-foundation/schemas/layer1.processed.v1/canonical-document.schema.json",
+  "title": "Layer1 Processed Canonical Document",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "document",
+    "document_version",
+    "sections",
+    "blocks",
+    "evidence_spans",
+    "parse_report"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "layer1.processed.v1"
+    },
+    "document": {
+      "$ref": "#/$defs/document"
+    },
+    "document_version": {
+      "$ref": "#/$defs/document_version"
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/section"
+      }
+    },
+    "blocks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/block"
+      }
+    },
+    "evidence_spans": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence_span"
+      }
+    },
+    "parse_report": {
+      "$ref": "#/$defs/parse_report"
+    }
+  },
+  "$defs": {
+    "document": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "document_id",
+        "title",
+        "source_type",
+        "owner",
+        "project",
+        "supplier",
+        "created_at"
+      ],
+      "properties": {
+        "document_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "source_type": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "supplier": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        }
+      }
+    },
+    "document_version": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "document_version_id",
+        "document_id",
+        "version",
+        "file_path",
+        "file_hash",
+        "created_at"
+      ],
+      "properties": {
+        "document_version_id": {
+          "type": "string"
+        },
+        "document_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "file_path": {
+          "type": "string"
+        },
+        "file_hash": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        }
+      }
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "section_id",
+        "document_version_id",
+        "section_path",
+        "title",
+        "page_start",
+        "page_end"
+      ],
+      "properties": {
+        "section_id": {
+          "type": "string"
+        },
+        "document_version_id": {
+          "type": "string"
+        },
+        "section_path": {
+          "$ref": "#/$defs/section_path"
+        },
+        "title": {
+          "type": "string"
+        },
+        "page_start": {
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "page_end": {
+          "$ref": "#/$defs/nullable_integer"
+        }
+      }
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "block_id",
+        "document_version_id",
+        "block_type",
+        "text",
+        "page_start",
+        "page_end",
+        "section_path",
+        "order",
+        "metadata"
+      ],
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "document_version_id": {
+          "type": "string"
+        },
+        "block_type": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "page_start": {
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "page_end": {
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "section_path": {
+          "$ref": "#/$defs/section_path"
+        },
+        "order": {
+          "type": "integer"
+        },
+        "metadata": {
+          "type": "object"
+        }
+      }
+    },
+    "evidence_span": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "evidence_id",
+        "document_version_id",
+        "page",
+        "section_path",
+        "block_id",
+        "bbox",
+        "text",
+        "text_hash"
+      ],
+      "properties": {
+        "evidence_id": {
+          "type": "string"
+        },
+        "document_version_id": {
+          "type": "string"
+        },
+        "page": {
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "section_path": {
+          "$ref": "#/$defs/section_path"
+        },
+        "block_id": {
+          "type": "string"
+        },
+        "bbox": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "text_hash": {
+          "type": "string"
+        }
+      }
+    },
+    "parse_report": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "parser_name",
+        "source_format",
+        "page_count",
+        "section_count",
+        "block_count",
+        "table_count",
+        "has_page_numbers",
+        "warnings",
+        "quality_report"
+      ],
+      "properties": {
+        "parser_name": {
+          "type": "string"
+        },
+        "source_format": {
+          "type": "string"
+        },
+        "page_count": {
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "section_count": {
+          "type": "integer"
+        },
+        "block_count": {
+          "type": "integer"
+        },
+        "table_count": {
+          "type": "integer"
+        },
+        "has_page_numbers": {
+          "type": "boolean"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "quality_report": {
+          "type": "object"
+        }
+      }
+    },
+    "section_path": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nullable_integer": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

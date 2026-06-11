@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
+from agent_knowledge_hub.fts_index import query_fts_index
 from agent_knowledge_hub.utils import normalize_space, stable_id, write_json
+from agent_knowledge_hub.vector_index import query_vector_index
 
 
 ASCII_TOKEN_RE = re.compile(r"[a-z0-9_./=-]+")
@@ -1003,8 +1006,11 @@ TOPIC_SUBFACET_WEIGHTS: dict[str, dict[str, float]] = {
 class RetrievedChunk:
     chunk_id: str
     document_version_id: str
+    document_version: str
     document_title: str
     source_type: str
+    project: str
+    supplier: str
     source_path: str
     section_path: list[str]
     section_titles: list[str]
@@ -1019,6 +1025,7 @@ class RetrievedChunk:
     allowed_for_context_pack: bool
     quality_gate_reasons: list[str]
     warnings: list[str]
+    retrieval_signals: list[str]
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -1026,9 +1033,11 @@ class RetrievedChunk:
 
 @dataclass(frozen=True)
 class ContextPackResult:
+    schema_version: str
     query: str
     normalized_query: str
     processed_dir: Path
+    applied_filters: dict[str, list[str]]
     selected_chunks: list[RetrievedChunk]
     markdown: str
     chunk_count: int
@@ -1037,9 +1046,11 @@ class ContextPackResult:
     def to_json_dict(self) -> dict[str, object]:
         sections = _build_context_pack_section_payloads(self.selected_chunks)
         return {
+            "schema_version": self.schema_version,
             "query": self.query,
             "normalized_query": self.normalized_query,
             "processed_dir": str(self.processed_dir),
+            "applied_filters": {key: list(value) for key, value in self.applied_filters.items()},
             "chunk_count": self.chunk_count,
             "document_count": self.document_count,
             "sections": sections,
@@ -1052,17 +1063,23 @@ class ContextPackResult:
             include_full_chunk=False,
         )
         return {
+            "schema_version": self.schema_version,
             "processed_dir": str(self.processed_dir),
             "query": self.query,
             "normalized_query": self.normalized_query,
+            "applied_filters": {key: list(value) for key, value in self.applied_filters.items()},
             "chunk_count": self.chunk_count,
             "document_count": self.document_count,
             "output_dir": str(output_dir) if output_dir else None,
             "sections": sections,
-                "selected_chunks": [
+            "selected_chunks": [
                 {
                     "chunk_id": chunk.chunk_id,
                     "document_title": chunk.document_title,
+                    "document_version": chunk.document_version,
+                    "project": chunk.project,
+                    "supplier": chunk.supplier,
+                    "source_type": chunk.source_type,
                     "source_path": chunk.source_path,
                     "score": round(chunk.score, 4),
                     "matched_clauses": chunk.matched_clauses,
@@ -1070,6 +1087,7 @@ class ContextPackResult:
                     "quality_status": chunk.quality_status,
                     "allowed_for_context_pack": chunk.allowed_for_context_pack,
                     "warnings": chunk.warnings,
+                    "retrieval_signals": chunk.retrieval_signals,
                 }
                 for chunk in self.selected_chunks
             ],
@@ -1081,6 +1099,7 @@ class SearchResult:
     query: str
     normalized_query: str
     processed_dir: Path
+    applied_filters: dict[str, list[str]]
     results: list[RetrievedChunk]
     result_count: int
     document_count: int
@@ -1090,6 +1109,7 @@ class SearchResult:
             "query": self.query,
             "normalized_query": self.normalized_query,
             "processed_dir": str(self.processed_dir),
+            "applied_filters": {key: list(value) for key, value in self.applied_filters.items()},
             "result_count": self.result_count,
             "document_count": self.document_count,
             "results": [result.to_dict() for result in self.results],
@@ -1169,8 +1189,11 @@ class EvidenceTraceResult:
 class _LoadedChunk:
     chunk_id: str
     document_version_id: str
+    document_version: str
     document_title: str
     source_type: str
+    project: str
+    supplier: str
     source_path: str
     section_path: list[str]
     section_titles: list[str]
@@ -1194,6 +1217,7 @@ class _CandidateScore:
     coherence_bonus: float
     topic_scores: dict[str, float]
     topic_subfacets: dict[str, frozenset[str]]
+    retrieval_signals: frozenset[str]
 
 
 def build_context_pack_for_processed_dir(
@@ -1202,6 +1226,9 @@ def build_context_pack_for_processed_dir(
     query: str,
     top_k: int = 8,
     per_document_limit: int = 2,
+    metadata_filters: dict[str, list[str]] | None = None,
+    fts_index_path: Path | str | None = None,
+    vector_index_path: Path | str | None = None,
 ) -> ContextPackResult:
     processed_root = Path(processed_dir).resolve()
     if top_k <= 0:
@@ -1216,6 +1243,13 @@ def build_context_pack_for_processed_dir(
     loaded_chunks = _load_processed_chunks(processed_root)
     if not loaded_chunks:
         raise ValueError(f"No chunks.jsonl files found under: {processed_root}")
+    normalized_filters = _normalize_metadata_filters(metadata_filters)
+    filtered_chunks = _filter_loaded_chunks(
+        chunks=loaded_chunks,
+        metadata_filters=normalized_filters,
+    )
+    if normalized_filters and not filtered_chunks:
+        raise ValueError("No chunks matched metadata filters.")
 
     normalized_query = _normalize_query_text(query)
     clauses = _split_query_clauses(normalized_query)
@@ -1227,15 +1261,43 @@ def build_context_pack_for_processed_dir(
         clauses=clauses,
         desired_topics=desired_topics,
     )
-    eligible_chunks = [chunk for chunk in loaded_chunks if chunk.allowed_for_context_pack]
+    fts_bonus_by_chunk_id = _load_fts_bonus_by_chunk_id(
+        fts_index_path=fts_index_path,
+        query=normalized_query,
+        limit=max(20, top_k * max(4, per_document_limit)),
+    )
+    vector_bonus_by_chunk_id = _load_vector_bonus_by_chunk_id(
+        vector_index_path=vector_index_path,
+        query=normalized_query,
+        limit=max(20, top_k * max(4, per_document_limit)),
+    )
+    retrieval_chunks = filtered_chunks if normalized_filters else loaded_chunks
+    eligible_chunks = [chunk for chunk in retrieval_chunks if chunk.allowed_for_context_pack]
+    external_bonus_by_chunk_id = {
+        **fts_bonus_by_chunk_id,
+        **{
+            chunk_id: max(vector_bonus, fts_bonus_by_chunk_id.get(chunk_id, 0.0))
+            for chunk_id, vector_bonus in vector_bonus_by_chunk_id.items()
+        },
+    }
+    if external_bonus_by_chunk_id:
+        eligible_chunk_ids = {chunk.chunk_id for chunk in eligible_chunks}
+        external_gate_bypass_chunks = [
+            chunk
+            for chunk in retrieval_chunks
+            if chunk.chunk_id in external_bonus_by_chunk_id and chunk.chunk_id not in eligible_chunk_ids
+        ]
+        eligible_chunks.extend(external_gate_bypass_chunks)
     if not eligible_chunks:
-        eligible_chunks = loaded_chunks
+        eligible_chunks = retrieval_chunks
     scored_chunks = _build_candidate_scores(
         chunks=eligible_chunks,
         query_tokens=query_tokens,
         clause_tokens=clause_tokens,
         desired_topics=desired_topics,
         query_text=normalized_query,
+        fts_bonus_by_chunk_id=fts_bonus_by_chunk_id,
+        vector_bonus_by_chunk_id=vector_bonus_by_chunk_id,
     )
     selected = _select_candidates(
         candidates=scored_chunks,
@@ -1251,8 +1313,11 @@ def build_context_pack_for_processed_dir(
         RetrievedChunk(
             chunk_id=candidate.chunk.chunk_id,
             document_version_id=candidate.chunk.document_version_id,
+            document_version=candidate.chunk.document_version,
             document_title=candidate.chunk.document_title,
             source_type=candidate.chunk.source_type,
+            project=candidate.chunk.project,
+            supplier=candidate.chunk.supplier,
             source_path=candidate.chunk.source_path,
             section_path=list(candidate.chunk.section_path),
             section_titles=list(candidate.chunk.section_titles),
@@ -1267,14 +1332,17 @@ def build_context_pack_for_processed_dir(
             allowed_for_context_pack=candidate.chunk.allowed_for_context_pack,
             quality_gate_reasons=list(candidate.chunk.quality_gate_reasons),
             warnings=list(candidate.chunk.warnings),
+            retrieval_signals=sorted(candidate.retrieval_signals),
         )
         for candidate in selected
     ]
     markdown = _render_context_pack_markdown(query=normalized_query, chunks=selected_chunks)
     return ContextPackResult(
+        schema_version="context-pack.v1",
         query=query,
         normalized_query=normalized_query,
         processed_dir=processed_root,
+        applied_filters=normalized_filters,
         selected_chunks=selected_chunks,
         markdown=markdown,
         chunk_count=len(selected_chunks),
@@ -1288,17 +1356,24 @@ def search_processed_dir(
     query: str,
     top_k: int = 8,
     per_document_limit: int = 2,
+    metadata_filters: dict[str, list[str]] | None = None,
+    fts_index_path: Path | str | None = None,
+    vector_index_path: Path | str | None = None,
 ) -> SearchResult:
     context_pack = build_context_pack_for_processed_dir(
         processed_dir=processed_dir,
         query=query,
         top_k=top_k,
         per_document_limit=per_document_limit,
+        metadata_filters=metadata_filters,
+        fts_index_path=fts_index_path,
+        vector_index_path=vector_index_path,
     )
     return SearchResult(
         query=context_pack.query,
         normalized_query=context_pack.normalized_query,
         processed_dir=context_pack.processed_dir,
+        applied_filters=dict(context_pack.applied_filters),
         results=list(context_pack.selected_chunks),
         result_count=len(context_pack.selected_chunks),
         document_count=context_pack.document_count,
@@ -1386,8 +1461,11 @@ def load_context_pack_result(path: Path | str) -> ContextPackResult:
         RetrievedChunk(
             chunk_id=item["chunk_id"],
             document_version_id=item["document_version_id"],
+            document_version=str(item.get("document_version") or "unknown"),
             document_title=item["document_title"],
             source_type=item["source_type"],
+            project=str(item.get("project") or "unknown"),
+            supplier=str(item.get("supplier") or "unknown"),
             source_path=item["source_path"],
             section_path=list(item.get("section_path") or []),
             section_titles=list(item.get("section_titles") or []),
@@ -1402,6 +1480,7 @@ def load_context_pack_result(path: Path | str) -> ContextPackResult:
             allowed_for_context_pack=bool(item.get("allowed_for_context_pack", True)),
             quality_gate_reasons=list(item.get("quality_gate_reasons") or []),
             warnings=list(item.get("warnings") or []),
+            retrieval_signals=list(item.get("retrieval_signals") or ["fallback"]),
         )
         for item in payload.get("selected_chunks") or []
     ]
@@ -1410,9 +1489,14 @@ def load_context_pack_result(path: Path | str) -> ContextPackResult:
         chunks=selected_chunks,
     )
     return ContextPackResult(
+        schema_version=str(payload.get("schema_version") or "context-pack.v1"),
         query=payload.get("query") or "",
         normalized_query=payload.get("normalized_query") or payload.get("query") or "",
         processed_dir=Path(payload.get("processed_dir") or json_path.parent),
+        applied_filters={
+            str(key): [str(item) for item in (values or [])]
+            for key, values in (payload.get("applied_filters") or {}).items()
+        },
         selected_chunks=selected_chunks,
         markdown=markdown,
         chunk_count=int(payload.get("chunk_count") or len(selected_chunks)),
@@ -1503,14 +1587,20 @@ def _load_processed_chunks(processed_dir: Path) -> list[_LoadedChunk]:
     chunks: list[_LoadedChunk] = []
     for chunks_path, document_payload in _iter_latest_processed_versions(processed_dir):
         document_chunks: list[_LoadedChunk] = []
+        document_info = document_payload.get("document", {}) if document_payload else {}
+        document_version_info = document_payload.get("document_version", {}) if document_payload else {}
         document_title = (
-            document_payload.get("document", {}).get("title") if document_payload else None
+            document_info.get("title") if document_payload else None
         )
         source_path = (
-            document_payload.get("document_version", {}).get("file_path")
+            document_version_info.get("file_path")
             if document_payload
             else None
         )
+        source_type = normalize_space(str(document_info.get("source_type") or "unknown"))
+        project = normalize_space(str(document_info.get("project") or "unknown"))
+        supplier = normalize_space(str(document_info.get("supplier") or "unknown"))
+        document_version = normalize_space(str(document_version_info.get("version") or "unknown"))
         section_titles_by_path = _build_section_title_map(document_payload)
         quality_status, quality_score, allowed_for_context_pack, quality_gate_reasons = (
             _extract_document_quality_gate(document_payload)
@@ -1526,8 +1616,11 @@ def _load_processed_chunks(processed_dir: Path) -> list[_LoadedChunk]:
                 _LoadedChunk(
                     chunk_id=payload["chunk_id"],
                     document_version_id=payload["document_version_id"],
+                    document_version=document_version,
                     document_title=metadata.get("document_title") or document_title or "unknown",
-                    source_type=metadata.get("source_type") or "unknown",
+                    source_type=metadata.get("source_type") or source_type or "unknown",
+                    project=project,
+                    supplier=supplier,
                     source_path=source_path or "",
                     section_path=section_path,
                     section_titles=_derive_section_titles(
@@ -1620,8 +1713,11 @@ def _build_neighbor_merged_chunks(document_chunks: list[_LoadedChunk]) -> list[_
                 _LoadedChunk(
                     chunk_id=chunk_id,
                     document_version_id=window[0].document_version_id,
+                    document_version=window[0].document_version,
                     document_title=window[0].document_title,
                     source_type=window[0].source_type,
+                    project=window[0].project,
+                    supplier=window[0].supplier,
                     source_path=window[0].source_path,
                     section_path=common_path,
                     section_titles=section_titles,
@@ -1693,6 +1789,114 @@ def _min_optional_int(values: Iterable[int | None]) -> int | None:
 def _max_optional_int(values: Iterable[int | None]) -> int | None:
     present = [value for value in values if value is not None]
     return max(present) if present else None
+
+
+SUPPORTED_METADATA_FILTERS = frozenset({"source_type", "project", "supplier", "document_version"})
+
+
+def _normalize_metadata_filters(
+    metadata_filters: dict[str, list[str]] | None,
+) -> dict[str, list[str]]:
+    if not metadata_filters:
+        return {}
+
+    normalized: dict[str, list[str]] = {}
+    for raw_key, raw_values in metadata_filters.items():
+        key = normalize_space(str(raw_key))
+        if not key:
+            continue
+        if key not in SUPPORTED_METADATA_FILTERS:
+            raise ValueError(f"Unsupported metadata filter: {key}")
+        values = [
+            normalize_space(str(item))
+            for item in (raw_values or [])
+            if normalize_space(str(item))
+        ]
+        if values:
+            normalized[key] = list(dict.fromkeys(values))
+    return normalized
+
+
+def _filter_loaded_chunks(
+    *,
+    chunks: list[_LoadedChunk],
+    metadata_filters: dict[str, list[str]],
+) -> list[_LoadedChunk]:
+    if not metadata_filters:
+        return list(chunks)
+
+    normalized_filters = {
+        key: {normalize_space(value).lower() for value in values}
+        for key, values in metadata_filters.items()
+    }
+    filtered: list[_LoadedChunk] = []
+    for chunk in chunks:
+        if _chunk_matches_metadata_filters(chunk=chunk, metadata_filters=normalized_filters):
+            filtered.append(chunk)
+    return filtered
+
+
+def _load_fts_bonus_by_chunk_id(
+    *,
+    fts_index_path: Path | str | None,
+    query: str,
+    limit: int,
+) -> dict[str, float]:
+    if fts_index_path is None:
+        return {}
+
+    hits = query_fts_index(
+        index_path=fts_index_path,
+        query=query,
+        limit=limit,
+    )
+    bonuses: dict[str, float] = {}
+    for rank, hit in enumerate(hits, start=1):
+        bonuses[hit.chunk_id] = max(bonuses.get(hit.chunk_id, 0.0), 72.0 / (rank * rank))
+    return bonuses
+
+
+def _load_vector_bonus_by_chunk_id(
+    *,
+    vector_index_path: Path | str | None,
+    query: str,
+    limit: int,
+) -> dict[str, float]:
+    if vector_index_path is None:
+        return {}
+
+    hits = query_vector_index(
+        index_path=vector_index_path,
+        query=query,
+        limit=limit,
+    )
+    bonuses: dict[str, float] = {}
+    for rank, hit in enumerate(hits, start=1):
+        rank_bonus = 54.0 / (rank * rank)
+        similarity_bonus = hit.similarity_score * 32.0
+        bonuses[hit.chunk_id] = max(
+            bonuses.get(hit.chunk_id, 0.0),
+            rank_bonus + similarity_bonus,
+        )
+    return bonuses
+
+
+def _chunk_matches_metadata_filters(
+    *,
+    chunk: _LoadedChunk,
+    metadata_filters: dict[str, set[str]],
+) -> bool:
+    field_map = {
+        "source_type": chunk.source_type,
+        "project": chunk.project,
+        "supplier": chunk.supplier,
+        "document_version": chunk.document_version,
+    }
+    for key, accepted_values in metadata_filters.items():
+        candidate = normalize_space(str(field_map.get(key) or "")).lower()
+        if candidate not in accepted_values:
+            return False
+    return True
 
 
 def _iter_latest_processed_versions(processed_dir: Path) -> list[tuple[Path, dict]]:
@@ -1825,9 +2029,15 @@ def _build_candidate_scores(
     clause_tokens: list[Counter[str]],
     desired_topics: list[str],
     query_text: str,
+    fts_bonus_by_chunk_id: dict[str, float] | None = None,
+    vector_bonus_by_chunk_id: dict[str, float] | None = None,
 ) -> list[_CandidateScore]:
+    chunk_list = list(chunks)
+    bm25_context = _build_bm25_context(chunk_list)
+    resolved_fts_bonus = fts_bonus_by_chunk_id or {}
+    resolved_vector_bonus = vector_bonus_by_chunk_id or {}
     candidates: list[_CandidateScore] = []
-    for chunk in chunks:
+    for chunk in chunk_list:
         topic_scores = _compute_topic_scores(
             document_title=chunk.document_title,
             section_titles=chunk.section_titles,
@@ -1844,12 +2054,31 @@ def _build_candidate_scores(
             section_titles=chunk.section_titles,
             query_tokens=query_tokens,
         )
+        bm25_score = _score_bm25(
+            chunk=chunk,
+            query_tokens=query_tokens,
+            bm25_context=bm25_context,
+        )
+        fts_bonus = resolved_fts_bonus.get(chunk.chunk_id, 0.0)
+        vector_bonus = resolved_vector_bonus.get(chunk.chunk_id, 0.0)
+        retrieval_signals = _derive_retrieval_signals(
+            lexical_score=overall_score,
+            bm25_score=bm25_score,
+            fts_bonus=fts_bonus,
+            vector_bonus=vector_bonus,
+            topic_scores=topic_scores,
+        )
         per_clause_scores = tuple(
             _score_tokens(
                 chunk_text=chunk.text,
                 document_title=chunk.document_title,
                 section_titles=chunk.section_titles,
                 query_tokens=one_clause_tokens,
+            )
+            + _score_bm25(
+                chunk=chunk,
+                query_tokens=one_clause_tokens,
+                bm25_context=bm25_context,
             )
             for one_clause_tokens in clause_tokens
         )
@@ -1880,6 +2109,9 @@ def _build_candidate_scores(
                 chunk=chunk,
                 overall_score=(
                     overall_score
+                    + bm25_score
+                    + fts_bonus
+                    + vector_bonus
                     + coherence_bonus
                     + structure_bonus
                     + evidence_quality_adjustment
@@ -1893,6 +2125,7 @@ def _build_candidate_scores(
                 coherence_bonus=coherence_bonus,
                 topic_scores=topic_scores,
                 topic_subfacets=topic_subfacets,
+                retrieval_signals=frozenset(retrieval_signals),
             )
         )
     candidates.sort(
@@ -1905,6 +2138,98 @@ def _build_candidate_scores(
         )
     )
     return candidates
+
+
+def _derive_retrieval_signals(
+    *,
+    lexical_score: float,
+    bm25_score: float,
+    fts_bonus: float,
+    vector_bonus: float,
+    topic_scores: dict[str, float],
+) -> list[str]:
+    signals: list[str] = []
+    if lexical_score > 0.0:
+        signals.append("lexical")
+    if bm25_score > 0.0:
+        signals.append("bm25")
+    if fts_bonus > 0.0:
+        signals.append("fts")
+    if vector_bonus > 0.0:
+        signals.append("vector")
+    if any(score > 0.0 for score in topic_scores.values()):
+        signals.append("topic")
+    return signals or ["fallback"]
+
+
+@dataclass(frozen=True)
+class _Bm25Context:
+    average_document_length: float
+    document_frequencies: dict[str, int]
+    token_counts_by_chunk_id: dict[str, Counter[str]]
+    total_documents: int
+
+
+def _build_bm25_context(chunks: list[_LoadedChunk]) -> _Bm25Context:
+    token_counts_by_chunk_id: dict[str, Counter[str]] = {}
+    document_frequencies: Counter[str] = Counter()
+    total_length = 0
+
+    for chunk in chunks:
+        token_counts = _tokenize_bm25_document(chunk)
+        token_counts_by_chunk_id[chunk.chunk_id] = token_counts
+        total_length += sum(token_counts.values())
+        for token in token_counts:
+            document_frequencies[token] += 1
+
+    total_documents = len(chunks)
+    average_document_length = total_length / total_documents if total_documents else 0.0
+    return _Bm25Context(
+        average_document_length=average_document_length,
+        document_frequencies=dict(document_frequencies),
+        token_counts_by_chunk_id=token_counts_by_chunk_id,
+        total_documents=total_documents,
+    )
+
+
+def _tokenize_bm25_document(chunk: _LoadedChunk) -> Counter[str]:
+    title_text = normalize_space(chunk.document_title).lower()
+    section_text = normalize_space("\n".join(chunk.section_titles)).lower()
+    chunk_text = normalize_space(chunk.text).lower()
+    return _tokenize_for_search(f"{title_text}\n{section_text}\n{chunk_text}")
+
+
+def _score_bm25(
+    *,
+    chunk: _LoadedChunk,
+    query_tokens: Counter[str],
+    bm25_context: _Bm25Context,
+) -> float:
+    if not query_tokens or bm25_context.total_documents == 0:
+        return 0.0
+
+    token_counts = bm25_context.token_counts_by_chunk_id.get(chunk.chunk_id)
+    if not token_counts:
+        return 0.0
+
+    document_length = sum(token_counts.values())
+    if document_length <= 0:
+        return 0.0
+
+    average_length = bm25_context.average_document_length or float(document_length)
+    k1 = 1.2
+    b = 0.75
+    score = 0.0
+    for term, query_count in query_tokens.items():
+        term_frequency = token_counts.get(term, 0)
+        if term_frequency <= 0:
+            continue
+        document_frequency = bm25_context.document_frequencies.get(term, 0)
+        idf = math.log(1.0 + (bm25_context.total_documents - document_frequency + 0.5) / (document_frequency + 0.5))
+        numerator = term_frequency * (k1 + 1.0)
+        denominator = term_frequency + k1 * (1.0 - b + b * (document_length / average_length))
+        score += idf * (numerator / denominator) * query_count * _term_weight(term)
+    return score
 
 
 def _select_candidates(
@@ -2583,6 +2908,9 @@ def _tokenize_for_search(text: str) -> Counter[str]:
 
 
 def _derive_query_topics(query: str, clauses: list[str]) -> list[str]:
+    if _looks_like_symbol_lookup_query(query):
+        return []
+
     topic_hits: dict[str, float] = defaultdict(float)
     combined_texts = [query, *clauses]
     for text in combined_texts:
@@ -2596,6 +2924,27 @@ def _derive_query_topics(query: str, clauses: list[str]) -> list[str]:
         if topic_hits.get(topic, 0.0) > 0
     ]
     return prioritized_topics
+
+
+def _looks_like_symbol_lookup_query(query: str) -> bool:
+    normalized = normalize_space(query).lower()
+    if not normalized:
+        return False
+    ascii_tokens = ASCII_TOKEN_RE.findall(normalized)
+    cjk_sequences = CJK_SEQUENCE_RE.findall(normalized)
+    if not ascii_tokens:
+        return False
+    if cjk_sequences:
+        return False
+    if len(ascii_tokens) > 3:
+        return False
+    return any(
+        "_" in token
+        or "/" in token
+        or "." in token
+        or len(token) >= 8
+        for token in ascii_tokens
+    )
 
 
 def _derive_requested_topic_subfacets(
@@ -3318,11 +3667,16 @@ def _build_context_pack_section_payloads(
                 "evidence_number": evidence_number,
                 "summary": _summarize_chunk(chunk),
                 "document_title": chunk.document_title,
+                "document_version": chunk.document_version,
+                "project": chunk.project,
+                "supplier": chunk.supplier,
+                "source_type": chunk.source_type,
                 "source_path": chunk.source_path,
                 "section_titles": list(chunk.section_titles),
                 "section_path": list(chunk.section_path),
                 "matched_clauses": list(chunk.matched_clauses),
                 "score": round(chunk.score, 4),
+                "retrieval_signals": list(chunk.retrieval_signals),
                 "evidence_ids": list(chunk.evidence_ids),
                 "quality_status": chunk.quality_status,
                 "quality_score": chunk.quality_score,
@@ -3446,6 +3800,8 @@ def _render_evidence_block(*, chunk: RetrievedChunk, evidence_number: int) -> li
         f"Score: `{chunk.score:.2f}`",
         f"Quality: `{chunk.quality_status}`",
     ]
+    if chunk.retrieval_signals:
+        lines.append(f"Retrieval Signals: `{', '.join(chunk.retrieval_signals)}`")
     if chunk.quality_score is not None:
         lines.append(f"Quality Score: `{chunk.quality_score:.2f}`")
     if not chunk.allowed_for_context_pack or chunk.quality_gate_reasons:

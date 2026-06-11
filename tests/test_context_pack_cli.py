@@ -3,7 +3,9 @@ import json
 import csv
 
 from agent_knowledge_hub.cli import main
+from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.pipeline import ingest_file
+from agent_knowledge_hub.vector_index import build_vector_index
 
 
 def test_context_pack_cli_writes_markdown_json_and_summary(tmp_path: Path):
@@ -177,6 +179,227 @@ def test_context_pack_cli_accepts_query_file_with_utf8_bom(tmp_path: Path):
     assert "\ufeff" not in context_pack
     assert "\ufeff" not in summary
     assert "GET /runtime-runs/{run_id}/events" in context_pack
+
+
+def test_context_pack_cli_accepts_metadata_filters(tmp_path: Path, capsys):
+    processed_root = tmp_path / "processed"
+    bosch = tmp_path / "bosch.md"
+    bosch.write_text(
+        "# 诊断\n\n诊断模块修改时必须检查 DTC 状态同步。",
+        encoding="utf-8",
+    )
+    qualcomm = tmp_path / "qualcomm.md"
+    qualcomm.write_text(
+        "# 诊断\n\n诊断模块修改时必须检查 BSP 电源状态同步。",
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=bosch,
+        out_dir=processed_root,
+        title="Bosch Diagnostic Constraint",
+        source_type="supplier spec",
+        owner="checker",
+        project="cockpit",
+        supplier="Bosch",
+        document_version="v7.0",
+    )
+    ingest_file(
+        file_path=qualcomm,
+        out_dir=processed_root,
+        title="Qualcomm Diagnostic Constraint",
+        source_type="supplier spec",
+        owner="checker",
+        project="cockpit",
+        supplier="Qualcomm",
+        document_version="v8.0",
+    )
+
+    exit_code = main(
+        [
+            "context-pack",
+            "--processed-dir",
+            str(processed_root),
+            "--query",
+            "诊断模块修改需要注意什么？",
+            "--supplier",
+            "Bosch",
+            "--document-version",
+            "v7.0",
+        ]
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr().out
+    assert "Bosch Diagnostic Constraint" in captured
+    assert "Qualcomm Diagnostic Constraint" not in captured
+
+
+def test_context_pack_cli_uses_fts_index_for_prefix_symbol_query(tmp_path: Path, capsys):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "fts" / "chunks.db"
+
+    api = tmp_path / "api.md"
+    api.write_text(
+        "# API\n\nruntime_requires_approval 事件用于审批。\n",
+        encoding="utf-8",
+    )
+    generic = tmp_path / "generic.md"
+    generic.write_text(
+        "# A Generic Requirement\n\nruntime requirement guidance for workflows.\n",
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=api,
+        out_dir=processed_root,
+        title="Z API",
+        source_type="internal api",
+        owner="checker",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=generic,
+        out_dir=processed_root,
+        title="A Generic Requirement",
+        source_type="internal guide",
+        owner="checker",
+        document_version="v1",
+    )
+
+    build_fts_index(processed_dir=processed_root, index_path=index_path)
+
+    exit_code = main(
+        [
+            "context-pack",
+            "--processed-dir",
+            str(processed_root),
+            "--query",
+            "runtime_requir",
+            "--fts-index-path",
+            str(index_path),
+        ]
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr().out
+    assert "Z API" in captured
+
+
+def test_build_fts_index_cli_writes_sqlite_index(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "fts" / "chunks.db"
+
+    source = tmp_path / "api.md"
+    source.write_text(
+        "# API\n\nruntime_requires_approval 事件用于审批。\n",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="API",
+        source_type="internal api",
+        owner="checker",
+        document_version="v1",
+    )
+
+    exit_code = main(
+        [
+            "build-fts-index",
+            "--processed-dir",
+            str(processed_root),
+            "--index-path",
+            str(index_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert index_path.exists()
+    assert index_path.with_suffix(".summary.json").exists()
+
+
+def test_context_pack_cli_uses_vector_index_for_local_similarity_query(tmp_path: Path, capsys):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "vector" / "chunks.vector.json"
+
+    safety = tmp_path / "safety.md"
+    safety.write_text(
+        "# 出境限制\n\n车辆重要数据出境传输需要进行安全评估，并记录证据。\n",
+        encoding="utf-8",
+    )
+    diagnostics = tmp_path / "diagnostics.md"
+    diagnostics.write_text(
+        "# 诊断\n\nDTC 状态同步需要覆盖上电、下电和异常恢复场景。\n",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=safety,
+        out_dir=processed_root,
+        title="Z 出境限制",
+        source_type="internal spec",
+        owner="checker",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=diagnostics,
+        out_dir=processed_root,
+        title="A 诊断",
+        source_type="internal spec",
+        owner="checker",
+        document_version="v1",
+    )
+    build_vector_index(processed_dir=processed_root, index_path=index_path)
+
+    exit_code = main(
+        [
+            "context-pack",
+            "--processed-dir",
+            str(processed_root),
+            "--query",
+            "海外批准要求",
+            "--vector-index-path",
+            str(index_path),
+        ]
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr().out
+    assert "Z 出境限制" in captured
+    assert "安全评估" in captured
+
+
+def test_build_vector_index_cli_writes_local_vector_index(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "vector" / "chunks.vector.json"
+
+    source = tmp_path / "safety.md"
+    source.write_text(
+        "# 出境限制\n\n车辆重要数据跨境传输需要进行出境安全评估。\n",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="Z 出境限制",
+        source_type="internal spec",
+        owner="checker",
+        document_version="v1",
+    )
+
+    exit_code = main(
+        [
+            "build-vector-index",
+            "--processed-dir",
+            str(processed_root),
+            "--index-path",
+            str(index_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert index_path.exists()
+    assert index_path.with_suffix(".summary.json").exists()
 
 
 def test_inventory_cli_writes_inventory_and_sample_manifest(tmp_path: Path):
