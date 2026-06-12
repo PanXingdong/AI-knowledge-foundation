@@ -44,13 +44,20 @@ def _find_section_path_for_page(
     sorted_entries: list[tuple[int, list[str]]],
     page: int | None,
 ) -> list[str]:
-    """Return the deepest section_path that starts at or before the given page."""
+    """Return the section_path whose bookmark starts at or before the given page.
+
+    When multiple bookmarks share the same page, the first one in outline order
+    is used — positional disambiguation within a page requires bbox data.
+    """
     if not sorted_entries or page is None:
         return ["0"]
     path: list[str] = ["0"]
     for entry_page, entry_path in sorted_entries:
-        if entry_page <= page:
+        if entry_page < page:
             path = entry_path
+        elif entry_page == page:
+            if path == ["0"]:
+                path = entry_path  # same-page: take first bookmark in outline order
         else:
             break
     return path
@@ -128,11 +135,11 @@ def build_canonical_document(
         seen_keys: set[str] = {"0"}
         total_pages = parsed.page_count or 0
         for i, (page_start, path) in enumerate(pdf_sorted_entries):
-            page_end = (
-                pdf_sorted_entries[i + 1][0] - 1
-                if i + 1 < len(pdf_sorted_entries)
-                else total_pages
-            )
+            if i + 1 < len(pdf_sorted_entries):
+                next_page = pdf_sorted_entries[i + 1][0]
+                page_end = max(page_start, next_page - 1)  # guard: never below page_start
+            else:
+                page_end = total_pages
             section_key = "\x00".join(path)
             if section_key not in seen_keys:
                 seen_keys.add(section_key)
