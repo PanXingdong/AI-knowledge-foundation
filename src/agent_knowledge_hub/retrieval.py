@@ -2974,17 +2974,17 @@ def _query_asks_outbound_method(normalized_query: str) -> bool:
 
 
 def _quality_gate_adjustment(chunk: _LoadedChunk) -> float:
+    status = chunk.quality_status
+    if status in {"unsupported", "ocr_unavailable"}:
+        return -80.0
     if not chunk.allowed_for_context_pack:
         return -56.0
-    status = chunk.quality_status
     if status == "ok":
         return 0.0
     if status == "recovered_by_fallback":
         return -4.0
     if status == "low_quality":
         return -42.0
-    if status in {"unsupported", "ocr_unavailable"}:
-        return -80.0
     return -24.0
 
 
