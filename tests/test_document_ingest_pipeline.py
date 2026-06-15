@@ -6,7 +6,7 @@ import pytest
 
 from agent_knowledge_hub.models import CANONICAL_DOCUMENT_SCHEMA_VERSION
 from agent_knowledge_hub.pipeline import ingest_file, ingest_manifest
-from agent_knowledge_hub.parsers import UnsupportedDocumentFormatError
+from agent_knowledge_hub.parsers import UnsupportedDocumentFormatError, _build_pdf_text_layer_blocks
 
 
 def read_json(path: Path):
@@ -97,6 +97,140 @@ def test_ingest_html_removes_markup_and_preserves_heading_sections(tmp_path: Pat
     assert "Signal Timing" in full_text
     assert "alert" not in full_text
     assert any(section["title"] == "Signal Timing" for section in document["sections"])
+
+
+def test_pdf_text_layer_blocks_detect_qnx_style_headings():
+    blocks = _build_pdf_text_layer_blocks(
+        [
+            "\n".join(
+                [
+                    "Chapter 5",
+                    "Optimizing Screen Startup Times",
+                    "",
+                    "This chapter describes strategies and techniques that you can use.",
+                    "",
+                    "Screen startup optimizations at a glance",
+                    "",
+                    "The more time it takes to boot your base system, the more time Screen needs.",
+                ]
+            )
+        ]
+    )
+
+    headings = [block for block in blocks if block.block_type == "heading"]
+    paragraphs = [block for block in blocks if block.block_type == "paragraph"]
+
+    assert [heading.text for heading in headings] == [
+        "Chapter 5",
+        "Optimizing Screen Startup Times",
+        "Screen startup optimizations at a glance",
+    ]
+    assert [heading.metadata["level"] for heading in headings] == [1, 2, 2]
+    assert all(heading.page_start == 1 for heading in headings)
+    assert any("strategies and techniques" in paragraph.text for paragraph in paragraphs)
+
+
+def test_pdf_text_layer_blocks_split_page_lines_at_inline_headings():
+    blocks = _build_pdf_text_layer_blocks(
+        [
+            "\n".join(
+                [
+                    "Chapter 1",
+                    "About the System Startup Sequence",
+                    "The boot process consists of several tasks, each handled by a specialized component.",
+                    "These tasks are:",
+                    "1. The operating system must load from nonvolatile storage.",
+                    "PLL (phase locked loop)",
+                    "PLL refers to how long it takes for the first instruction to begin executing after power is applied.",
+                    "Startup program",
+                    "The first program in a bootable OS image is a startup program.",
+                    "Copyright © 2024, BlackBerry Limited 9",
+                ]
+            )
+        ]
+    )
+
+    headings = [block.text for block in blocks if block.block_type == "heading"]
+    paragraphs = [block.text for block in blocks if block.block_type == "paragraph"]
+
+    assert headings == [
+        "Chapter 1",
+        "About the System Startup Sequence",
+        "PLL (phase locked loop)",
+        "Startup program",
+    ]
+    assert any("boot process consists" in paragraph for paragraph in paragraphs)
+    assert any("first program in a bootable OS image" in paragraph for paragraph in paragraphs)
+    assert all("Copyright" not in paragraph for paragraph in paragraphs)
+
+
+def test_pdf_text_layer_blocks_do_not_promote_common_pdf_noise_to_headings():
+    blocks = _build_pdf_text_layer_blocks(
+        [
+            "\n".join(
+                [
+                    "Chapter 2",
+                    "Optimizing the Loading and Launching of the OS",
+                    "Optimize the bootloader",
+                    "The bootloader should avoid unnecessary initialization work.",
+                    "2. Optimize the Screen configuration file",
+                    "• image_scan_2()",
+                    "LD_LIBRARY_PATH=:/proc/boot:/lib:/usr/lib:/lib/dll procnto –vvvv",
+                    "# SPI 0",
+                    "Voice: +1 519 888-7465",
+                    "Web: https://www.qnx.com/",
+                    "Copyright © 2024, BlackBerry Limited14",
+                ]
+            )
+        ]
+    )
+
+    headings = [block.text for block in blocks if block.block_type == "heading"]
+    paragraphs = [block.text for block in blocks if block.block_type == "paragraph"]
+
+    assert headings == [
+        "Chapter 2",
+        "Optimizing the Loading and Launching of the OS",
+        "Optimize the bootloader",
+    ]
+    assert any("image_scan_2" in paragraph for paragraph in paragraphs)
+    assert any("Optimize the Screen configuration file" in paragraph for paragraph in paragraphs)
+    assert any("LD_LIBRARY_PATH" in paragraph for paragraph in paragraphs)
+    assert any("# SPI 0" in paragraph for paragraph in paragraphs)
+    assert all("BlackBerry Limited" not in paragraph for paragraph in paragraphs)
+
+
+def test_pdf_text_layer_blocks_skip_repeated_running_headers():
+    blocks = _build_pdf_text_layer_blocks(
+        [
+            "\n".join(
+                [
+                    "Chapter 5",
+                    "Optimizing Screen Startup Times",
+                    "Screen startup optimizations at a glance",
+                    "Screen can start after the base system is ready.",
+                ]
+            ),
+            "\n".join(
+                [
+                    "Remove unneeded display managers",
+                    "Remove any display manager that is not required by the target.",
+                    "Optimizing Screen Startup Times",
+                ]
+            ),
+        ]
+    )
+
+    headings = [block.text for block in blocks if block.block_type == "heading"]
+    paragraphs = [block.text for block in blocks if block.block_type == "paragraph"]
+
+    assert headings == [
+        "Chapter 5",
+        "Optimizing Screen Startup Times",
+        "Screen startup optimizations at a glance",
+        "Remove unneeded display managers",
+    ]
+    assert any("display manager" in paragraph for paragraph in paragraphs)
 
 
 def test_ingest_manifest_processes_only_existing_document_paths(tmp_path: Path):

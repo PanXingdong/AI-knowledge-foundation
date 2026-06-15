@@ -114,8 +114,35 @@ Generate Context Pack:
 python -m agent_knowledge_hub.cli context-pack `
   --processed-dir ".\data\processed" `
   --query "你的真实问题" `
+  --task-type "constraint_lookup" `
   --top-k 8 `
-  --per-document-limit 2
+  --per-document-limit 2 `
+  --fts-index-path ".\agent-artifacts\layer2-run\indexes\chunks.fts.sqlite" `
+  --vector-index-path ".\agent-artifacts\layer2-run\indexes\chunks.vector.json"
+```
+
+Prepare baseline vs Context Pack evaluation prompts:
+
+```powershell
+python -m agent_knowledge_hub.cli prepare-eval-run `
+  --eval-cases ".\agent-artifacts\eval\eval_cases.jsonl" `
+  --processed-dir ".\data\processed" `
+  --output-dir ".\agent-artifacts\eval\run-001" `
+  --run-id "run-001" `
+  --agent "copilot-or-codex" `
+  --model "actual-model-name" `
+  --top-k 8 `
+  --per-document-limit 2 `
+  --fts-index-path ".\agent-artifacts\layer2-run\indexes\chunks.fts.sqlite" `
+  --vector-index-path ".\agent-artifacts\layer2-run\indexes\chunks.vector.json"
+```
+
+Then generate the real-agent execution guide:
+
+```powershell
+python -m agent_knowledge_hub.cli prepare-eval-execution-pack `
+  --eval-run-dir ".\agent-artifacts\eval\run-001" `
+  --eval-cases ".\agent-artifacts\eval\eval_cases.jsonl"
 ```
 
 ## Quality Gates
@@ -126,6 +153,7 @@ Before treating results as useful:
 - Processed documents have `canonical-document.json` and `chunks.jsonl`.
 - `validate-processed --require-valid` passes.
 - `layer2-run --require-ready` passes for at least one real question.
+- Eval Context Packs are generated with the same retrieval indexes used in manual Context Pack validation.
 - Parse quality summary has allowed documents.
 - Context Pack evidence includes source document, version, section or page, and evidence id.
 - Low-quality documents are either excluded or clearly warned.

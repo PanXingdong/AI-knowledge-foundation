@@ -28,11 +28,17 @@ from agent_knowledge_hub.dependencies import check_runtime_dependencies
 
 
 class MCPContextPackResult(BaseModel):
+    schema_version: str
+    task_type: str
+    task_profile: dict[str, Any]
+    contract: dict[str, Any]
     query: str
     normalized_query: str
     processed_dir: str
+    applied_filters: dict[str, list[str]]
     chunk_count: int
     document_count: int
+    warnings: list[str]
     sections: list[dict[str, Any]]
     selected_chunks: list[dict[str, Any]]
     markdown: str
@@ -130,12 +136,14 @@ def create_mcp_server(
     def get_context_pack(
         processed_dir: str,
         query: str,
+        task_type: str = "general_query",
         top_k: int = Field(default=8, ge=1, le=100),
         per_document_limit: int = Field(default=2, ge=1, le=20),
     ) -> MCPContextPackResult:
         result = build_context_pack_for_processed_dir(
             processed_dir=processed_dir,
             query=query,
+            task_type=task_type,
             top_k=top_k,
             per_document_limit=per_document_limit,
         )

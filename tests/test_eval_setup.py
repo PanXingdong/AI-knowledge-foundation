@@ -2,6 +2,7 @@ import csv
 import json
 from pathlib import Path
 
+from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.eval_setup import (
     check_eval_business_readiness,
     build_eval_run_status,
@@ -152,6 +153,14 @@ def test_prepare_eval_run_writes_paired_prompts_and_manifests(tmp_path: Path):
     assert "Context Source: raw_files" in baseline_text
     assert "Context Source: context_pack" in context_text
     assert "# Context Pack" in context_text
+    assert "Task Type: `constraint_lookup`" in context_text
+    context_payload = json.loads(
+        (run.output_dir / "context-packs" / "case-001" / "context_pack.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert context_payload["task_type"] == "constraint_lookup"
+    assert context_payload["contract"]["stability"] == "stable_for_layer3"
 
     with (run.output_dir / "agent-prompt-manifest.csv").open(
         "r", encoding="utf-8-sig", newline=""
@@ -165,6 +174,147 @@ def test_prepare_eval_run_writes_paired_prompts_and_manifests(tmp_path: Path):
         result_rows = list(csv.DictReader(handle))
     assert len(result_rows) == 2
     assert result_rows[0]["answer_correct"] == "待评分"
+
+
+def test_prepare_eval_run_can_use_fts_index_for_context_pack(tmp_path: Path):
+    processed = tmp_path / "processed"
+    api = tmp_path / "api.md"
+    api.write_text(
+        "# API\n\nruntime_requires_approval is the exact event name for approval flow.\n",
+        encoding="utf-8",
+    )
+    generic = tmp_path / "generic.md"
+    generic.write_text(
+        "# Generic\n\nRuntime requirement guidance for broad workflow reviews.\n",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=api,
+        out_dir=processed,
+        title="Z API",
+        source_type="internal api",
+        owner="checker",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=generic,
+        out_dir=processed,
+        title="A Generic",
+        source_type="internal guide",
+        owner="checker",
+        document_version="v1",
+    )
+    fts_index = tmp_path / "indexes" / "chunks.fts.sqlite"
+    build_fts_index(processed_dir=processed, index_path=fts_index)
+
+    cases_path = tmp_path / "eval_cases.jsonl"
+    cases_path.write_text(
+        json.dumps(
+            {
+                "task_id": "case-001",
+                "task_type": "api_usage",
+                "question": "approval",
+                "gold_answer_points": ["runtime_requires_approval"],
+                "required_constraints": ["runtime_requires_approval"],
+                "expected_evidence": ["Z API"],
+                "allowed_documents": ["Z API"],
+                "scorer": "checker",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    run = prepare_eval_run(
+        eval_cases_path=cases_path,
+        processed_dir=processed,
+        output_dir=tmp_path / "eval-run",
+        top_k=1,
+        per_document_limit=1,
+        fts_index_path=fts_index,
+    )
+
+    context_payload = json.loads(
+        (run.output_dir / "context-packs" / "case-001" / "context_pack.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert context_payload["selected_chunks"][0]["document_title"] == "Z API"
+    assert "fts" in context_payload["selected_chunks"][0]["retrieval_signals"]
+
+
+def test_prepare_eval_run_normalizes_legacy_task_type_aliases(tmp_path: Path):
+    processed = tmp_path / "processed"
+    source = tmp_path / "api-and-tests.md"
+    source.write_text(
+        "\n".join(
+            [
+                "# 接口与测试",
+                "",
+                "接口使用时必须检查错误码、超时和版本限制。",
+                "测试设计必须覆盖接口失败、超时恢复和版本兼容。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed,
+        title="接口与测试",
+        source_type="内部设计文档",
+        owner="checker",
+        document_version="v1",
+    )
+
+    cases_path = tmp_path / "eval_cases.jsonl"
+    cases = [
+        {
+            "task_id": "case-api-legacy",
+            "task_type": "查接口/机制",
+            "question": "查接口机制需要注意什么？",
+            "gold_answer_points": ["错误码", "超时", "版本限制"],
+            "required_constraints": ["错误码", "超时", "版本限制"],
+            "expected_evidence": ["接口与测试"],
+            "allowed_documents": ["接口与测试"],
+            "scorer": "checker",
+        },
+        {
+            "task_id": "case-test-legacy",
+            "task_type": "test_focus_generation",
+            "question": "生成测试关注点",
+            "gold_answer_points": ["接口失败", "超时恢复", "版本兼容"],
+            "required_constraints": ["接口失败", "超时恢复", "版本兼容"],
+            "expected_evidence": ["接口与测试"],
+            "allowed_documents": ["接口与测试"],
+            "scorer": "checker",
+        },
+    ]
+    cases_path.write_text(
+        "\n".join(json.dumps(case, ensure_ascii=False) for case in cases) + "\n",
+        encoding="utf-8",
+    )
+
+    run = prepare_eval_run(
+        eval_cases_path=cases_path,
+        processed_dir=processed,
+        output_dir=tmp_path / "eval-run",
+        top_k=1,
+        per_document_limit=1,
+    )
+
+    api_payload = json.loads(
+        (run.output_dir / "context-packs" / "case-api-legacy" / "context_pack.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    test_payload = json.loads(
+        (run.output_dir / "context-packs" / "case-test-legacy" / "context_pack.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert api_payload["task_type"] == "api_usage"
+    assert test_payload["task_type"] == "test_design"
 
 
 def test_prepare_eval_run_rejects_cases_without_question(tmp_path: Path):

@@ -12,7 +12,7 @@ engineering documents
   -> chunks and evidence spans
   -> quality gate
   -> retrieval
-  -> Context Pack
+  -> task-aware Context Pack
   -> evidence trace
   -> group bot entry / local agent entry
 ```
@@ -27,7 +27,7 @@ Knowledge Hub Core
   -> local agent entry
 ```
 
-Knowledge Hub Core owns parsing outputs, retrieval, Context Pack assembly, evidence trace, and quality warnings.
+Knowledge Hub Core owns parsing outputs, retrieval, task-aware Context Pack assembly, evidence trace, and quality warnings.
 
 The group bot is for people asking questions in a team chat.
 
@@ -49,7 +49,7 @@ Phase 1 focuses on:
 - Section-aware chunks and evidence spans.
 - Parse quality gate.
 - Lexical retrieval.
-- Context Pack generation.
+- Context Pack v1 generation with task types such as constraint lookup, code review, impact analysis, test design, and API usage.
 - Evidence trace.
 - API, CLI, and evaluation harness.
 
@@ -75,7 +75,7 @@ Direct file handoff has four main problems:
 This project tries to provide a stable intermediate product:
 
 ```text
-Context Pack = compact relevant context + source evidence + quality warnings
+Context Pack = task-shaped compact context + source evidence + quality warnings
 ```
 
 The value must be proven by evaluation. If Context Pack does not improve correctness, missing-constraint rate, token cost, or traceability, the project should not move into heavier graph work.

@@ -39,6 +39,7 @@ def test_context_pack_api_returns_markdown_and_sections(tmp_path: Path):
         json={
             "processed_dir": str(processed_root),
             "query": "为什么选第三种 runtime，默认规则是什么？",
+            "task_type": "code_review",
             "top_k": 2,
             "per_document_limit": 1,
         },
@@ -48,8 +49,12 @@ def test_context_pack_api_returns_markdown_and_sections(tmp_path: Path):
     payload = response.json()["data"]
 
     assert payload["markdown"].startswith("# Context Pack")
+    assert payload["schema_version"] == "context-pack.v1"
+    assert payload["task_type"] == "code_review"
+    assert payload["contract"]["stability"] == "stable_for_layer3"
     assert payload["chunk_count"] == 1
-    assert payload["sections"][0]["title"] == "Architecture Decision"
+    assert payload["sections"][0]["title"].startswith("Review ")
+    assert payload["sections"][0]["items"][0]["task_item_type"].startswith("review_")
     assert payload["sections"][0]["items"][0]["document_title"] == "架构"
 
 

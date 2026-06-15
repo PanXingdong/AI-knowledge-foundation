@@ -40,6 +40,7 @@ from agent_knowledge_hub.retrieval import (
     build_context_pack_for_processed_dir,
     compare_context_pack_against_reference,
     load_context_pack_result,
+    trace_evidence_in_processed_dir,
     write_context_pack_bundle,
     write_gap_report_bundle,
 )
@@ -115,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             result = build_context_pack_for_processed_dir(
                 processed_dir=args.processed_dir,
                 query=query,
+                task_type=args.task_type,
                 top_k=args.top_k,
                 per_document_limit=args.per_document_limit,
                 metadata_filters=_build_metadata_filters_from_args(args),
@@ -155,6 +157,18 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 _emit_text(report.markdown)
                 return 0
+        elif args.command == "trace":
+            result = trace_evidence_in_processed_dir(
+                processed_dir=args.processed_dir,
+                evidence_id=args.evidence_id,
+            )
+            payload = result.to_dict()
+            if args.output_path:
+                args.output_path.parent.mkdir(parents=True, exist_ok=True)
+                args.output_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
         elif args.command == "parse-quality-summary":
             summary = build_parse_quality_summary(args.processed_dir)
             if args.output_dir:
@@ -203,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 top_k=args.top_k,
                 per_document_limit=args.per_document_limit,
+                fts_index_path=args.fts_index_path,
+                vector_index_path=args.vector_index_path,
             )
             payload = summary.to_dict()
         elif args.command == "prepare-eval-execution-pack":
@@ -376,6 +392,7 @@ def _build_parser() -> argparse.ArgumentParser:
     query_group = context_pack_parser.add_mutually_exclusive_group(required=True)
     query_group.add_argument("--query")
     query_group.add_argument("--query-file", type=Path)
+    context_pack_parser.add_argument("--task-type", default="general_query")
     context_pack_parser.add_argument("--top-k", type=int, default=8)
     context_pack_parser.add_argument("--per-document-limit", type=int, default=2)
     context_pack_parser.add_argument("--source-type", action="append")
@@ -394,6 +411,14 @@ def _build_parser() -> argparse.ArgumentParser:
     gap_report_parser.add_argument("--auto-context-pack-json", required=True, type=Path)
     gap_report_parser.add_argument("--reference-markdown", required=True, type=Path)
     gap_report_parser.add_argument("--output-dir", type=Path)
+
+    trace_parser = subparsers.add_parser(
+        "trace",
+        help="Trace one evidence id back to its source document text.",
+    )
+    trace_parser.add_argument("--processed-dir", required=True, type=Path)
+    trace_parser.add_argument("--evidence-id", required=True)
+    trace_parser.add_argument("--output-path", type=Path)
 
     quality_parser = subparsers.add_parser(
         "parse-quality-summary",
@@ -445,6 +470,8 @@ def _build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--model", default="待填写")
     eval_parser.add_argument("--top-k", type=int, default=8)
     eval_parser.add_argument("--per-document-limit", type=int, default=2)
+    eval_parser.add_argument("--fts-index-path", type=Path)
+    eval_parser.add_argument("--vector-index-path", type=Path)
 
     eval_execution_parser = subparsers.add_parser(
         "prepare-eval-execution-pack",
