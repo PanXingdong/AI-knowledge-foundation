@@ -82,6 +82,7 @@ def test_mcp_get_context_pack_and_search_knowledge_return_structured_payloads(tm
             {
                 "processed_dir": str(processed_root),
                 "query": "为什么选第三种 runtime，默认治理规则是什么？",
+                "task_type": "code_review",
                 "top_k": 3,
                 "per_document_limit": 2,
             },
@@ -100,8 +101,12 @@ def test_mcp_get_context_pack_and_search_knowledge_return_structured_payloads(tm
     context_pack_payload, search_payload = anyio.run(_call_tools)
 
     assert context_pack_payload["markdown"].startswith("# Context Pack")
+    assert context_pack_payload["schema_version"] == "context-pack.v1"
+    assert context_pack_payload["task_type"] == "code_review"
+    assert context_pack_payload["contract"]["stability"] == "stable_for_layer3"
     assert context_pack_payload["document_count"] == 2
     assert context_pack_payload["sections"]
+    assert context_pack_payload["sections"][0]["items"][0]["task_item_type"].startswith("review_")
     assert search_payload["result_count"] >= 1
     assert any("默认不开放无限网络" in item["text"] for item in search_payload["results"])
 

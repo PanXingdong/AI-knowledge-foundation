@@ -85,4 +85,17 @@ check-eval-business-readiness
 eval-run-status
 ```
 
+When the run is meant to evaluate the current Layer2 retrieval path, pass the same indexes used for manual Context Pack checks:
+
+```powershell
+python -m agent_knowledge_hub.cli prepare-eval-run `
+  --eval-cases ".\agent-artifacts\eval\eval_cases.jsonl" `
+  --processed-dir ".\data\processed" `
+  --output-dir ".\agent-artifacts\eval\run-001" `
+  --fts-index-path ".\agent-artifacts\indexes\chunks.fts.sqlite" `
+  --vector-index-path ".\agent-artifacts\indexes\chunks.vector.json"
+```
+
+Otherwise the eval Context Pack uses the default retrieval path and may not match a manually generated indexed Context Pack.
+
 Historical detailed evaluation notes are archived under [archive/05-evaluation](archive/05-evaluation/).

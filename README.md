@@ -12,7 +12,7 @@ documents
   -> chunks + evidence spans
   -> parse quality gate
   -> retrieval
-  -> Context Pack
+  -> task-aware Context Pack
   -> evidence trace
   -> API / CLI / eval harness
 ```
@@ -24,7 +24,7 @@ canonical-document.json + chunks.jsonl
   -> contract validation
   -> FTS + local vector indexes
   -> retrieval
-  -> Context Pack
+  -> task-aware Context Pack
   -> evidence trace
   -> group bot / local agent entry
 ```
@@ -43,7 +43,7 @@ The first sample scope is mixed engineering documents (`混合工程文档样本
 - Parse quality summary and context-pack quality gate.
 - Lexical/rule-based retrieval prototype.
 - SQLite FTS5 index prototype and dependency-free local sparse-vector index prototype.
-- Context Pack generation in Markdown and JSON.
+- Context Pack v1 generation in Markdown and JSON, with task types for general query, constraint lookup, code review, impact analysis, test design, and API usage.
 - Evidence trace by `evidence_id`.
 - `layer2-run` acceptance command for validation, indexing, retrieval, Context Pack, and evidence trace.
 - FastAPI service for core operations.
@@ -113,6 +113,7 @@ Generate a Context Pack after ingest:
 python -m agent_knowledge_hub.cli context-pack `
   --processed-dir ".\data\processed" `
   --query "这个文档说明了什么？" `
+  --task-type "general_query" `
   --top-k 5 `
   --per-document-limit 2
 ```
@@ -156,5 +157,5 @@ Start here:
 The cleaned project is expected to pass:
 
 ```text
-128 passed, 6 skipped
+145 passed, 6 skipped
 ```

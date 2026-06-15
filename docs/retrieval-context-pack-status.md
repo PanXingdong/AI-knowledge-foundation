@@ -120,9 +120,13 @@ The system already assembles agent-consumable Context Packs from selected chunks
 Current output fields include:
 
 - schema version
+- task type
+- task profile
+- emitted v1 contract
 - query
 - normalized query
 - applied filters
+- pack-level warnings
 - selected chunks
 - document version id
 - document version
@@ -147,6 +151,17 @@ Current output forms:
 
 - JSON
 - Markdown
+
+The current Context Pack contract is `context-pack.v1`. It is task-type-aware and currently supports:
+
+- `general_query`
+- `constraint_lookup`
+- `code_review`
+- `impact_analysis`
+- `test_design`
+- `api_usage`
+
+The task type changes section labels, item roles, task intent, and agent-use guidance. It does not yet perform a full production rerank policy per task type.
 
 Relevant functions:
 
@@ -204,8 +219,11 @@ Current commands:
 - `python -m agent_knowledge_hub.cli context-pack`
 - `python -m agent_knowledge_hub.cli build-fts-index`
 - `python -m agent_knowledge_hub.cli build-vector-index`
+- `python -m agent_knowledge_hub.cli trace`
 - `python -m agent_knowledge_hub.cli parse-quality-summary`
 - `python -m agent_knowledge_hub.cli gap-report`
+- `python -m agent_knowledge_hub.cli prepare-eval-run`
+- `python -m agent_knowledge_hub.cli prepare-eval-execution-pack`
 
 This CLI is usable for engineering validation, but it is still an internal project CLI, not the final agent-facing product interface.
 
@@ -217,6 +235,7 @@ Current capabilities include:
 
 - preparing eval runs
 - collecting Context Pack outputs
+- passing the same FTS/vector index paths into eval Context Pack generation
 - recording agent outputs
 - recording review decisions
 - scoring eval runs
@@ -278,27 +297,31 @@ retrieval exists
 but production hybrid retrieval does not exist yet
 ```
 
-### 3. Task-type-aware Context Pack is not complete
+### 3. Task-type-aware Context Pack exists as a v1 contract
 
-The current Context Pack is generic retrieval output plus formatting.
+The current Context Pack is no longer only generic retrieval output. It now accepts a `task_type`, normalizes common aliases, emits a task profile, and groups section items with task-aware labels and `task_item_type`.
 
-What is still missing is explicit task-type assembly such as:
+Implemented task types:
 
-- `api_usage`
+- `general_query`
+- `constraint_lookup`
 - `code_review`
-- `design_review`
 - `impact_analysis`
-- `qa`
+- `test_design`
+- `api_usage`
 
-For example, different task types should eventually select and group different output fields:
+Still missing:
 
-- code review wants risks, constraints, checklist, tests
-- API usage wants signature, arguments, returns, errors, caveats
-- design review wants assumptions, constraints, dependencies, version scope
+- production task-specific reranking
+- domain-specific extraction such as API signatures, arguments, return values, and error codes from parser-level structured sections
+- task-specific completeness checks
+- `design_review` as a separate first-class task type if the team needs it
 
-### 4. Stable agent-facing product contract is not done
+### 4. Stable Core contract exists, but product adapters are not done
 
-The current API and CLI are engineering interfaces, not yet the final product entry contract.
+The current API and CLI expose the stable Core-side `context-pack.v1` payload. This is enough for Layer3 implementation to depend on the Core response shape.
+
+The API and CLI are still engineering interfaces, not yet the final group-bot or local-agent product entry.
 
 Missing product-level hardening includes:
 
@@ -345,7 +368,6 @@ processed outputs -> retrieval -> Context Pack -> evidence trace -> API/CLI
 
   It does not yet have:
 production hybrid retrieval,
-task-type-aware Context Pack,
 stable product adapters,
 or graph augmentation.
 ```
@@ -360,7 +382,7 @@ Goal: prove the current second segment works on real documents and can be demons
 
 Tasks:
 
-1. write and freeze the current Context Pack v1 schema
+1. keep Context Pack v1 schema documented and covered by tests
 2. document the current retrieval chain for collaborators
 3. run the chain on real sample documents
 4. produce first A/B comparison:
@@ -388,7 +410,7 @@ Tasks:
 2. add BM25 or FTS retrieval
 3. replace or supplement the local vector prototype with production semantic embeddings when allowed
 4. add hybrid merge and rerank policy
-5. add task-type-aware Context Pack assembly
+5. harden task-type-aware Context Pack assembly with task-specific rerank and completeness checks
 6. define a stable local agent request and response contract
 7. define a stable bot request and response contract
 
@@ -409,10 +431,10 @@ Tasks:
 The practical engineering order should be:
 
 1. real-document eval
-2. Context Pack v1 schema freeze
+2. keep Context Pack v1 schema frozen through tests and docs
 3. metadata filters
 4. hybrid retrieval
-5. task-type-aware assembly
+5. task-type-aware assembly hardening
 6. adapter contracts
 7. graph augmentation if needed
 
@@ -438,7 +460,9 @@ The current system does not need graph work first. It needs proof and retrieval 
 | Persistent SQLite FTS5 retrieval engine | done for P1 prototype |
 | Local vector retrieval prototype | done |
 | Hybrid retrieval merge | missing |
-| Task-type-aware Context Pack | missing |
+| Context Pack v1 schema contract | done |
+| Task-type-aware Context Pack | done as v1 baseline |
+| Task-specific rerank and completeness checks | missing |
 | Stable product adapter contract | missing |
 | Graph augmentation | missing |
 | Real-document business proof | missing |
