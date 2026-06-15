@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace as dc_replace
 from pathlib import Path
 
 from agent_knowledge_hub.models import (
@@ -132,17 +133,25 @@ def build_canonical_document(
                 page_end=first_bm_page - 1 if first_bm_page > 1 else None,
             )
         )
-        seen_keys: set[str] = {"0"}
+        # Map section_key → index in sections[] for duplicate-path merging.
+        _section_idx_by_key: dict[str, int] = {"0": 0}
         total_pages = parsed.page_count or 0
         for i, (page_start, path) in enumerate(pdf_sorted_entries):
             if i + 1 < len(pdf_sorted_entries):
                 next_page = pdf_sorted_entries[i + 1][0]
-                page_end = max(page_start, next_page - 1)  # guard: never below page_start
+                page_end = max(page_start, next_page - 1)
             else:
                 page_end = total_pages
             section_key = "\x00".join(path)
-            if section_key not in seen_keys:
-                seen_keys.add(section_key)
+            if section_key in _section_idx_by_key:
+                # Extend existing section's page_end so blocks at this re-occurrence
+                # still reference a section whose range covers them.
+                idx = _section_idx_by_key[section_key]
+                existing = sections[idx]
+                if existing.page_end is not None and page_end > existing.page_end:
+                    sections[idx] = dc_replace(existing, page_end=page_end)
+            else:
+                _section_idx_by_key[section_key] = len(sections)
                 sections.append(
                     Section(
                         section_id=stable_id("sec", document_version_id, section_key),
@@ -159,6 +168,8 @@ def build_canonical_document(
     current_section_path = ["0"]
     current_section_id: str | None = None
     heading_counts: list[int] = []
+    # Tracks the last bookmark path so heading counters reset on section boundary.
+    current_bookmark_path: list[str] = ["0"]
 
     def ensure_default_section() -> None:
         nonlocal current_section_id
@@ -178,10 +189,41 @@ def build_canonical_document(
 
     for order, parsed_block in enumerate(parsed.blocks, start=1):
         if pdf_sorted_entries:
-            # PDF bookmark mode: assign section by page number
-            current_section_path = _find_section_path_for_page(
-                pdf_sorted_entries, parsed_block.page_start
-            )
+            # PDF bookmark mode: bookmarks are primary structure; headings detected
+            # by the parser create fine-grained sub-sections within each bookmark.
+            bm_path = _find_section_path_for_page(pdf_sorted_entries, parsed_block.page_start)
+
+            # When the bookmark section changes, reset heading sub-counters so
+            # numbering restarts at "1" inside each bookmark chapter.
+            if bm_path != current_bookmark_path:
+                current_bookmark_path = bm_path
+                heading_counts = []
+                current_section_path = bm_path
+
+            if parsed_block.block_type == "heading":
+                level = int(parsed_block.metadata.get("level", 1))
+                level = max(1, min(level, 6))
+                while len(heading_counts) < level:
+                    heading_counts.append(0)
+                heading_counts[level - 1] += 1
+                heading_counts = heading_counts[:level]
+                heading_suffix = [str(v) for v in heading_counts]
+                current_section_path = bm_path + heading_suffix
+                current_section_id = stable_id(
+                    "sec", document_version_id, "\x00".join(current_section_path), parsed_block.text
+                )
+                sections.append(
+                    Section(
+                        section_id=current_section_id,
+                        document_version_id=document_version_id,
+                        section_path=list(current_section_path),
+                        title=parsed_block.text,
+                        page_start=parsed_block.page_start,
+                        page_end=parsed_block.page_end,
+                    )
+                )
+            # Non-heading blocks keep current_section_path (bookmark base or last heading sub-path).
+
         elif parsed_block.block_type == "heading":
             # Heading-based mode: Markdown / DOCX / HTML
             level = int(parsed_block.metadata.get("level", 1))
