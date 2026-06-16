@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -38,6 +39,7 @@ class FeishuConfig:
             reference_markdown_path=os.getenv("REFERENCE_MARKDOWN_PATH", ""),
             default_top_k=int(os.getenv("DEFAULT_TOP_K", "8")),
             default_per_document_limit=int(os.getenv("DEFAULT_PER_DOCUMENT_LIMIT", "2")),
+            max_reply_length=int(os.getenv("MAX_REPLY_LENGTH", "3000")),
         )
 
 
@@ -93,15 +95,19 @@ class LocalAPIClient:
         query: str,
         top_k: int = 8,
         per_document_limit: int = 2,
+        task_type: str | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}/api/context-pack"
         try:
-            data = _http_post(url, {
+            payload: dict[str, Any] = {
                 "processed_dir": processed_dir,
                 "query": query,
                 "top_k": top_k,
                 "per_document_limit": per_document_limit,
-            })
+            }
+            if task_type is not None:
+                payload["task_type"] = task_type
+            data = _http_post(url, payload)
             return data.get("data", {})
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8") if e.fp else str(e)
@@ -134,25 +140,26 @@ class LocalAPIClient:
 
 class MessageFormatter:
     @staticmethod
-    def format_context_pack(result: dict[str, Any]) -> str:
+    def format_context_pack(result: dict[str, Any], score_threshold: float = -30.0) -> str:
         query = result.get("query", "N/A")
-        chunk_count = result.get("chunk_count", 0)
-        document_count = result.get("document_count", 0)
+        selected_chunks = result.get("selected_chunks", [])
+        qualified = [c for c in selected_chunks if c.get("score", float("-inf")) >= score_threshold]
 
+        if not qualified:
+            return "未找到相关内容"
+
+        doc_titles = {c.get("document_title", "Unknown") for c in qualified}
         lines = [
             f"【Query】{query}",
             "",
-            f"【检索结果】共 {chunk_count} 个片段，来自 {document_count} 个文档",
-            "",
+            f"【检索结果】共 {len(qualified)} 个片段，来自 {len(doc_titles)} 个文档",
             "─────────────────────",
         ]
 
-        selected_chunks = result.get("selected_chunks", [])
-        for chunk in selected_chunks[:8]:
+        for i, chunk in enumerate(qualified[:8]):
             doc_title = chunk.get("document_title", "Unknown")
             text = chunk.get("text", "")[:120]
-            score = chunk.get("score", 0)
-            lines.append(f"\n▶ [{doc_title}] (score: {score:.2f})")
+            lines.append(f"\n▶ [{doc_title}]")
             lines.append(f"  {text}")
 
         return "\n".join(lines)
@@ -199,18 +206,24 @@ class FeishuAPI:
     def send_text_message(self, chat_id: str, text: str) -> None:
         token = self.token_manager.get_token()
         url = f"{self.config.api_base}/message/v4/send/"
-        content_json = json.dumps({"text": text}, ensure_ascii=False)
 
-        _http_post(
+        resp = _http_post(
             url,
             {
-                "receive_id": chat_id,
+                "chat_id": chat_id,
                 "msg_type": "text",
-                "content": content_json,
+                "content": {"text": text},
             },
             headers={"Authorization": f"Bearer {token}"},
         )
-        logger.info("消息已发送到chat_id=%s", chat_id)
+        code = resp.get("code", -1)
+        if code != 0:
+            logger.error(
+                "发送消息失败: chat_id=%s, code=%s, msg=%s, resp=%s",
+                chat_id, code, resp.get("msg", ""), json.dumps(resp, ensure_ascii=False)[:300],
+            )
+        else:
+            logger.info("消息已发送到chat_id=%s", chat_id)
 
 
 class FeishuMessageHandler:
@@ -283,12 +296,20 @@ class FeishuMessageHandler:
 
     @staticmethod
     def _assemble_reply(context_pack_text: str, gap_report_text: str) -> str:
-        parts = [context_pack_text]
-        if gap_report_text:
-            parts.append("\n" + "═" * 30 + "\n")
-            parts.append(gap_report_text)
-        return "\n".join(parts)
+        return assemble_reply(context_pack_text, gap_report_text)
 
     @staticmethod
     def _filter_mentions(text: str) -> str:
-        return text.split(" ", 1)[-1] if text.startswith("@") else text
+        return filter_mentions(text)
+
+
+def assemble_reply(context_pack_text: str, gap_report_text: str) -> str:
+    parts = [context_pack_text]
+    if gap_report_text:
+        parts.append("\n" + "═" * 30 + "\n")
+        parts.append(gap_report_text)
+    return "\n".join(parts)
+
+
+def filter_mentions(text: str) -> str:
+    return re.sub(r"@_?\S+\s?", "", text).strip()

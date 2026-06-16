@@ -4,12 +4,36 @@
 
 set -e
 
-# 配置
-export PYTHONPATH="/home/xyd/AI-knowledge-foundation/AI-knowledge-foundation/src"
-export FEISHU_APP_ID="cli_aaa3b8fe933a5ccc"
-export FEISHU_APP_SECRET="wCkxgMrneywL8A6uYfM9chdCLBDrazRQ"
-export PROCESSED_DIR="/home/xyd/AI-knowledge-foundation/AI-knowledge-foundation/.tmp_demo_processed"
-export FEISHU_API_BASE="https://open.feishu.cn/open-apis"
+# 定位项目根目录
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# 自动加载本地 .env 文件（如果存在）
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    set -a
+    source "$PROJECT_ROOT/.env"
+    set +a
+fi
+
+export PYTHONPATH="$PROJECT_ROOT/src"
+
+# 校验必要环境变量
+if [ -z "$FEISHU_APP_ID" ]; then
+    echo "错误: FEISHU_APP_ID 未设置"
+    echo "请在项目根目录创建 .env 文件，或手动 export FEISHU_APP_ID"
+    exit 1
+fi
+
+if [ -z "$FEISHU_APP_SECRET" ]; then
+    echo "错误: FEISHU_APP_SECRET 未设置"
+    echo "请在项目根目录创建 .env 文件，或手动 export FEISHU_APP_SECRET"
+    exit 1
+fi
+
+# 设置默认值
+: "${FEISHU_API_BASE:=https://open.feishu.cn/open-apis}"
+: "${LOCAL_API_BASE:=http://127.0.0.1:8789}"
+: "${PROCESSED_DIR:=$PROJECT_ROOT/.tmp_demo_processed}"
 
 API_PORT=8789
 API_LOG="/tmp/uvicorn.log"
