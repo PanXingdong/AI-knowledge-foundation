@@ -5,7 +5,7 @@
 本目录是第一段（文档结构化）的交付物。
 
 将 58 份 QNX Neutrino RTOS 7.1 / QNX SDP 7.1 官方 PDF 文档，通过
-[AI Knowledge Foundation](https://github.com/你的组织/AI-knowledge-foundation)
+[AI Knowledge Foundation](https://github.com/PanXingdong/AI-knowledge-foundation)
 管道转换成带版本、章节、证据的 Canonical Document Model，供第二段（知识检索与组包）和第三段（产品入口与验证）直接使用。
 
 ---
@@ -76,7 +76,7 @@ python3.11 -m venv qnx-env
 source qnx-env/bin/activate   # Windows: qnx-env\Scripts\activate
 
 # 安装 AI Knowledge Foundation
-git clone https://github.com/你的组织/AI-knowledge-foundation.git
+git clone https://github.com/PanXingdong/AI-knowledge-foundation.git
 cd AI-knowledge-foundation
 pip install -e .
 ```
