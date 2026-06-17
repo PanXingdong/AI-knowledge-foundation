@@ -57,8 +57,8 @@ def _find_section_path_for_page(
         if entry_page < page:
             path = entry_path
         elif entry_page == page:
-            if path == ["0"]:
-                path = entry_path  # same-page: take first bookmark in outline order
+            path = entry_path  # always take the first bookmark on this page
+            break
         else:
             break
     return path

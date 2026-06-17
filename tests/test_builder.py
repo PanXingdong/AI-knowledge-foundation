@@ -77,13 +77,10 @@ def test_pdf_bookmark_sections_assign_block_path(tmp_path):
     doc = _build_with_bookmarks(tmp_path, blocks, outline, page_count=4)
 
     paths = [b.section_path for b in doc.blocks]
-    # _find_section_path_for_page uses entry_page < block_page for the main update
-    # and entry_page == block_page only when path is still the default ["0"].
-    # Block at page 3 (= Chapter 2 start): first bookmark 1<3→["Chapter 1"],
-    # then 3==3 but path≠["0"] → stays ["Chapter 1"].  This is existing behaviour;
-    # we only verify the two unambiguous cases here.
     assert paths[0] == ["Chapter 1"]
     assert paths[1] == ["Chapter 1"]
+    # Block on Chapter 2's start page must belong to Chapter 2, not Chapter 1.
+    assert paths[2] == ["Chapter 2"]
 
 
 # ---------------------------------------------------------------------------
@@ -144,10 +141,8 @@ def test_heading_counters_reset_on_bookmark_change(tmp_path):
         # Two headings inside Chapter 1 (pages 1-9)
         ParsedBlock(block_type="heading", text="Sec A", page_start=2, metadata={"level": 2}),
         ParsedBlock(block_type="heading", text="Sec B", page_start=3, metadata={"level": 2}),
-        # _find_section_path_for_page uses entry_page < block_page, so a block on
-        # page 10 (the Chapter 2 start page) still falls in Chapter 1.
-        # page 11 is the first page that lands in Chapter 2.
-        ParsedBlock(block_type="heading", text="Sec C", page_start=11, metadata={"level": 2}),
+        # Chapter 2 starts on page 10; a block on that page must land in Chapter 2.
+        ParsedBlock(block_type="heading", text="Sec C", page_start=10, metadata={"level": 2}),
     ]
     doc = _build_with_bookmarks(tmp_path, blocks, outline, page_count=15)
 
