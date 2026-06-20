@@ -3171,3 +3171,216 @@ def test_quality_gate_adjustment_penalizes_disallowed_chunk_before_ok_status():
     )
 
     assert _quality_gate_adjustment(chunk) == -56.0
+
+
+def _ingest_three_topic_docs(tmp_path: Path) -> Path:
+    processed_root = tmp_path / "processed"
+    architecture = tmp_path / "architecture.md"
+    architecture.write_text(
+        "\n".join(
+            [
+                "# 方案选型",
+                "",
+                "第一阶段正式方案采用第三种 runtime 模式。",
+                "Skill/MCP 只适合短期 PoC。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    safety = tmp_path / "safety.md"
+    safety.write_text(
+        "\n".join(
+            [
+                "# 安全治理",
+                "",
+                "默认不写主仓库。",
+                "高风险动作必须审批。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rollback = tmp_path / "rollback.md"
+    rollback.write_text(
+        "\n".join(
+            [
+                "# 灰度与回滚",
+                "",
+                "功能开关使用 ENABLE_CLAUDE_CODE_RUNTIME=false。",
+                "router 停止分发到 claude_code。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    for path, title in (
+        (architecture, "架构设计"),
+        (safety, "安全治理"),
+        (rollback, "灰度与回滚"),
+    ):
+        ingest_file(
+            file_path=path,
+            out_dir=processed_root,
+            title=title,
+            source_type="内部设计文档",
+            owner="checker",
+            document_version="v1",
+        )
+    return processed_root
+
+
+def test_estimate_tokens_weights_cjk_higher_than_latin():
+    from agent_knowledge_hub.retrieval import estimate_tokens
+
+    assert estimate_tokens("") == 0
+    # 14 CJK chars -> int(14 * 1.6) tokens.
+    assert estimate_tokens("数据安全治理隔离审批回滚架构") == int(14 * 1.6)
+    # Latin text is ~1 token per 4 chars.
+    assert estimate_tokens("a" * 40) == 10
+
+
+def test_build_context_pack_reports_token_usage_without_budget(tmp_path: Path):
+    processed_root = _ingest_three_topic_docs(tmp_path)
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="runtime 选型、审批治理、回滚开关分别是什么？",
+        top_k=4,
+        per_document_limit=2,
+    )
+
+    from agent_knowledge_hub.retrieval import estimate_tokens
+
+    assert result.token_budget is None
+    assert result.token_used == estimate_tokens(result.markdown)
+    assert result.token_used > 0
+
+
+def test_build_context_pack_trims_chunks_to_fit_token_budget(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    body = "这是一段足够长的治理与回滚说明，用于撑大每个证据块的体积，便于预算裁剪验证。" * 6
+    for index, (title, topic_line) in enumerate(
+        (
+            ("架构设计", "第一阶段正式方案采用第三种 runtime 模式。"),
+            ("安全治理", "默认不写主仓库，高风险动作必须审批。"),
+            ("灰度与回滚", "功能开关使用 ENABLE_CLAUDE_CODE_RUNTIME=false。"),
+            ("接口协议", "runtime profile 详情接口返回预算与工具策略。"),
+        )
+    ):
+        path = tmp_path / f"doc-{index}.md"
+        path.write_text(
+            "\n".join([f"# {title}", "", topic_line, body]),
+            encoding="utf-8",
+        )
+        ingest_file(
+            file_path=path,
+            out_dir=processed_root,
+            title=title,
+            source_type="内部设计文档",
+            owner="checker",
+            document_version="v1",
+        )
+
+    query = "runtime 选型、审批治理、回滚开关、profile 接口分别是什么？"
+    full = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query=query,
+        top_k=4,
+        per_document_limit=1,
+    )
+    assert full.chunk_count >= 3
+
+    # Budget large enough for a strict subset (well above the fixed scaffolding
+    # plus one chunk) but below the full pack, so trimming drops the tail.
+    budget = (full.token_used * 2) // 3
+    trimmed = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query=query,
+        top_k=4,
+        per_document_limit=1,
+        token_budget=budget,
+    )
+
+    assert trimmed.token_budget == budget
+    assert trimmed.chunk_count < full.chunk_count
+    assert trimmed.chunk_count >= 1
+    assert trimmed.token_used <= budget
+    assert "token_budget_too_small:kept_single_best_chunk" not in trimmed.warnings
+    assert any(
+        warning.startswith("token_budget_exceeded:") for warning in trimmed.warnings
+    )
+    # The highest-priority chunk must survive trimming.
+    assert trimmed.selected_chunks[0].chunk_id == full.selected_chunks[0].chunk_id
+
+
+def test_build_context_pack_keeps_single_best_chunk_when_budget_too_small(tmp_path: Path):
+    processed_root = _ingest_three_topic_docs(tmp_path)
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="runtime 选型、审批治理、回滚开关分别是什么？",
+        top_k=4,
+        per_document_limit=2,
+        token_budget=1,
+    )
+
+    assert result.chunk_count == 1
+    assert any(
+        warning.startswith("token_budget_too_small:") for warning in result.warnings
+    )
+
+
+def test_build_context_pack_warns_when_fts_index_missing(tmp_path: Path):
+    processed_root = _ingest_three_topic_docs(tmp_path)
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="runtime 选型是什么？",
+        top_k=3,
+        per_document_limit=2,
+        fts_index_path=tmp_path / "does-not-exist.sqlite3",
+    )
+
+    assert result.selected_chunks
+    assert any(
+        warning.startswith("fts_index_unavailable:not_found") for warning in result.warnings
+    )
+
+
+def test_build_context_pack_warns_when_vector_index_missing(tmp_path: Path):
+    processed_root = _ingest_three_topic_docs(tmp_path)
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="runtime 选型是什么？",
+        top_k=3,
+        per_document_limit=2,
+        vector_index_path=tmp_path / "missing-vectors.json",
+    )
+
+    assert result.selected_chunks
+    assert any(
+        warning.startswith("vector_index_unavailable:not_found")
+        for warning in result.warnings
+    )
+
+
+def test_context_pack_token_fields_round_trip_through_json(tmp_path: Path):
+    from agent_knowledge_hub.retrieval import (
+        load_context_pack_result,
+        write_context_pack_bundle,
+    )
+
+    processed_root = _ingest_three_topic_docs(tmp_path)
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="runtime 选型、审批治理、回滚开关分别是什么？",
+        top_k=4,
+        per_document_limit=2,
+        token_budget=10_000,
+    )
+
+    bundle = write_context_pack_bundle(output_dir=tmp_path / "bundle", result=result)
+    reloaded = load_context_pack_result(bundle["json_path"])
+
+    assert reloaded.token_budget == result.token_budget
+    assert reloaded.token_used == result.token_used
+
