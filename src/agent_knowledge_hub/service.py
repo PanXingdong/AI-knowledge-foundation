@@ -23,6 +23,7 @@ from agent_knowledge_hub.quality import build_parse_quality_summary
 class ContextPackRequest(BaseModel):
     processed_dir: str = Field(..., min_length=1)
     query: str = Field(..., min_length=1)
+    task_type: str = "general_query"
     top_k: int = Field(8, ge=1, le=100)
     per_document_limit: int = Field(2, ge=1, le=20)
     metadata_filters: dict[str, list[str]] = Field(default_factory=dict)
@@ -93,6 +94,7 @@ def create_app() -> FastAPI:
             result = build_context_pack_for_processed_dir(
                 processed_dir=request.processed_dir,
                 query=request.query,
+                task_type=request.task_type,
                 top_k=request.top_k,
                 per_document_limit=request.per_document_limit,
                 metadata_filters=request.metadata_filters,
@@ -216,6 +218,7 @@ def create_app() -> FastAPI:
             context_pack = build_context_pack_for_processed_dir(
                 processed_dir=request.processed_dir,
                 query=request.query,
+                task_type=request.task_type,
                 top_k=request.top_k,
                 per_document_limit=request.per_document_limit,
                 metadata_filters=request.metadata_filters,

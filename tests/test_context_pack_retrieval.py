@@ -160,6 +160,124 @@ def test_context_pack_json_includes_v1_schema_and_applied_filters(tmp_path: Path
     assert item["chunk"]["project"] == "cockpit"
 
 
+def test_context_pack_json_exposes_v1_contract_and_task_profile(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    source = tmp_path / "governance.md"
+    source.write_text(
+        "\n".join(
+            [
+                "# 安全治理",
+                "",
+                "默认不写主仓库。",
+                "默认高风险动作必须审批。",
+                "默认不开放无限网络，禁止绕过审批策略。",
+                "所有高风险执行都必须记录审计字段、执行人、运行参数和证据。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="安全治理",
+        source_type="内部设计文档",
+        owner="checker",
+        document_version="v1",
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="代码评审时默认治理规则是什么？",
+        task_type="code_review",
+        top_k=2,
+        per_document_limit=1,
+    )
+
+    payload = result.to_json_dict()
+
+    assert result.task_type == "code_review"
+    assert payload["schema_version"] == "context-pack.v1"
+    assert payload["task_type"] == "code_review"
+    assert payload["task_profile"]["label"] == "Code Review"
+    assert payload["contract"]["stable_fields"][0] == "schema_version"
+    assert "sections" in payload["contract"]["stable_fields"]
+    assert "task_item_type" in payload["contract"]["item_stable_fields"]
+    assert payload["warnings"] == []
+    assert payload["sections"][0]["title"] == "Review Safety Risks"
+    assert payload["sections"][0]["items"][0]["task_item_type"] == "review_risk"
+    assert "Task Type: `code_review`" in result.markdown
+
+
+def test_build_context_pack_rejects_unknown_task_type(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    source = tmp_path / "doc.md"
+    source.write_text(
+        "# 设计\n\n采用第三种 runtime 模式。",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="设计",
+        source_type="内部设计文档",
+        owner="checker",
+        document_version="v1",
+    )
+
+    try:
+        build_context_pack_for_processed_dir(
+            processed_dir=processed_root,
+            query="为什么采用第三种 runtime？",
+            task_type="unknown_task",
+        )
+    except ValueError as exc:
+        assert "Unsupported task_type" in str(exc)
+    else:
+        raise AssertionError("build_context_pack_for_processed_dir should reject unknown task_type")
+
+
+def test_build_context_pack_normalizes_legacy_eval_task_type_aliases(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    source = tmp_path / "api-and-test.md"
+    source.write_text(
+        "\n".join(
+            [
+                "# 接口与测试",
+                "",
+                "接口使用时必须检查错误码、超时和版本限制。",
+                "测试设计必须覆盖接口失败、超时恢复和版本兼容。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="接口与测试",
+        source_type="内部设计文档",
+        owner="checker",
+        document_version="v1",
+    )
+
+    api_result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="查接口机制需要注意什么？",
+        task_type="查接口/机制",
+        top_k=1,
+        per_document_limit=1,
+    )
+    test_result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="生成测试关注点",
+        task_type="test_focus_generation",
+        top_k=1,
+        per_document_limit=1,
+    )
+
+    assert api_result.task_type == "api_usage"
+    assert test_result.task_type == "test_design"
+
+
 def test_build_context_pack_metadata_filters_limit_results_to_matching_documents(tmp_path: Path):
     processed_root = tmp_path / "processed"
 
@@ -315,6 +433,280 @@ def test_build_context_pack_uses_fts_index_for_prefix_symbol_query(tmp_path: Pat
     assert result.selected_chunks[0].document_title == "API"
     assert "runtime_requires_approval" in result.selected_chunks[0].text
     assert "fts" in result.selected_chunks[0].retrieval_signals
+
+
+def test_build_context_pack_prefers_chunks_covering_core_technical_terms(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+
+    mutex = tmp_path / "mutex.md"
+    mutex.write_text(
+        "\n".join(
+            [
+                "# pthread mutex priority inheritance",
+                "",
+                "pthread mutex priority inheritance and priority protection constraints must be checked.",
+                "The mutex protocol affects synchronization behavior and caveats for real-time threads.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    crypto = tmp_path / "crypto.md"
+    crypto.write_text(
+        "\n".join(
+            [
+                "# Cryptographic primitives",
+                "",
+                "Cryptographic primitives have constraints and caveats.",
+                "Algorithm handling requires plugin binding and release.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=crypto,
+        out_dir=processed_root,
+        title="A System Security Guide",
+        source_type="supplier security guide",
+        owner="checker",
+        document_version="SDP 7.1",
+    )
+    ingest_file(
+        file_path=mutex,
+        out_dir=processed_root,
+        title="Z C Library Reference",
+        source_type="supplier api reference",
+        owner="checker",
+        document_version="SDP 7.1",
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query=(
+            "What QNX SDP 7.1 constraints or caveats should be considered "
+            "when using pthread mutex priority inheritance or related synchronization APIs?"
+        ),
+        task_type="constraint_lookup",
+        top_k=2,
+        per_document_limit=1,
+    )
+
+    assert result.selected_chunks
+    assert result.selected_chunks[0].document_title == "Z C Library Reference"
+    assert "pthread mutex priority inheritance" in result.selected_chunks[0].text
+
+
+def test_topic_seed_does_not_promote_off_topic_api_chunk_over_core_terms(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+
+    mutex = tmp_path / "mutex.md"
+    mutex.write_text(
+        "\n".join(
+            [
+                "# Priority inheritance and mutexes",
+                "",
+                "pthread mutex priority inheritance affects thread synchronization.",
+                "A mutex owner may inherit a higher-priority caller, and pthread_mutexattr_setprotocol controls the protocol.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    algorithm = tmp_path / "algorithm.md"
+    algorithm.write_text(
+        "\n".join(
+            [
+                "# Requesting an algorithm API",
+                "",
+                "The qcrypto API lets a user request an algorithm from a plugin.",
+                "This section has API constraints and caveats for plugin algorithm handling.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=algorithm,
+        out_dir=processed_root,
+        title="A System Security Guide",
+        source_type="supplier security guide",
+        owner="checker",
+        document_version="SDP 7.1",
+    )
+    ingest_file(
+        file_path=mutex,
+        out_dir=processed_root,
+        title="Z System Architecture",
+        source_type="architecture",
+        owner="checker",
+        document_version="SDP 7.1",
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query=(
+            "What QNX SDP 7.1 constraints or caveats should be considered "
+            "when using pthread mutex priority inheritance or related synchronization APIs?"
+        ),
+        task_type="constraint_lookup",
+        top_k=2,
+        per_document_limit=1,
+    )
+
+    assert result.selected_chunks
+    assert result.selected_chunks[0].document_title == "Z System Architecture"
+    assert result.selected_chunks[0].section_titles == ["Priority inheritance and mutexes"]
+
+
+def test_topic_seed_does_not_promote_compact_toc_chunk_over_body_evidence(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+
+    toc = tmp_path / "toc.md"
+    toc.write_text(
+        "\n".join(
+            [
+                "# Electronic edition published: October 28, 2024",
+                "",
+                (
+                    "Contents About This Guide........................................9 "
+                    "Chapter 2: The QNX Neutrino Microkernel.........................27 "
+                    "Thread scheduling...............................................38 "
+                    "Synchronization services........................................47 "
+                    "Mutexes: mutual exclusion locks.................................47 "
+                    "Reader/writer locks.............................................53 "
+                    "Priority inheritance and messages...............................79 "
+                    "Message-passing API.............................................81 "
+                    "Events..........................................................84 "
+                    "Signals.........................................................86 "
+                    "Contents"
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    mutex = tmp_path / "mutex.md"
+    mutex.write_text(
+        "\n".join(
+            [
+                "# Priority inheritance and mutexes",
+                "",
+                "pthread mutex priority inheritance affects thread synchronization.",
+                "pthread_mutexattr_setprotocol controls whether a mutex uses inheritance or protection.",
+                "The implementation constraints and caveats must be checked for real-time threads.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=toc,
+        out_dir=processed_root,
+        title="QNX Neutrino RTOS 7.1 System Architecture",
+        source_type="architecture",
+        owner="checker",
+        document_version="SDP 7.1",
+    )
+    ingest_file(
+        file_path=mutex,
+        out_dir=processed_root,
+        title="QNX Neutrino RTOS 7.1 C Library Reference",
+        source_type="supplier api reference",
+        owner="checker",
+        document_version="SDP 7.1",
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query=(
+            "What QNX SDP 7.1 constraints or caveats should be considered "
+            "when using pthread mutex priority inheritance or related synchronization APIs?"
+        ),
+        task_type="constraint_lookup",
+        top_k=2,
+        per_document_limit=1,
+    )
+
+    assert result.selected_chunks
+    assert result.selected_chunks[0].document_title == "QNX Neutrino RTOS 7.1 C Library Reference"
+    assert result.selected_chunks[0].section_titles == ["Priority inheritance and mutexes"]
+    assert "Contents About This Guide" not in result.selected_chunks[0].text
+
+
+def test_topic_seed_does_not_promote_compact_toc_continuation_chunk(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+
+    toc = tmp_path / "toc-continuation.md"
+    toc.write_text(
+        "\n".join(
+            [
+                "# Electronic edition published: October 28, 2024",
+                "",
+                (
+                    "Timers........................................................59 "
+                    "Interrupt handling.............................................62 "
+                    "Chapter 3: Interprocess Communication (IPC)....................69 "
+                    "Priority inheritance and messages..............................79 "
+                    "Message-passing API............................................81 "
+                    "Events.........................................................84 "
+                    "Signals........................................................86 "
+                    "Chapter 4: The Instrumented Microkernel.......................105 "
+                    "Chapter 5: Multicore Processing...............................113 "
+                    "Bound multiprocessing (BMP)...................................119 Contents "
+                    "Chapter 6: Process Manager....................................123 "
+                    "Using libc APIs to calculate memory reservations...............142 "
+                    "Chapter 7: Dynamic Linking....................................155 "
+                    "Chapter 8: Resource Managers.................................163"
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    mutex = tmp_path / "mutex.md"
+    mutex.write_text(
+        "\n".join(
+            [
+                "# Perform an operation on a synchronization object",
+                "",
+                "pthread mutex priority inheritance applies to synchronization APIs.",
+                "Mutex caveats and error handling must be considered before implementation.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=toc,
+        out_dir=processed_root,
+        title="QNX Neutrino RTOS 7.1 System Architecture",
+        source_type="architecture",
+        owner="checker",
+        document_version="SDP 7.1",
+    )
+    ingest_file(
+        file_path=mutex,
+        out_dir=processed_root,
+        title="QNX Neutrino RTOS 7.1 C Library Reference",
+        source_type="supplier api reference",
+        owner="checker",
+        document_version="SDP 7.1",
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query=(
+            "What QNX SDP 7.1 constraints or caveats should be considered "
+            "when using pthread mutex priority inheritance or related synchronization APIs?"
+        ),
+        task_type="constraint_lookup",
+        top_k=2,
+        per_document_limit=1,
+    )
+
+    assert result.selected_chunks
+    assert result.selected_chunks[0].document_title == "QNX Neutrino RTOS 7.1 C Library Reference"
+    assert result.selected_chunks[0].section_titles == [
+        "Perform an operation on a synchronization object"
+    ]
+    assert "Chapter 3: Interprocess Communication" not in result.selected_chunks[0].text
 
 
 def test_build_context_pack_uses_vector_index_for_semantic_like_query(tmp_path: Path):
@@ -2720,3 +3112,62 @@ def test_build_context_pack_returns_parse_warnings_for_agent_context(tmp_path: P
     assert payload["selected_chunks"][0]["warnings"] == ["synthetic_parse_warning"]
     assert payload["sections"][0]["items"][0]["warnings"] == ["synthetic_parse_warning"]
     assert "Warnings: `synthetic_parse_warning`" in result.markdown
+
+
+def test_neighbor_merged_chunks_are_capped_for_large_documents():
+    from agent_knowledge_hub.retrieval import _LoadedChunk, _build_neighbor_merged_chunks
+
+    chunks = [
+        _LoadedChunk(
+            chunk_id=f"chunk-{index}",
+            document_version_id="docver-large",
+            document_version="v1",
+            document_title="Large API Reference",
+            source_type="supplier api reference",
+            project="qnx-validation",
+            supplier="QNX",
+            source_path="large.pdf",
+            section_path=[str(index)],
+            section_titles=[f"Function {index}"],
+            page_start=index,
+            page_end=index,
+            text=f"Function {index} returns constraints and caveats.",
+            evidence_ids=[f"span-{index}"],
+            quality_status="ok",
+            quality_score=100.0,
+            allowed_for_context_pack=True,
+            quality_gate_reasons=[],
+            warnings=[],
+        )
+        for index in range(1201)
+    ]
+
+    assert _build_neighbor_merged_chunks(chunks) == []
+
+
+def test_quality_gate_adjustment_penalizes_disallowed_chunk_before_ok_status():
+    from agent_knowledge_hub.retrieval import _LoadedChunk, _quality_gate_adjustment
+
+    chunk = _LoadedChunk(
+        chunk_id="chunk-disallowed",
+        document_version_id="docver-disallowed",
+        document_version="v1",
+        document_title="Disallowed Doc",
+        source_type="internal note",
+        project="project",
+        supplier="internal",
+        source_path="disallowed.md",
+        section_path=["1"],
+        section_titles=["Disallowed"],
+        page_start=None,
+        page_end=None,
+        text="This chunk is externally matched but not allowed for Context Pack.",
+        evidence_ids=["span-disallowed"],
+        quality_status="ok",
+        quality_score=100.0,
+        allowed_for_context_pack=False,
+        quality_gate_reasons=["manual_block"],
+        warnings=[],
+    )
+
+    assert _quality_gate_adjustment(chunk) == -56.0

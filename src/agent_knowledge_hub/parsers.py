@@ -323,17 +323,178 @@ def _extract_pdf_text_pages_with_pypdf(path: Path) -> tuple[list[str], int, list
 
 def _build_pdf_text_layer_blocks(page_texts: list[str]) -> list[ParsedBlock]:
     blocks: list[ParsedBlock] = []
+    seen_heading_keys: set[str] = set()
     for page_index, text in enumerate(page_texts, start=1):
-        blocks.extend(
-            ParsedBlock(
-                block_type="paragraph",
-                text=paragraph,
-                page_start=page_index,
-                page_end=page_index,
-            )
-            for paragraph in _split_paragraphs(text)
-        )
+        paragraphs = _split_pdf_text_paragraphs(text)
+        for paragraph_index, paragraph in enumerate(paragraphs):
+            heading_level = _classify_pdf_text_heading(paragraph)
+            if heading_level is not None:
+                heading_key = _pdf_heading_key(paragraph)
+                if (
+                    page_index > 1
+                    and (paragraph_index == 0 or paragraph_index == len(paragraphs) - 1)
+                    and heading_level > 1
+                    and heading_key in seen_heading_keys
+                ):
+                    continue
+                seen_heading_keys.add(heading_key)
+                blocks.append(
+                    ParsedBlock(
+                        block_type="heading",
+                        text=paragraph,
+                        page_start=page_index,
+                        page_end=page_index,
+                        metadata={"level": heading_level, "pdf_text_heading": True},
+                    )
+                )
+            else:
+                blocks.append(
+                    ParsedBlock(
+                        block_type="paragraph",
+                        text=paragraph,
+                        page_start=page_index,
+                        page_end=page_index,
+                    )
+                )
     return blocks
+
+
+def _split_pdf_text_paragraphs(text: str) -> list[str]:
+    paragraphs: list[str] = []
+    paragraph_lines: list[str] = []
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph_lines
+        paragraph = normalize_space(" ".join(paragraph_lines))
+        if paragraph:
+            paragraphs.append(paragraph)
+        paragraph_lines = []
+
+    for raw_line in text.splitlines():
+        line = normalize_space(raw_line)
+        if not line:
+            flush_paragraph()
+            continue
+        if _is_pdf_text_noise_line(line):
+            continue
+        if _classify_pdf_text_heading(line) is not None:
+            flush_paragraph()
+            paragraphs.append(line)
+            continue
+        paragraph_lines.append(line)
+
+    flush_paragraph()
+    return paragraphs
+
+
+def _classify_pdf_text_heading(text: str) -> int | None:
+    normalized = normalize_space(text)
+    if not normalized:
+        return None
+    if len(normalized) > 96:
+        return None
+    if _is_non_heading_pdf_text_line(normalized):
+        return None
+    if normalized.endswith((".", ";", ":", ",")):
+        return None
+
+    if re.fullmatch(r"(?i)chapter\s+\d+[a-z]?", normalized):
+        return 1
+    if re.fullmatch(r"\d+(?:\.\d+){1,4}\s+\S.{2,}", normalized):
+        if re.fullmatch(r"\d+\.\s+\S.{2,}", normalized):
+            return None
+        depth = normalized.split(" ", 1)[0].count(".") + 1
+        return max(1, min(depth, 6))
+
+    words = normalized.split()
+    if 2 <= len(words) <= 8 and _looks_like_title_case_heading(words):
+        return 2
+    if 2 <= len(words) <= 8 and _looks_like_sentence_case_heading(words):
+        return 2
+    return None
+
+
+def _is_pdf_text_noise_line(text: str) -> bool:
+    normalized = normalize_space(text)
+    if not normalized:
+        return True
+    if re.fullmatch(r"\d{1,4}", normalized):
+        return True
+    if re.fullmatch(r"(?i)copyright\s+.*(?:\b|[a-z])\d{1,4}$", normalized):
+        return True
+    return False
+
+
+def _is_non_heading_pdf_text_line(text: str) -> bool:
+    if text[0] in {"•", "*", "#"}:
+        return True
+    if re.match(r"^\d+[\.)]\s+\S", text):
+        return True
+    if re.match(r"^[A-Za-z]+:\s", text):
+        return True
+    if re.search(r"https?://|www\.|@", text, re.IGNORECASE):
+        return True
+    if any(char in text for char in {"=", "|", "\\"}):
+        return True
+    if text.count("/") >= 2:
+        return True
+    if re.search(r"\s-{1,2}[\w-]+", text):
+        return True
+    if re.search(r"\b[A-Za-z0-9_]*_[A-Za-z0-9_]*\b", text):
+        return True
+    return False
+
+
+def _pdf_heading_key(text: str) -> str:
+    return normalize_space(text).casefold()
+
+
+def _looks_like_title_case_heading(words: list[str]) -> bool:
+    strong_words = 0
+    for word in words:
+        stripped = word.strip("()[]{}")
+        if not stripped:
+            continue
+        if stripped.lower() in {"and", "or", "of", "the", "a", "an", "to", "in", "at"}:
+            continue
+        if stripped[0].isupper() or stripped.isupper() or any(char.isdigit() for char in stripped):
+            strong_words += 1
+    return strong_words >= max(1, len(words) // 2)
+
+
+def _looks_like_sentence_case_heading(words: list[str]) -> bool:
+    first = words[0].strip("()[]{}")
+    if not first or not first[0].isupper():
+        return False
+    lower_words = {word.strip("()[]{}").lower() for word in words}
+    sentence_verbs = {
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "can",
+        "could",
+        "must",
+        "should",
+        "shall",
+        "will",
+        "would",
+        "do",
+        "does",
+        "did",
+        "has",
+        "have",
+        "had",
+        "describes",
+        "requires",
+        "contains",
+        "provides",
+        "uses",
+    }
+    return not bool(lower_words & sentence_verbs)
 
 
 def _parse_pdf_with_rapidocr(path: Path) -> ParsedDocument:

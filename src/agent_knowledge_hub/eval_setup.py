@@ -289,6 +289,8 @@ def prepare_eval_run(
     model: str = "待填写",
     top_k: int = 8,
     per_document_limit: int = 2,
+    fts_index_path: Path | str | None = None,
+    vector_index_path: Path | str | None = None,
 ) -> EvalRunSummary:
     cases_path = Path(eval_cases_path).resolve()
     processed_root = Path(processed_dir).resolve()
@@ -315,8 +317,11 @@ def prepare_eval_run(
         context_pack = build_context_pack_for_processed_dir(
             processed_dir=processed_root,
             query=case.question,
+            task_type=case.task_type,
             top_k=top_k,
             per_document_limit=per_document_limit,
+            fts_index_path=fts_index_path,
+            vector_index_path=vector_index_path,
         )
         case_context_dir = context_pack_dir / case.task_id
         case_context_dir.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,145 @@ from agent_knowledge_hub.utils import normalize_space, stable_id, write_json
 from agent_knowledge_hub.vector_index import query_vector_index
 
 
+CONTEXT_PACK_SCHEMA_VERSION = "context-pack.v1"
+DEFAULT_CONTEXT_PACK_TASK_TYPE = "general_query"
+MAX_CHUNKS_FOR_NEIGHBOR_MERGE = 1200
+CONTEXT_PACK_STABLE_FIELDS = (
+    "schema_version",
+    "task_type",
+    "task_profile",
+    "query",
+    "normalized_query",
+    "processed_dir",
+    "applied_filters",
+    "chunk_count",
+    "document_count",
+    "warnings",
+    "sections",
+    "selected_chunks",
+)
+CONTEXT_PACK_ITEM_STABLE_FIELDS = (
+    "evidence_number",
+    "task_item_type",
+    "summary",
+    "document_title",
+    "document_version",
+    "project",
+    "supplier",
+    "source_type",
+    "source_path",
+    "section_titles",
+    "section_path",
+    "matched_clauses",
+    "score",
+    "retrieval_signals",
+    "evidence_ids",
+    "quality_status",
+    "quality_score",
+    "allowed_for_context_pack",
+    "quality_gate_reasons",
+    "warnings",
+)
+CONTEXT_PACK_TASK_ALIASES = {
+    "": DEFAULT_CONTEXT_PACK_TASK_TYPE,
+    "general": DEFAULT_CONTEXT_PACK_TASK_TYPE,
+    "general_query": DEFAULT_CONTEXT_PACK_TASK_TYPE,
+    "query": DEFAULT_CONTEXT_PACK_TASK_TYPE,
+    "constraint": "constraint_lookup",
+    "constraint_query": "constraint_lookup",
+    "constraints": "constraint_lookup",
+    "constraint_lookup": "constraint_lookup",
+    "查约束": "constraint_lookup",
+    "code_review": "code_review",
+    "review": "code_review",
+    "代码评审": "code_review",
+    "impact": "impact_analysis",
+    "impact_analysis": "impact_analysis",
+    "影响分析": "impact_analysis",
+    "test": "test_design",
+    "test_design": "test_design",
+    "test_focus": "test_design",
+    "test_focus_generation": "test_design",
+    "test_review_checklist": "test_design",
+    "qa": "test_design",
+    "测试设计": "test_design",
+    "生成测试关注点": "test_design",
+    "生成测试点": "test_design",
+    "api": "api_usage",
+    "api_usage": "api_usage",
+    "interface_lookup": "api_usage",
+    "interface_mechanism_lookup": "api_usage",
+    "interface_mechanism": "api_usage",
+    "接口使用": "api_usage",
+    "机制查询": "api_usage",
+    "查接口": "api_usage",
+    "查接口/机制": "api_usage",
+    "查接口机制": "api_usage",
+}
+CONTEXT_PACK_TASK_PROFILES: dict[str, dict[str, object]] = {
+    "general_query": {
+        "label": "General Query",
+        "intent": "Answer the current question with compact, traceable evidence.",
+        "agent_use": (
+            "Use summary items first.",
+            "Quote evidence ids when an answer depends on a source claim.",
+            "Treat quality warnings as uncertainty, not as confirmed facts.",
+        ),
+        "preferred_sections": ("summary", "evidence", "evidence_appendix"),
+    },
+    "constraint_lookup": {
+        "label": "Constraint Lookup",
+        "intent": "Surface applicable constraints, risks, caveats, and source evidence.",
+        "agent_use": (
+            "Prioritize constraints and caveats over background text.",
+            "Keep document version and supplier visible in the answer.",
+            "Use evidence trace for any disputed or safety-relevant claim.",
+        ),
+        "preferred_sections": ("constraints", "risks", "evidence", "evidence_appendix"),
+    },
+    "code_review": {
+        "label": "Code Review",
+        "intent": "Provide review-ready constraints, implementation contracts, and risk evidence.",
+        "agent_use": (
+            "Turn constraints into concrete review checklist items.",
+            "Connect risks to changed modules or interfaces before raising findings.",
+            "Do not invent a finding when evidence only provides background context.",
+        ),
+        "preferred_sections": ("risks", "implementation_contracts", "tests", "evidence"),
+    },
+    "impact_analysis": {
+        "label": "Impact Analysis",
+        "intent": "Identify likely affected modules, interfaces, tests, and version constraints.",
+        "agent_use": (
+            "Group evidence by affected area before proposing changes.",
+            "Flag version-specific claims explicitly.",
+            "Use missing evidence as an open question rather than a conclusion.",
+        ),
+        "preferred_sections": ("affected_areas", "interfaces", "tests", "open_questions"),
+    },
+    "test_design": {
+        "label": "Test Design",
+        "intent": "Extract behaviors, constraints, and risks that should become test coverage.",
+        "agent_use": (
+            "Translate constraints into observable test conditions.",
+            "Preserve preconditions, error cases, and version applicability.",
+            "Reference evidence ids beside high-risk test cases.",
+        ),
+        "preferred_sections": ("behaviors", "edge_cases", "risks", "evidence"),
+    },
+    "api_usage": {
+        "label": "API Usage",
+        "intent": "Provide interface signatures, required arguments, return/error behavior, and caveats.",
+        "agent_use": (
+            "Keep API names, arguments, error codes, and caveats together.",
+            "Preserve version and safety classifications when present.",
+            "Use evidence ids for behavior that affects implementation choices.",
+        ),
+        "preferred_sections": ("interfaces", "arguments", "errors", "caveats", "evidence"),
+    },
+}
+
+
 ASCII_TOKEN_RE = re.compile(r"[a-z0-9_./=-]+")
 CJK_SEQUENCE_RE = re.compile(r"[\u4e00-\u9fff]+")
 CLAUSE_SPLIT_RE = re.compile(r"[，,。；;：:\n]+")
@@ -35,6 +174,32 @@ CJK_STOPGRAMS = {
     "请综",
     "综合",
     "说明",
+}
+QUERY_CORE_TERM_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "api",
+    "apis",
+    "be",
+    "caveat",
+    "caveats",
+    "consider",
+    "considered",
+    "constraint",
+    "constraints",
+    "for",
+    "how",
+    "or",
+    "qnx",
+    "related",
+    "sdp",
+    "should",
+    "the",
+    "to",
+    "using",
+    "what",
+    "when",
 }
 QUERY_NOISE_PREFIXES = (
     "只基于给定材料回答",
@@ -679,6 +844,90 @@ TOPIC_SECTION_LABELS: dict[str, str] = {
     "governance": "Safety / Governance Defaults",
     "other": "Additional Evidence",
 }
+TASK_TOPIC_SECTION_LABELS: dict[str, dict[str, str]] = {
+    "constraint_lookup": {
+        "architecture": "Design Constraints",
+        "backend": "Implementation Constraints",
+        "api": "Interface Constraints",
+        "rollout": "Validation / Rollback Constraints",
+        "governance": "Safety / Governance Constraints",
+        "other": "Additional Constraints",
+    },
+    "code_review": {
+        "architecture": "Review Design Decisions",
+        "backend": "Review Implementation Scope",
+        "api": "Review Interface Contracts",
+        "rollout": "Review Tests / Rollback",
+        "governance": "Review Safety Risks",
+        "other": "Additional Review Evidence",
+    },
+    "impact_analysis": {
+        "architecture": "Impacted Decisions",
+        "backend": "Impacted Backend Scope",
+        "api": "Impacted Interfaces",
+        "rollout": "Impacted Tests / Rollback",
+        "governance": "Impacted Governance Rules",
+        "other": "Additional Impact Evidence",
+    },
+    "test_design": {
+        "architecture": "Design Behaviors To Verify",
+        "backend": "Implementation Behaviors To Verify",
+        "api": "Interface Behaviors To Verify",
+        "rollout": "Rollback / Acceptance Tests",
+        "governance": "Safety / Governance Tests",
+        "other": "Additional Test Evidence",
+    },
+    "api_usage": {
+        "architecture": "Design Context",
+        "backend": "Implementation Context",
+        "api": "API Usage Evidence",
+        "rollout": "API Validation / Rollback",
+        "governance": "API Safety / Governance",
+        "other": "Additional API Evidence",
+    },
+}
+TASK_TOPIC_ITEM_TYPES: dict[str, dict[str, str]] = {
+    "constraint_lookup": {
+        "architecture": "design_constraint",
+        "backend": "implementation_constraint",
+        "api": "interface_constraint",
+        "rollout": "validation_constraint",
+        "governance": "safety_constraint",
+        "other": "supporting_constraint",
+    },
+    "code_review": {
+        "architecture": "review_design_context",
+        "backend": "review_implementation_context",
+        "api": "review_interface_contract",
+        "rollout": "review_test_or_rollback_context",
+        "governance": "review_risk",
+        "other": "review_supporting_evidence",
+    },
+    "impact_analysis": {
+        "architecture": "impacted_decision",
+        "backend": "impacted_implementation",
+        "api": "impacted_interface",
+        "rollout": "impacted_test_or_rollback",
+        "governance": "impacted_governance",
+        "other": "impact_supporting_evidence",
+    },
+    "test_design": {
+        "architecture": "design_test_condition",
+        "backend": "implementation_test_condition",
+        "api": "interface_test_condition",
+        "rollout": "rollout_test_condition",
+        "governance": "safety_test_condition",
+        "other": "test_supporting_evidence",
+    },
+    "api_usage": {
+        "architecture": "api_design_context",
+        "backend": "api_implementation_context",
+        "api": "api_contract",
+        "rollout": "api_validation_context",
+        "governance": "api_safety_context",
+        "other": "api_supporting_evidence",
+    },
+}
 TOPIC_SUBFACET_HINTS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
     "api": {
         "agent_create_fields": {
@@ -1034,6 +1283,8 @@ class RetrievedChunk:
 @dataclass(frozen=True)
 class ContextPackResult:
     schema_version: str
+    task_type: str
+    task_profile: dict[str, object]
     query: str
     normalized_query: str
     processed_dir: Path
@@ -1042,17 +1293,25 @@ class ContextPackResult:
     markdown: str
     chunk_count: int
     document_count: int
+    warnings: list[str]
 
     def to_json_dict(self) -> dict[str, object]:
-        sections = _build_context_pack_section_payloads(self.selected_chunks)
+        sections = _build_context_pack_section_payloads(
+            self.selected_chunks,
+            task_type=self.task_type,
+        )
         return {
             "schema_version": self.schema_version,
+            "task_type": self.task_type,
+            "task_profile": dict(self.task_profile),
+            "contract": _build_context_pack_contract(),
             "query": self.query,
             "normalized_query": self.normalized_query,
             "processed_dir": str(self.processed_dir),
             "applied_filters": {key: list(value) for key, value in self.applied_filters.items()},
             "chunk_count": self.chunk_count,
             "document_count": self.document_count,
+            "warnings": list(self.warnings),
             "sections": sections,
             "selected_chunks": [chunk.to_dict() for chunk in self.selected_chunks],
         }
@@ -1060,16 +1319,21 @@ class ContextPackResult:
     def to_summary_dict(self, *, output_dir: Path | None = None) -> dict[str, object]:
         sections = _build_context_pack_section_payloads(
             self.selected_chunks,
+            task_type=self.task_type,
             include_full_chunk=False,
         )
         return {
             "schema_version": self.schema_version,
+            "task_type": self.task_type,
+            "task_profile": dict(self.task_profile),
+            "contract": _build_context_pack_contract(),
             "processed_dir": str(self.processed_dir),
             "query": self.query,
             "normalized_query": self.normalized_query,
             "applied_filters": {key: list(value) for key, value in self.applied_filters.items()},
             "chunk_count": self.chunk_count,
             "document_count": self.document_count,
+            "warnings": list(self.warnings),
             "output_dir": str(output_dir) if output_dir else None,
             "sections": sections,
             "selected_chunks": [
@@ -1224,6 +1488,7 @@ def build_context_pack_for_processed_dir(
     *,
     processed_dir: Path | str,
     query: str,
+    task_type: str = DEFAULT_CONTEXT_PACK_TASK_TYPE,
     top_k: int = 8,
     per_document_limit: int = 2,
     metadata_filters: dict[str, list[str]] | None = None,
@@ -1231,6 +1496,8 @@ def build_context_pack_for_processed_dir(
     vector_index_path: Path | str | None = None,
 ) -> ContextPackResult:
     processed_root = Path(processed_dir).resolve()
+    normalized_task_type = _normalize_context_pack_task_type(task_type)
+    task_profile = _build_context_pack_task_profile(normalized_task_type)
     if top_k <= 0:
         raise ValueError("top_k must be > 0")
     if per_document_limit <= 0:
@@ -1336,9 +1603,18 @@ def build_context_pack_for_processed_dir(
         )
         for candidate in selected
     ]
-    markdown = _render_context_pack_markdown(query=normalized_query, chunks=selected_chunks)
+    warnings = _build_context_pack_warnings(selected_chunks)
+    markdown = _render_context_pack_markdown(
+        query=normalized_query,
+        task_type=normalized_task_type,
+        task_profile=task_profile,
+        warnings=warnings,
+        chunks=selected_chunks,
+    )
     return ContextPackResult(
-        schema_version="context-pack.v1",
+        schema_version=CONTEXT_PACK_SCHEMA_VERSION,
+        task_type=normalized_task_type,
+        task_profile=task_profile,
         query=query,
         normalized_query=normalized_query,
         processed_dir=processed_root,
@@ -1347,7 +1623,52 @@ def build_context_pack_for_processed_dir(
         markdown=markdown,
         chunk_count=len(selected_chunks),
         document_count=len({chunk.document_version_id for chunk in selected_chunks}),
+        warnings=warnings,
     )
+
+
+def _normalize_context_pack_task_type(task_type: str | None) -> str:
+    normalized = normalize_space(str(task_type or DEFAULT_CONTEXT_PACK_TASK_TYPE)).lower()
+    normalized = normalized.replace("-", "_").replace(" ", "_")
+    resolved = CONTEXT_PACK_TASK_ALIASES.get(normalized)
+    if resolved:
+        return resolved
+    allowed = ", ".join(sorted(CONTEXT_PACK_TASK_PROFILES))
+    raise ValueError(f"Unsupported task_type '{task_type}'. Supported task types: {allowed}")
+
+
+def _build_context_pack_task_profile(task_type: str) -> dict[str, object]:
+    profile = CONTEXT_PACK_TASK_PROFILES[task_type]
+    return {
+        "label": str(profile["label"]),
+        "intent": str(profile["intent"]),
+        "agent_use": list(profile["agent_use"]),
+        "preferred_sections": list(profile["preferred_sections"]),
+    }
+
+
+def _build_context_pack_contract() -> dict[str, object]:
+    return {
+        "name": "Context Pack v1",
+        "schema_version": CONTEXT_PACK_SCHEMA_VERSION,
+        "stability": "stable_for_layer3",
+        "stable_fields": list(CONTEXT_PACK_STABLE_FIELDS),
+        "item_stable_fields": list(CONTEXT_PACK_ITEM_STABLE_FIELDS),
+    }
+
+
+def _build_context_pack_warnings(chunks: list[RetrievedChunk]) -> list[str]:
+    warnings: list[str] = []
+    for chunk in chunks:
+        if not chunk.allowed_for_context_pack:
+            warnings.append(
+                f"quality_gate_bypassed:{chunk.document_title}:{chunk.chunk_id}"
+            )
+        for reason in chunk.quality_gate_reasons:
+            warnings.append(f"quality_gate_reason:{chunk.document_title}:{reason}")
+        for warning in chunk.warnings:
+            warnings.append(f"source_warning:{chunk.document_title}:{warning}")
+    return list(dict.fromkeys(warnings))
 
 
 def search_processed_dir(
@@ -1484,12 +1805,20 @@ def load_context_pack_result(path: Path | str) -> ContextPackResult:
         )
         for item in payload.get("selected_chunks") or []
     ]
+    task_type = _normalize_context_pack_task_type(str(payload.get("task_type") or ""))
+    task_profile = _build_context_pack_task_profile(task_type)
+    warnings = [str(item) for item in (payload.get("warnings") or [])]
     markdown = _render_context_pack_markdown(
         query=payload.get("normalized_query") or payload.get("query") or "",
+        task_type=task_type,
+        task_profile=task_profile,
+        warnings=warnings,
         chunks=selected_chunks,
     )
     return ContextPackResult(
-        schema_version=str(payload.get("schema_version") or "context-pack.v1"),
+        schema_version=str(payload.get("schema_version") or CONTEXT_PACK_SCHEMA_VERSION),
+        task_type=task_type,
+        task_profile=task_profile,
         query=payload.get("query") or "",
         normalized_query=payload.get("normalized_query") or payload.get("query") or "",
         processed_dir=Path(payload.get("processed_dir") or json_path.parent),
@@ -1504,6 +1833,7 @@ def load_context_pack_result(path: Path | str) -> ContextPackResult:
             payload.get("document_count")
             or len({chunk.document_version_id for chunk in selected_chunks})
         ),
+        warnings=warnings,
     )
 
 
@@ -1663,6 +1993,9 @@ def _extract_document_warnings(document_payload: dict) -> list[str]:
 
 def _build_neighbor_merged_chunks(document_chunks: list[_LoadedChunk]) -> list[_LoadedChunk]:
     merged_chunks: list[_LoadedChunk] = []
+    if len(document_chunks) > MAX_CHUNKS_FOR_NEIGHBOR_MERGE:
+        return merged_chunks
+
     seen_ids: set[str] = set()
     max_window = min(7, len(document_chunks))
 
@@ -2642,16 +2975,16 @@ def _query_asks_outbound_method(normalized_query: str) -> bool:
 
 def _quality_gate_adjustment(chunk: _LoadedChunk) -> float:
     status = chunk.quality_status
+    if status in {"unsupported", "ocr_unavailable"}:
+        return -80.0
+    if not chunk.allowed_for_context_pack:
+        return -56.0
     if status == "ok":
         return 0.0
     if status == "recovered_by_fallback":
         return -4.0
     if status == "low_quality":
         return -42.0
-    if status in {"unsupported", "ocr_unavailable"}:
-        return -80.0
-    if not chunk.allowed_for_context_pack:
-        return -56.0
     return -24.0
 
 
@@ -2671,6 +3004,8 @@ def _looks_like_toc_or_index_chunk(text: str) -> bool:
     normalized = normalize_space(text)
     if not normalized:
         return False
+    if _looks_like_compact_pdf_toc_chunk(normalized):
+        return True
     lines = [
         line.strip()
         for line in normalized.splitlines()
@@ -2699,6 +3034,37 @@ def _looks_like_toc_or_index_chunk(text: str) -> bool:
         and heading_like_lines >= 5
         and short_heading_ratio >= 0.6
         and not has_normative_sentence
+    )
+
+
+def _looks_like_compact_pdf_toc_chunk(normalized_text: str) -> bool:
+    lowered = normalized_text.lower()
+    has_toc_marker = (
+        "contents" in lowered[:120]
+        or " contents " in f" {lowered} "
+        or lowered.rstrip().endswith("contents")
+        or "目录" in normalized_text[:80]
+        or " 目录 " in f" {normalized_text} "
+        or "目次" in normalized_text[:80]
+        or " 目次 " in f" {normalized_text} "
+    )
+
+    dot_leader_hits = len(re.findall(r"\.{4,}\s*\d+\b", normalized_text))
+    chapter_hits = len(re.findall(r"\bchapter\s+\d+\s*[:：]", normalized_text, re.IGNORECASE))
+    numbered_heading_hits = len(
+        re.findall(
+            r"(?:^|\s)(?:\d+(?:\.\d+){0,4}|[A-Z]\.\d+(?:\.\d+)*)\s*"
+            r"[\u4e00-\u9fffA-Za-z][^.\n]{0,80}\.{4,}\s*\d+\b",
+            normalized_text,
+        )
+    )
+    section_like_hits = chapter_hits + numbered_heading_hits
+
+    return (
+        dot_leader_hits >= 6
+        and (section_like_hits >= 2 or has_toc_marker)
+        and (has_toc_marker or dot_leader_hits >= 10)
+        and not _contains_direct_answer_sentence(normalized_text)
     )
 
 
@@ -3266,6 +3632,13 @@ def _pick_topic_candidate(
 
     for candidate in eligible_candidates:
         document_key = candidate.chunk.document_version_id
+        if _looks_like_toc_or_index_chunk(candidate.chunk.text):
+            continue
+        if not _candidate_covers_core_query_terms(
+            candidate=candidate,
+            query_text=query_text,
+        ):
+            continue
         topic_score = candidate.topic_scores.get(topic, 0.0)
         utility = candidate.overall_score + 28.0 + (topic_score * 1.5)
         utility += 2.0 * len(candidate.clause_hits)
@@ -3311,6 +3684,45 @@ def _pick_topic_candidate(
             best_candidate = candidate
 
     return best_candidate
+
+
+def _candidate_covers_core_query_terms(
+    *,
+    candidate: _CandidateScore,
+    query_text: str,
+) -> bool:
+    core_terms = _extract_core_query_terms(query_text)
+    if len(core_terms) < 2:
+        return True
+
+    candidate_tokens = _tokenize_for_search(
+        "\n".join(
+            [
+                candidate.chunk.document_title,
+                "\n".join(candidate.chunk.section_titles),
+                candidate.chunk.text,
+            ]
+        )
+    )
+    matched_terms = {term for term in core_terms if candidate_tokens.get(term, 0) > 0}
+    required_matches = max(1, min(len(core_terms), math.ceil(len(core_terms) * 0.5)))
+    return len(matched_terms) >= required_matches
+
+
+def _extract_core_query_terms(query_text: str) -> set[str]:
+    tokens = _tokenize_for_search(query_text)
+    core_terms: set[str] = set()
+    for term in tokens:
+        if not re.fullmatch(r"[a-z0-9_./=-]+", term):
+            continue
+        if term in QUERY_CORE_TERM_STOPWORDS:
+            continue
+        if term.isdigit():
+            continue
+        if len(term) < 4 and not any(char in term for char in {"_", "/", ".", "-"}):
+            continue
+        core_terms.add(term)
+    return core_terms
 
 
 def _document_title_matches_topic(document_title: str, topic: str) -> bool:
@@ -3623,10 +4035,21 @@ def _extract_reference_concepts(text: str) -> set[str]:
     return concepts
 
 
-def _render_context_pack_markdown(*, query: str, chunks: list[RetrievedChunk]) -> str:
-    rendered_sections = _build_render_sections(chunks)
+def _render_context_pack_markdown(
+    *,
+    query: str,
+    task_type: str,
+    task_profile: dict[str, object],
+    warnings: list[str],
+    chunks: list[RetrievedChunk],
+) -> str:
+    rendered_sections = _build_render_sections(chunks, task_type=task_type)
     lines = [
         "# Context Pack",
+        "",
+        f"Schema Version: `{CONTEXT_PACK_SCHEMA_VERSION}`",
+        f"Task Type: `{task_type}`",
+        f"Task Intent: {task_profile.get('intent')}",
         "",
         "Query:",
         "",
@@ -3635,9 +4058,23 @@ def _render_context_pack_markdown(*, query: str, chunks: list[RetrievedChunk]) -
         f"Selected Documents: {len({chunk.document_version_id for chunk in chunks})}",
         f"Selected Chunks: {len(chunks)}",
         "",
-        "## Summary",
+        "## Agent Use",
         "",
     ]
+    agent_use = [str(item) for item in (task_profile.get("agent_use") or [])]
+    lines.extend(f"- {item}" for item in agent_use)
+    lines.extend(["", "## Warnings", ""])
+    if warnings:
+        lines.extend(f"- `{warning}`" for warning in warnings)
+    else:
+        lines.append("- None")
+    lines.extend(
+        [
+            "",
+        "## Summary",
+        "",
+        ]
+    )
 
     summary_lines = _render_summary_lines(rendered_sections)
     lines.extend(summary_lines if summary_lines else ["- No evidence selected.", ""])
@@ -3657,14 +4094,24 @@ def _render_context_pack_markdown(*, query: str, chunks: list[RetrievedChunk]) -
 def _build_context_pack_section_payloads(
     chunks: list[RetrievedChunk],
     *,
+    task_type: str = DEFAULT_CONTEXT_PACK_TASK_TYPE,
     include_full_chunk: bool = True,
 ) -> list[dict[str, object]]:
     payload_sections: list[dict[str, object]] = []
-    for section_label, evidence_items in _build_render_sections(chunks):
+    normalized_task_type = _normalize_context_pack_task_type(task_type)
+    for section_label, evidence_items in _build_render_sections(
+        chunks,
+        task_type=normalized_task_type,
+    ):
         items: list[dict[str, object]] = []
         for evidence_number, chunk in evidence_items:
+            topic = _classify_chunk_topic(chunk)
             item_payload: dict[str, object] = {
                 "evidence_number": evidence_number,
+                "task_item_type": _task_item_type_for_topic(
+                    task_type=normalized_task_type,
+                    topic=topic,
+                ),
                 "summary": _summarize_chunk(chunk),
                 "document_title": chunk.document_title,
                 "document_version": chunk.document_version,
@@ -3698,14 +4145,20 @@ def _build_context_pack_section_payloads(
 
 def _build_render_sections(
     chunks: list[RetrievedChunk],
+    *,
+    task_type: str = DEFAULT_CONTEXT_PACK_TASK_TYPE,
 ) -> list[tuple[str, list[tuple[int, RetrievedChunk]]]]:
+    normalized_task_type = _normalize_context_pack_task_type(task_type)
     sections: list[tuple[str, list[tuple[int, RetrievedChunk]]]] = []
     current_label: str | None = None
     current_items: list[tuple[int, RetrievedChunk]] = []
 
     for index, chunk in enumerate(chunks, start=1):
         topic = _classify_chunk_topic(chunk)
-        section_label = TOPIC_SECTION_LABELS.get(topic, TOPIC_SECTION_LABELS["other"])
+        section_label = _section_label_for_topic(
+            task_type=normalized_task_type,
+            topic=topic,
+        )
         if current_label is not None and section_label != current_label:
             sections.append((current_label, current_items))
             current_items = []
@@ -3715,6 +4168,16 @@ def _build_render_sections(
     if current_label is not None:
         sections.append((current_label, current_items))
     return sections
+
+
+def _section_label_for_topic(*, task_type: str, topic: str) -> str:
+    labels = TASK_TOPIC_SECTION_LABELS.get(task_type, TOPIC_SECTION_LABELS)
+    return labels.get(topic, labels.get("other", TOPIC_SECTION_LABELS["other"]))
+
+
+def _task_item_type_for_topic(*, task_type: str, topic: str) -> str:
+    item_types = TASK_TOPIC_ITEM_TYPES.get(task_type, {})
+    return item_types.get(topic, item_types.get("other", "supporting_evidence"))
 
 
 def _classify_chunk_topic(chunk: RetrievedChunk) -> str:

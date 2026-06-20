@@ -39,6 +39,8 @@ def test_context_pack_cli_writes_markdown_json_and_summary(tmp_path: Path):
             str(processed_root),
             "--query",
             "为什么选第三种 runtime，默认规则是什么？",
+            "--task-type",
+            "code_review",
             "--output-dir",
             str(output_dir),
         ]
@@ -57,8 +59,14 @@ def test_context_pack_cli_writes_markdown_json_and_summary(tmp_path: Path):
 
     assert "## Summary" in context_pack_markdown
     assert "## Evidence Appendix" in context_pack_markdown
-    assert context_pack_json["sections"][0]["title"] == "Architecture Decision"
-    assert context_pack_summary["sections"][0]["title"] == "Architecture Decision"
+    assert "Task Type: `code_review`" in context_pack_markdown
+    assert context_pack_json["schema_version"] == "context-pack.v1"
+    assert context_pack_json["task_type"] == "code_review"
+    assert context_pack_json["contract"]["stability"] == "stable_for_layer3"
+    assert context_pack_json["sections"][0]["title"] == "Review Design Decisions"
+    assert context_pack_json["sections"][0]["items"][0]["task_item_type"].startswith("review_")
+    assert context_pack_summary["task_type"] == "code_review"
+    assert context_pack_summary["sections"][0]["title"] == "Review Design Decisions"
 
 
 def test_gap_report_cli_writes_markdown_and_json(tmp_path: Path):
@@ -317,6 +325,52 @@ def test_build_fts_index_cli_writes_sqlite_index(tmp_path: Path):
     assert exit_code == 0
     assert index_path.exists()
     assert index_path.with_suffix(".summary.json").exists()
+
+
+def test_trace_cli_writes_evidence_trace_json(tmp_path: Path, capsys):
+    processed_root = tmp_path / "processed"
+    source = tmp_path / "api.md"
+    source.write_text(
+        "# API\n\nThe runtime endpoint is /runtime-runs/{run_id}/events and must preserve evidence ids.\n",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="API",
+        source_type="internal api",
+        owner="checker",
+        document_version="v1",
+    )
+
+    document_path = next(processed_root.rglob("canonical-document.json"))
+    payload = json.loads(document_path.read_text(encoding="utf-8"))
+    evidence_id = next(
+        evidence["evidence_id"]
+        for evidence in payload["evidence_spans"]
+        if "/runtime-runs/{run_id}/events" in evidence["text"]
+    )
+    output_path = tmp_path / "trace" / "evidence-trace.json"
+
+    exit_code = main(
+        [
+            "trace",
+            "--processed-dir",
+            str(processed_root),
+            "--evidence-id",
+            evidence_id,
+            "--output-path",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    trace_payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert trace_payload["evidence_id"] == evidence_id
+    assert trace_payload["document_title"] == "API"
+    assert "/runtime-runs/{run_id}/events" in trace_payload["text"]
+    captured = capsys.readouterr().out
+    assert evidence_id in captured
 
 
 def test_context_pack_cli_uses_vector_index_for_local_similarity_query(tmp_path: Path, capsys):

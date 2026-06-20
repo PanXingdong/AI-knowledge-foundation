@@ -221,11 +221,15 @@ def _build_fts_match_query(query: str) -> str | None:
                 char for char in token if char.isalnum() or char in {"_", ".", "/", "-"}
             )
             if len(cleaned) >= 2:
-                tokens.append(f"{cleaned}*")
+                tokens.append(f"{_escape_fts_token(cleaned)}*")
 
     if not tokens:
         return None
     return " AND ".join(dict.fromkeys(tokens))
+
+
+def _escape_fts_token(token: str) -> str:
+    return '"' + token.replace('"', '""') + '"'
 
 
 def _iter_latest_processed_versions(processed_dir: Path) -> list[tuple[Path, dict]]:

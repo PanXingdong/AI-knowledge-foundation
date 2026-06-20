@@ -38,6 +38,7 @@ Request:
 {
   "processed_dir": "D:/runs/processed",
   "query": "重要数据出境有什么限制？",
+  "task_type": "constraint_lookup",
   "top_k": 8,
   "per_document_limit": 2,
   "fts_index_path": "D:/runs/index/chunks.db",
@@ -50,6 +51,23 @@ Request:
   }
 }
 ```
+
+Supported Context Pack task types:
+
+- `general_query`: default compact answer context.
+- `constraint_lookup`: constraints, caveats, risks, and source evidence.
+- `code_review`: review-ready risks, implementation contracts, and tests.
+- `impact_analysis`: likely affected areas, interfaces, tests, and open questions.
+- `test_design`: behaviors, edge cases, risks, and test evidence.
+- `api_usage`: signatures, arguments, returns/errors, caveats, and API evidence.
+
+Common aliases are normalized to the stable task types above for compatibility with older eval templates and owner input forms. Current supported aliases include:
+
+- `constraint_lookup`: `constraint-query`, `constraint_query`, `constraint`, `constraints`, `查约束`.
+- `code_review`: `review`, `代码评审`.
+- `impact_analysis`: `impact`, `影响分析`.
+- `test_design`: `test`, `test_focus`, `test_focus_generation`, `test_review_checklist`, `qa`, `测试设计`, `生成测试关注点`, `生成测试点`.
+- `api_usage`: `api`, `interface_lookup`, `interface_mechanism_lookup`, `interface_mechanism`, `接口使用`, `机制查询`, `查接口`, `查接口/机制`, `查接口机制`.
 
 Supported P0 filter keys:
 
@@ -64,6 +82,56 @@ Response shape:
 {
   "data": {
     "schema_version": "context-pack.v1",
+    "task_type": "constraint_lookup",
+    "task_profile": {
+      "label": "Constraint Lookup",
+      "intent": "Surface applicable constraints, risks, caveats, and source evidence.",
+      "agent_use": [
+        "Prioritize constraints and caveats over background text."
+      ],
+      "preferred_sections": ["constraints", "risks", "evidence", "evidence_appendix"]
+    },
+    "contract": {
+      "name": "Context Pack v1",
+      "schema_version": "context-pack.v1",
+      "stability": "stable_for_layer3",
+      "stable_fields": [
+        "schema_version",
+        "task_type",
+        "task_profile",
+        "query",
+        "normalized_query",
+        "processed_dir",
+        "applied_filters",
+        "chunk_count",
+        "document_count",
+        "warnings",
+        "sections",
+        "selected_chunks"
+      ],
+      "item_stable_fields": [
+        "evidence_number",
+        "task_item_type",
+        "summary",
+        "document_title",
+        "document_version",
+        "project",
+        "supplier",
+        "source_type",
+        "source_path",
+        "section_titles",
+        "section_path",
+        "matched_clauses",
+        "score",
+        "retrieval_signals",
+        "evidence_ids",
+        "quality_status",
+        "quality_score",
+        "allowed_for_context_pack",
+        "quality_gate_reasons",
+        "warnings"
+      ]
+    },
     "query": "...",
     "normalized_query": "...",
     "processed_dir": "...",
@@ -72,12 +140,44 @@ Response shape:
     },
     "chunk_count": 3,
     "document_count": 2,
-    "sections": [],
+    "warnings": [],
+    "sections": [
+      {
+        "title": "Additional Constraints",
+        "items": [
+          {
+            "evidence_number": 1,
+            "task_item_type": "supporting_constraint",
+            "summary": "...",
+            "document_title": "...",
+            "document_version": "v7.0",
+            "supplier": "Bosch",
+            "project": "cockpit",
+            "source_type": "supplier spec",
+            "source_path": "...",
+            "section_titles": [],
+            "section_path": [],
+            "matched_clauses": [],
+            "score": 12.34,
+            "retrieval_signals": ["lexical", "bm25"],
+            "evidence_ids": ["span_xxx"],
+            "quality_status": "ok",
+            "quality_score": 100.0,
+            "allowed_for_context_pack": true,
+            "quality_gate_reasons": [],
+            "warnings": [],
+            "chunk": {}
+          }
+        ]
+      }
+    ],
     "selected_chunks": [],
     "markdown": "# Context Pack..."
   }
 }
 ```
+
+`schema_version`, `task_type`, `task_profile`, `warnings`, `sections`, and `selected_chunks` are part of the Context Pack v1 contract. `contract.stable_fields` and `contract.item_stable_fields` are emitted with every pack so Layer3 callers can validate the shape they depend on.
 
 Selected chunks include document title, document version, supplier, project, source path, source type, section path, section titles, page range, evidence ids, matched clauses, quality status, quality score, gate reasons, and warnings.
 
@@ -86,6 +186,7 @@ Selected chunks also include `retrieval_signals`, which explains which retrieval
 `sections[].items[]` is the stable P0/P1 transition payload for agent consumption. Each item currently includes:
 
 - `evidence_number`
+- `task_item_type`
 - `summary`
 - `document_title`
 - `document_version`
@@ -104,11 +205,12 @@ Selected chunks also include `retrieval_signals`, which explains which retrieval
 - `allowed_for_context_pack`
 - `quality_gate_reasons`
 - `warnings`
-- `chunk`
+
+`chunk` is included in full JSON responses for debug and trace expansion, but it is not an item stable field. Summary bundles can omit the full `chunk` while preserving the stable item fields above.
 
 ## POST /api/search
 
-Request is the same as `/api/context-pack`.
+Request is the same envelope as `/api/context-pack`, but `task_type` is ignored because search returns raw ranked chunks instead of a task-shaped Context Pack.
 
 Response shape:
 
@@ -290,6 +392,7 @@ Current internal CLI filter shape:
 ```powershell
 python -m agent_knowledge_hub.cli context-pack `
   --processed-dir ".\\data\\processed" `
+  --task-type "code_review" `
   --query "诊断模块修改需要注意什么？" `
   --supplier "Bosch" `
   --document-version "v7.0" `
