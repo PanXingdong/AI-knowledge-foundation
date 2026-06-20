@@ -24,6 +24,13 @@ eval-run/
 experiments/runs/*
 !experiments/runs/README.md
 
+# QNX knowledge base - generated artifacts and sensitive manifests
+qnx-knowledge/parse-quality-summary.json
+qnx-knowledge/parse-quality-summary.md
+qnx-knowledge/qnx-doc-manifest.csv
+qnx-knowledge/ingest*.log
+qnx-knowledge/processed/
+
 # Confidential or raw documents
 samples/raw/*
 !samples/raw/README.md
