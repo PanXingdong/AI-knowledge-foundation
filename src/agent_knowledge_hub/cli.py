@@ -122,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
                 metadata_filters=_build_metadata_filters_from_args(args),
                 fts_index_path=args.fts_index_path,
                 vector_index_path=args.vector_index_path,
+                token_budget=args.token_budget,
             )
             if args.output_dir:
                 bundle_paths = write_context_pack_bundle(
@@ -395,6 +396,12 @@ def _build_parser() -> argparse.ArgumentParser:
     context_pack_parser.add_argument("--task-type", default="general_query")
     context_pack_parser.add_argument("--top-k", type=int, default=8)
     context_pack_parser.add_argument("--per-document-limit", type=int, default=2)
+    context_pack_parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        help="Optional max estimated tokens for the rendered pack; trims lowest-priority chunks to fit.",
+    )
     context_pack_parser.add_argument("--source-type", action="append")
     context_pack_parser.add_argument("--project-filter", action="append")
     context_pack_parser.add_argument("--supplier", action="append")
