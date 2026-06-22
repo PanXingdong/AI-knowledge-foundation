@@ -23,6 +23,14 @@ agent-artifacts/
 eval-run/
 experiments/runs/*
 !experiments/runs/README.md
+models/
+_qnx_*
+_tmp_*
+_ask.py
+_ask_out.txt
+_probe.py
+_probe_out.txt
+_run_ingest.py
 
 # QNX knowledge base - generated artifacts and sensitive manifests
 qnx-knowledge/parse-quality-summary.json

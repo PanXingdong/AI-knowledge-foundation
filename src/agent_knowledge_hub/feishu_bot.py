@@ -22,6 +22,8 @@ class FeishuConfig:
     api_base: str = "https://open.feishu.cn/open-apis"
     local_api_base: str = "http://127.0.0.1:8789"
     processed_dir: str = ""
+    fts_index_path: str = ""
+    vector_index_path: str = ""
     reference_markdown_path: str = ""
     default_top_k: int = 8
     default_per_document_limit: int = 2
@@ -36,6 +38,8 @@ class FeishuConfig:
             api_base=os.getenv("FEISHU_API_BASE", "https://open.feishu.cn/open-apis"),
             local_api_base=os.getenv("LOCAL_API_BASE", "http://127.0.0.1:8789"),
             processed_dir=os.getenv("PROCESSED_DIR", ""),
+            fts_index_path=os.getenv("FTS_INDEX_PATH", ""),
+            vector_index_path=os.getenv("VECTOR_INDEX_PATH", ""),
             reference_markdown_path=os.getenv("REFERENCE_MARKDOWN_PATH", ""),
             default_top_k=int(os.getenv("DEFAULT_TOP_K", "8")),
             default_per_document_limit=int(os.getenv("DEFAULT_PER_DOCUMENT_LIMIT", "2")),
@@ -43,7 +47,7 @@ class FeishuConfig:
         )
 
 
-def _http_post(url: str, data: dict[str, Any], headers: dict[str, str] | None = None, timeout: int = 30) -> dict[str, Any]:
+def _http_post(url: str, data: dict[str, Any], headers: dict[str, str] | None = None, timeout: int = 120) -> dict[str, Any]:
     req_headers = headers or {}
     req = urllib.request.Request(
         url,
@@ -96,6 +100,8 @@ class LocalAPIClient:
         top_k: int = 8,
         per_document_limit: int = 2,
         task_type: str | None = None,
+        fts_index_path: str | None = None,
+        vector_index_path: str | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}/api/context-pack"
         try:
@@ -107,6 +113,10 @@ class LocalAPIClient:
             }
             if task_type is not None:
                 payload["task_type"] = task_type
+            if fts_index_path is not None:
+                payload["fts_index_path"] = fts_index_path
+            if vector_index_path is not None:
+                payload["vector_index_path"] = vector_index_path
             data = _http_post(url, payload)
             return data.get("data", {})
         except urllib.error.HTTPError as e:

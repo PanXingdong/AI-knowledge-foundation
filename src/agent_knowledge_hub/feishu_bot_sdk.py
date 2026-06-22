@@ -17,6 +17,7 @@ from agent_knowledge_hub.feishu_bot import (
     assemble_reply,
     filter_mentions,
 )
+from agent_knowledge_hub.llm_agent import LLMAgent
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class FeishuBotSDK:
         self.local_api = LocalAPIClient(self.config.local_api_base)
         self.feishu_api = FeishuAPI(self.config)
         self.formatter = MessageFormatter()
+        self.llm_agent = LLMAgent.from_env()
         self._channel = None
         self._message_count = 0
         self._start_time: float = 0
@@ -133,53 +135,51 @@ class FeishuBotSDK:
             start_time = time.time()
 
         try:
+            # ── Step 1: chitchat shortcut (no KB call) ──────────────────
+            if self.llm_agent.is_chitchat(query):
+                logger.info("Intent: chitchat, skipping KB retrieval")
+                reply = self.llm_agent.direct_reply(query)
+                reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
+                self.feishu_api.send_text_message(chat_id, reply)
+                logger.info("总耗时: %.2fs", time.time() - start_time)
+                return
+
+            # ── Step 2: knowledge base retrieval ───────────────────────
             t1 = time.time()
             context_pack = self.local_api.get_context_pack(
                 processed_dir=self.config.processed_dir,
                 query=query,
                 top_k=self.config.default_top_k,
                 per_document_limit=self.config.default_per_document_limit,
+                fts_index_path=self.config.fts_index_path or None,
+                vector_index_path=self.config.vector_index_path or None,
             )
             t2 = time.time()
 
             score_threshold = -30.0
             selected_chunks = context_pack.get("selected_chunks", [])
-            if selected_chunks:
-                max_score = max(chunk.get("score", float("-inf")) for chunk in selected_chunks)
-                if max_score < score_threshold:
-                    logger.info("查询无匹配内容: query=%s, max_score=%.2f", query, max_score)
-                    self.feishu_api.send_text_message(chat_id, "未找到相关内容")
-                    return
+            has_evidence = bool(selected_chunks) and (
+                max((c.get("score", float("-inf")) for c in selected_chunks), default=float("-inf"))
+                >= score_threshold
+            )
 
-            context_pack_text = self.formatter.format_context_pack(context_pack, score_threshold)
-            t3 = time.time()
-            logger.info("步骤耗时: 获取Context Pack=%.2fs, 格式化=%.2fs", t2 - t1, t3 - t2)
+            # ── Step 3: LLM synthesis ───────────────────────────────────
+            if not has_evidence:
+                logger.info("KB: no relevant evidence for query=%s", query[:40])
+                reply = self.llm_agent.no_evidence_reply(query)
+            else:
+                context_pack_text = self.formatter.format_context_pack(context_pack, score_threshold)
+                t3 = time.time()
+                logger.info("步骤耗时: KB=%.2fs, 格式化=%.2fs", t2 - t1, t3 - t2)
+                reply = self.llm_agent.synthesize(query, context_pack_text)
 
-            gap_report_text = ""
-            ref_path = self.config.reference_markdown_path
-            if ref_path and Path(ref_path).exists():
-                t4 = time.time()
-                gap_report = self.local_api.get_gap_report(
-                    processed_dir=self.config.processed_dir,
-                    query=query,
-                    reference_markdown_path=ref_path,
-                    top_k=self.config.default_top_k,
-                    per_document_limit=self.config.default_per_document_limit,
-                )
-                gap_report_text = self.formatter.format_gap_report(gap_report)
-                t5 = time.time()
-                logger.info("步骤耗时: 基线对比=%.2fs", t5 - t4)
-
-            full_reply = assemble_reply(context_pack_text, gap_report_text)
-            full_reply = self.formatter.truncate_message(full_reply, self.config.max_reply_length)
-
-            self.feishu_api.send_text_message(chat_id, full_reply)
-            total = time.time() - start_time
-            logger.info("总耗时: %.2fs (消息接收→回复发送)", total)
+            reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
+            self.feishu_api.send_text_message(chat_id, reply)
+            logger.info("总耗时: %.2fs", time.time() - start_time)
 
         except Exception:
             logger.exception("处理用户查询失败")
-            self.feishu_api.send_text_message(chat_id, f"处理查询时出错: {query}")
+            self.feishu_api.send_text_message(chat_id, f"处理查询时出错，请稍后重试。")
 
 
 def main() -> int:

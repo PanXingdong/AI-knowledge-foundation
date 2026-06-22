@@ -1557,6 +1557,12 @@ def build_context_pack_for_processed_dir(
         eligible_chunks.extend(external_gate_bypass_chunks)
     if not eligible_chunks:
         eligible_chunks = retrieval_chunks
+    # Build / reuse BM25 corpus stats (query-independent, safe to cache for
+    # the lifetime of the service process for a fixed processed_dir).
+    _bm25_cache_key = str(processed_root)
+    if _bm25_cache_key not in _BM25_CONTEXT_CACHE:
+        _BM25_CONTEXT_CACHE[_bm25_cache_key] = _build_bm25_context(list(loaded_chunks))
+    cached_bm25_context: _Bm25Context = _BM25_CONTEXT_CACHE[_bm25_cache_key]  # type: ignore[assignment]
     scored_chunks = _build_candidate_scores(
         chunks=eligible_chunks,
         query_tokens=query_tokens,
@@ -1565,7 +1571,13 @@ def build_context_pack_for_processed_dir(
         query_text=normalized_query,
         fts_bonus_by_chunk_id=fts_bonus_by_chunk_id,
         vector_bonus_by_chunk_id=vector_bonus_by_chunk_id,
+        bm25_context=cached_bm25_context,
     )
+    # _select_candidates is O(pool_size²). Candidates are already sorted by
+    # score, so capping the pool here gives ample diversity room while avoiding
+    # a quadratic blowup on large corpora (e.g. 9 000+ neighbor-merged chunks).
+    _pool_size = min(max(top_k * 30, 300), len(scored_chunks))
+    scored_chunks = scored_chunks[:_pool_size]
     selected = _select_candidates(
         candidates=scored_chunks,
         clauses=clauses,
@@ -1913,7 +1925,32 @@ def write_gap_report_bundle(
     }
 
 
+# ---------------------------------------------------------------------------
+# Module-level caches for expensive repeated computations.
+# These persist across HTTP requests for the lifetime of the service process,
+# eliminating repeated disk I/O and corpus tokenization.
+# Call clear_retrieval_caches() to invalidate after re-ingestion.
+# ---------------------------------------------------------------------------
+_CHUNK_CACHE: dict[str, list] = {}          # str(processed_dir) → list[_LoadedChunk]
+_BM25_CONTEXT_CACHE: dict[str, object] = {} # str(processed_dir) → _Bm25Context
+# chunk_id → (topic_scores, topic_subfacets, coherence, structure, ev_quality, thin_penalty)
+_CHUNK_STATIC_SCORE_CACHE: dict[str, tuple] = {}
+# chunk_id → (chunk_tokens, title_normalized, section_text, leaf_section_text)
+_CHUNK_TOKEN_CACHE: dict[str, tuple] = {}
+
+
+def clear_retrieval_caches() -> None:
+    """Invalidate all module-level retrieval caches (call after re-ingestion)."""
+    _CHUNK_CACHE.clear()
+    _BM25_CONTEXT_CACHE.clear()
+    _CHUNK_STATIC_SCORE_CACHE.clear()
+    _CHUNK_TOKEN_CACHE.clear()
+
+
 def _load_processed_chunks(processed_dir: Path) -> list[_LoadedChunk]:
+    cache_key = str(processed_dir)
+    if cache_key in _CHUNK_CACHE:
+        return _CHUNK_CACHE[cache_key]  # type: ignore[return-value]
     chunks: list[_LoadedChunk] = []
     for chunks_path, document_payload in _iter_latest_processed_versions(processed_dir):
         document_chunks: list[_LoadedChunk] = []
@@ -1970,6 +2007,7 @@ def _load_processed_chunks(processed_dir: Path) -> list[_LoadedChunk]:
             )
         chunks.extend(document_chunks)
         chunks.extend(_build_neighbor_merged_chunks(document_chunks))
+    _CHUNK_CACHE[cache_key] = chunks
     return chunks
 
 
@@ -2364,27 +2402,64 @@ def _build_candidate_scores(
     query_text: str,
     fts_bonus_by_chunk_id: dict[str, float] | None = None,
     vector_bonus_by_chunk_id: dict[str, float] | None = None,
+    bm25_context: _Bm25Context | None = None,
 ) -> list[_CandidateScore]:
     chunk_list = list(chunks)
-    bm25_context = _build_bm25_context(chunk_list)
+    if bm25_context is None:
+        bm25_context = _build_bm25_context(chunk_list)
     resolved_fts_bonus = fts_bonus_by_chunk_id or {}
     resolved_vector_bonus = vector_bonus_by_chunk_id or {}
     candidates: list[_CandidateScore] = []
     for chunk in chunk_list:
-        topic_scores = _compute_topic_scores(
-            document_title=chunk.document_title,
-            section_titles=chunk.section_titles,
-            chunk_text=chunk.text,
-        )
-        topic_subfacets = _compute_topic_subfacets(
-            document_title=chunk.document_title,
-            section_titles=chunk.section_titles,
-            chunk_text=chunk.text,
-        )
-        overall_score = _score_tokens(
-            chunk_text=chunk.text,
-            document_title=chunk.document_title,
-            section_titles=chunk.section_titles,
+        # Restore query-independent per-chunk scores from cache when available.
+        static_key = chunk.chunk_id
+        if static_key in _CHUNK_STATIC_SCORE_CACHE:
+            (
+                topic_scores,
+                topic_subfacets,
+                coherence_bonus,
+                structure_bonus,
+                evidence_quality_adjustment,
+                thin_chunk_penalty,
+            ) = _CHUNK_STATIC_SCORE_CACHE[static_key]
+        else:
+            topic_scores = _compute_topic_scores(
+                document_title=chunk.document_title,
+                section_titles=chunk.section_titles,
+                chunk_text=chunk.text,
+            )
+            topic_subfacets = _compute_topic_subfacets(
+                document_title=chunk.document_title,
+                section_titles=chunk.section_titles,
+                chunk_text=chunk.text,
+            )
+            coherence_bonus = _coherence_bonus(chunk.text)
+            structure_bonus = _structure_bonus(chunk.text)
+            evidence_quality_adjustment = _evidence_quality_adjustment(
+                chunk_text=chunk.text,
+                section_titles=chunk.section_titles,
+            )
+            thin_chunk_penalty = _thin_chunk_penalty(
+                chunk_text=chunk.text,
+                document_title=chunk.document_title,
+                section_titles=chunk.section_titles,
+            )
+            _CHUNK_STATIC_SCORE_CACHE[static_key] = (
+                topic_scores,
+                topic_subfacets,
+                coherence_bonus,
+                structure_bonus,
+                evidence_quality_adjustment,
+                thin_chunk_penalty,
+            )
+        # Use cached token data to avoid re-tokenising the same chunk text on
+        # every request (tokenisation is query-independent).
+        _chunk_tokens, _title_text, _section_text, _leaf_section_text = _get_chunk_token_data(chunk)
+        overall_score = _score_tokens_from_cached(
+            chunk_tokens=_chunk_tokens,
+            title_text=_title_text,
+            section_text=_section_text,
+            leaf_section_text=_leaf_section_text,
             query_tokens=query_tokens,
         )
         bm25_score = _score_bm25(
@@ -2402,10 +2477,11 @@ def _build_candidate_scores(
             topic_scores=topic_scores,
         )
         per_clause_scores = tuple(
-            _score_tokens(
-                chunk_text=chunk.text,
-                document_title=chunk.document_title,
-                section_titles=chunk.section_titles,
+            _score_tokens_from_cached(
+                chunk_tokens=_chunk_tokens,
+                title_text=_title_text,
+                section_text=_section_text,
+                leaf_section_text=_leaf_section_text,
                 query_tokens=one_clause_tokens,
             )
             + _score_bm25(
@@ -2420,23 +2496,12 @@ def _build_candidate_scores(
             for index, score in enumerate(per_clause_scores)
             if score >= 2.0 or (score > 0 and len(clause_tokens[index]) <= 3)
         )
-        coherence_bonus = _coherence_bonus(chunk.text)
-        structure_bonus = _structure_bonus(chunk.text)
-        evidence_quality_adjustment = _evidence_quality_adjustment(
-            chunk_text=chunk.text,
-            section_titles=chunk.section_titles,
-        )
         appendix_method_query_bonus = _appendix_method_query_bonus(
             query_text=query_text,
             chunk_text=chunk.text,
             section_titles=chunk.section_titles,
         )
         topic_bonus = _topic_alignment_bonus(topic_scores, desired_topics)
-        thin_chunk_penalty = _thin_chunk_penalty(
-            chunk_text=chunk.text,
-            document_title=chunk.document_title,
-            section_titles=chunk.section_titles,
-        )
         candidates.append(
             _CandidateScore(
                 chunk=chunk,
@@ -2785,6 +2850,48 @@ def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
         return 0.0
     intersection = len(left & right)
     return intersection / max(1, min(len(left), len(right)))
+
+
+def _get_chunk_token_data(chunk: _LoadedChunk) -> tuple[Counter[str], str, str, str]:
+    """Return pre-tokenised chunk data, using a module-level cache keyed by chunk_id."""
+    cache_key = chunk.chunk_id
+    if cache_key in _CHUNK_TOKEN_CACHE:
+        return _CHUNK_TOKEN_CACHE[cache_key]  # type: ignore[return-value]
+    chunk_text_normalized = normalize_space(chunk.text).lower()
+    title_text = normalize_space(chunk.document_title).lower()
+    section_text = normalize_space("\n".join(chunk.section_titles)).lower()
+    leaf_section_text = normalize_space(chunk.section_titles[-1]).lower() if chunk.section_titles else ""
+    chunk_tokens = _tokenize_for_search(f"{title_text}\n{section_text}\n{chunk_text_normalized}")
+    result = (chunk_tokens, title_text, section_text, leaf_section_text)
+    _CHUNK_TOKEN_CACHE[cache_key] = result
+    return result
+
+
+def _score_tokens_from_cached(
+    *,
+    chunk_tokens: Counter[str],
+    title_text: str,
+    section_text: str,
+    leaf_section_text: str,
+    query_tokens: Counter[str],
+) -> float:
+    """Score query tokens against pre-tokenised chunk data (no repeat tokenization)."""
+    if not query_tokens:
+        return 0.0
+    score = 0.0
+    for term, query_count in query_tokens.items():
+        chunk_count = chunk_tokens.get(term, 0)
+        if not chunk_count:
+            continue
+        weight = _term_weight(term)
+        score += weight * min(chunk_count, 3) * query_count
+        if term in title_text:
+            score += weight * 1.5
+        if leaf_section_text and term in leaf_section_text:
+            score += weight * 2.5
+        if section_text and term in section_text:
+            score += weight * 1.5
+    return score
 
 
 def _score_tokens(

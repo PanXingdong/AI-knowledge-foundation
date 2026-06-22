@@ -8,6 +8,8 @@ dependencies = [
   "pydantic",
   "pypdf",
   "python-docx",
+  "FlagEmbedding",
+  "sentence-transformers",
 ]
 
 [project.optional-dependencies]

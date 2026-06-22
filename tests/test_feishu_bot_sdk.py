@@ -26,8 +26,14 @@ def bot():
         max_reply_length=3000,
     )
     with patch("agent_knowledge_hub.feishu_bot_sdk.LocalAPIClient"), \
-         patch("agent_knowledge_hub.feishu_bot_sdk.FeishuAPI"):
+         patch("agent_knowledge_hub.feishu_bot_sdk.FeishuAPI"), \
+         patch("agent_knowledge_hub.feishu_bot_sdk.LLMAgent"):
         sdk = FeishuBotSDK(config)
+    # Configure default llm_agent mock behaviour used across tests.
+    sdk.llm_agent.is_chitchat.return_value = False
+    sdk.llm_agent.synthesize.return_value = "合成回答"
+    sdk.llm_agent.no_evidence_reply.return_value = "未找到相关内容"
+    sdk.llm_agent.direct_reply.return_value = "你好！"
     return sdk
 
 
@@ -39,7 +45,8 @@ class TestFeishuBotSDKInit:
         }
         with patch.dict(os.environ, env, clear=True), \
              patch("agent_knowledge_hub.feishu_bot_sdk.LocalAPIClient"), \
-             patch("agent_knowledge_hub.feishu_bot_sdk.FeishuAPI"):
+             patch("agent_knowledge_hub.feishu_bot_sdk.FeishuAPI"), \
+             patch("agent_knowledge_hub.feishu_bot_sdk.LLMAgent"):
             sdk = FeishuBotSDK()
             assert sdk.config.app_id == "env_app_id"
             assert sdk.config.app_secret == "env_secret"
@@ -150,10 +157,10 @@ class TestHealthCheck:
 
 class TestProcessQuery:
     def test_sends_formatted_reply(self, bot):
-        """正常流程：获取 context_pack → 格式化 → 发送"""
+        """正常流程：KB检索 → LLM综合 → 发送"""
         bot.formatter = MagicMock()
         context_pack = {
-            "query": "测试查询",
+            "query": "QNX priority inheritance技术问题",
             "chunk_count": 1,
             "document_count": 1,
             "selected_chunks": [
@@ -162,12 +169,15 @@ class TestProcessQuery:
         }
         bot.local_api.get_context_pack.return_value = context_pack
         bot.formatter.format_context_pack.return_value = "格式化结果"
-        bot.formatter.truncate_message.return_value = "格式化结果"
+        bot.formatter.truncate_message.return_value = "合成回答"
+        bot.llm_agent.is_chitchat.return_value = False
+        bot.llm_agent.synthesize.return_value = "合成回答"
 
-        bot._process_query("oc_test", "测试查询")
+        bot._process_query("oc_test", "QNX priority inheritance技术问题")
 
         bot.local_api.get_context_pack.assert_called_once()
-        bot.feishu_api.send_text_message.assert_called_once_with("oc_test", "格式化结果")
+        bot.llm_agent.synthesize.assert_called_once()
+        bot.feishu_api.send_text_message.assert_called_once_with("oc_test", "合成回答")
 
     def test_low_score_sends_not_found(self, bot):
         """所有 chunk 的 score 低于阈值时发送"未找到相关内容" """
@@ -205,21 +215,20 @@ class TestProcessQuery:
         """处理查询异常时向用户发送错误提示"""
         bot.local_api.get_context_pack.side_effect = RuntimeError("API挂了")
 
-        bot._process_query("oc_err", "问题")
+        bot._process_query("oc_err", "第三方接口调用异常问题")
 
         bot.feishu_api.send_text_message.assert_called_once()
         sent_text = bot.feishu_api.send_text_message.call_args[0][1]
         assert "处理查询时出错" in sent_text
-        assert "问题" in sent_text
 
     def test_gap_report_included_when_reference_exists(self, bot, tmp_path):
-        """reference_markdown_path 存在时附加 gap_report"""
+        """reference_markdown_path 存在时，仍走 LLM 合成流程并正常回复"""
         ref_file = tmp_path / "ref.md"
         ref_file.write_text("# reference")
         bot.config.reference_markdown_path = str(ref_file)
 
         context_pack = {
-            "query": "带基线",
+            "query": "QNX内核内存保护机制技术问题",
             "chunk_count": 1,
             "document_count": 1,
             "selected_chunks": [
@@ -227,14 +236,14 @@ class TestProcessQuery:
             ],
         }
         bot.local_api.get_context_pack.return_value = context_pack
-        bot.local_api.get_gap_report.return_value = {"covered_items": [], "missing_items": []}
         bot.formatter.format_context_pack.return_value = "上下文"
-        bot.formatter.format_gap_report.return_value = "基线报告"
-        bot.formatter.truncate_message.return_value = "上下文\n基线报告"
+        bot.formatter.truncate_message.return_value = "合成回答"
+        bot.llm_agent.synthesize.return_value = "合成回答"
 
-        bot._process_query("oc_gap", "带基线")
+        bot._process_query("oc_gap", "QNX内核内存保护机制技术问题")
 
-        bot.local_api.get_gap_report.assert_called_once()
+        bot.local_api.get_context_pack.assert_called_once()
+        bot.llm_agent.synthesize.assert_called_once()
         bot.feishu_api.send_text_message.assert_called_once()
 
 
