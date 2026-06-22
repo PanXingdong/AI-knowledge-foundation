@@ -28,7 +28,6 @@ def clear_vector_index_cache() -> None:
     _VECTOR_INDEX_CACHE.clear()
     _BGE_VECTOR_INDEX_CACHE.clear()
 
-
 EMBEDDING_STRATEGY = "local-hashed-token-v1"
 BGE_M3_EMBEDDING_STRATEGY = "bge-m3-dense-v1"
 BGE_M3_DEFAULT_MODEL_PATH = "models/bge-m3"
@@ -39,6 +38,41 @@ CJK_SYNONYM_GROUPS = (
     ("审批", "评估", "审核", "批准"),
     ("限制", "约束", "要求", "规则"),
     ("风险", "隐患", "问题"),
+)
+CONCEPT_FEATURE_WEIGHT = 1.4
+# Bilingual concept bridges: when either a Chinese term or an English term in a
+# group is present, the same shared `concept:<id>` feature is emitted. This lets
+# a Chinese query and an English document share vector dimensions so cross-lingual
+# matches produce a non-zero cosine similarity.
+BILINGUAL_CONCEPT_GROUPS = (
+    ("partition", ("分区", "隔离", "划分"), ("partition", "partitioning", "isolation", "isolate")),
+    ("scheduler", ("调度", "调度器", "调度程序"), ("schedule", "scheduler", "scheduling")),
+    ("priority", ("优先级", "优先权"), ("priority", "priorities")),
+    ("process", ("进程",), ("process", "processes")),
+    ("thread", ("线程",), ("thread", "threads", "threading")),
+    ("security", ("安全", "安全性"), ("security", "secure", "securing")),
+    ("permission", ("权限", "许可"), ("permission", "permissions", "privilege", "privileges")),
+    ("critical", ("关键", "关键任务", "临界"), ("critical", "criticality")),
+    ("realtime", ("实时", "实时性"), ("realtime", "real-time")),
+    ("kernel", ("内核", "微内核"), ("kernel", "microkernel")),
+    ("resource", ("资源",), ("resource", "resources")),
+    ("processor", ("处理器", "中央处理器"), ("processor", "cpu")),
+    ("budget", ("份额", "预算", "配额", "百分比"), ("budget", "share", "percentage", "quota")),
+    ("interrupt", ("中断",), ("interrupt", "interrupts")),
+    ("memory", ("内存", "存储"), ("memory",)),
+    ("architecture", ("架构", "体系结构"), ("architecture", "architectural")),
+    ("task", ("任务",), ("task", "tasks")),
+    ("ipc", ("进程间通信", "消息传递", "消息"), ("ipc", "message", "messaging", "messages")),
+    ("fault", ("故障", "失效", "容错"), ("fault", "faults", "failure", "availability")),
+    ("driver", ("驱动", "驱动程序"), ("driver", "drivers")),
+    ("network", ("网络", "联网"), ("network", "networking")),
+    ("filesystem", ("文件", "文件系统"), ("file", "files", "filesystem")),
+    ("boot", ("启动", "引导"), ("boot", "booting", "bootup", "bootstrap")),
+    ("configuration", ("配置",), ("config", "configuration", "configure")),
+    ("policy", ("策略", "政策"), ("policy", "policies")),
+    ("encryption", ("加密",), ("encrypt", "encryption", "crypto")),
+    ("authentication", ("认证", "鉴权", "身份验证"), ("authentication", "authenticate")),
+    ("scheduling_preempt", ("抢占", "抢占式"), ("preempt", "preemptive", "preemption")),
 )
 
 
@@ -591,6 +625,9 @@ def _build_sparse_vector(text: str) -> Counter[str]:
     for feature in _synonym_features(normalized):
         vector[feature] += 1.2
 
+    for feature in _concept_features(normalized):
+        vector[feature] += CONCEPT_FEATURE_WEIGHT
+
     return vector
 
 
@@ -614,6 +651,22 @@ def _synonym_features(normalized_text: str) -> list[str]:
         if any(term in normalized_text for term in group):
             features.append("syn:" + "|".join(group))
     return features
+
+
+def _concept_features(normalized_text: str) -> list[str]:
+    features: list[str] = []
+    for canonical, cjk_terms, ascii_terms in BILINGUAL_CONCEPT_GROUPS:
+        if any(term in normalized_text for term in cjk_terms) or any(
+            _ascii_term_present(term, normalized_text) for term in ascii_terms
+        ):
+            features.append(f"concept:{canonical}")
+    return features
+
+
+def _ascii_term_present(term: str, normalized_text: str) -> bool:
+    # Word-start prefix match so "partition" matches "partitioning"/"partitions"
+    # but not the tail of an unrelated word (e.g. "repartition").
+    return re.search(r"(?<![a-z0-9])" + re.escape(term), normalized_text) is not None
 
 
 def _build_idf(*, document_frequency: dict[str, int], document_count: int) -> dict[str, float]:
