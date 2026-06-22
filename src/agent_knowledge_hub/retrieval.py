@@ -11,7 +11,7 @@ from typing import Iterable
 
 from agent_knowledge_hub.fts_index import query_fts_index
 from agent_knowledge_hub.utils import normalize_space, stable_id, write_json
-from agent_knowledge_hub.vector_index import query_vector_index
+from agent_knowledge_hub.vector_index import VectorIndexError, query_vector_index
 
 
 CONTEXT_PACK_SCHEMA_VERSION = "context-pack.v1"
@@ -26,13 +26,18 @@ VECTOR_SIMILARITY_BONUS_WEIGHT = 32.0
 # CJK characters are pricier per token than latin text, so they are weighted up.
 _CJK_TOKEN_WEIGHT = 1.6
 _NON_CJK_TOKEN_DIVISOR = 4.0
-# Reserved placeholder used only while measuring the budget. It leaves headroom
-# for the budget/too-small warning lines that are appended after trimming is
-# decided, so the final ``token_used`` stays within ``token_budget``.
+# Generous upper-bound placeholder for the two system-level warnings appended
+# *after* _apply_token_budget returns (token_budget_exceeded and
+# token_budget_too_small). Chunk-level quality warnings (_build_context_pack_warnings)
+# are measured accurately inside the trimming loop and do not need headroom here.
+# Values are intentionally larger than any realistic run:
+#   dropped  <= 9 999        (top_k is always < 1 000 in practice)
+#   budget   <= 9 999 999    (~10 M tokens)
+#   topics   <= 20 labels of 20 chars each
 _TOKEN_BUDGET_WARNING_RESERVE = (
-    "token_budget_exceeded:dropped=000:budget=000000:"
-    "topics=architecture,backend,api,governance,rollout|"
-    "token_budget_too_small:kept_single_best_chunk"
+    "token_budget_exceeded:dropped=9999:budget=9999999:topics="
+    + ",".join(["x" * 20] * 20)
+    + "|token_budget_too_small:kept_single_best_chunk"
 )
 CONTEXT_PACK_STABLE_FIELDS = (
     "schema_version",
@@ -1518,7 +1523,14 @@ def estimate_tokens(text: str) -> int:
     """
     if not text:
         return 0
-    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    cjk = sum(
+        1
+        for ch in text
+        if "\u4e00" <= ch <= "\u9fff"   # CJK Unified Ideographs
+        or "\u3400" <= ch <= "\u4dbf"   # CJK Extension A
+        or "\u3000" <= ch <= "\u303f"   # CJK Symbols and Punctuation (。，、；：)
+        or "\uff00" <= ch <= "\uffef"   # Halfwidth and Fullwidth Forms (full-width punct)
+    )
     other = len(text) - cjk
     return int(cjk * _CJK_TOKEN_WEIGHT + other / _NON_CJK_TOKEN_DIVISOR)
 
@@ -1544,11 +1556,20 @@ def _apply_token_budget(
         return [], []
     kept_count = 0
     for count in range(1, len(chunks) + 1):
+        # Include per-chunk quality warnings in each candidate measurement so
+        # the budget estimate accounts for the actual warnings that will appear
+        # in the final markdown, not just the post-trimming system warnings
+        # covered by _TOKEN_BUDGET_WARNING_RESERVE.
+        candidate_warnings = list(
+            dict.fromkeys(
+                base_warnings + _build_context_pack_warnings(chunks[:count])
+            )
+        )
         candidate_markdown = _render_context_pack_markdown(
             query=query,
             task_type=task_type,
             task_profile=task_profile,
-            warnings=base_warnings,
+            warnings=candidate_warnings,
             chunks=chunks[:count],
         )
         if estimate_tokens(candidate_markdown) <= token_budget:
@@ -1960,7 +1981,11 @@ def load_context_pack_result(path: Path | str) -> ContextPackResult:
             or len({chunk.document_version_id for chunk in selected_chunks})
         ),
         warnings=warnings,
-        token_used=int(payload.get("token_used") or estimate_tokens(markdown)),
+        token_used=int(
+            payload["token_used"]
+            if payload.get("token_used") is not None
+            else estimate_tokens(markdown)
+        ),
         token_budget=_optional_int(payload.get("token_budget")),
     )
 
@@ -2314,7 +2339,7 @@ def _load_fts_bonus_by_chunk_id(
         )
     except FileNotFoundError:
         return {}, "fts_index_unavailable:not_found:lexical_only"
-    except (OSError, sqlite3.Error, ValueError):
+    except (OSError, sqlite3.Error):
         return {}, "fts_index_unavailable:query_failed:lexical_only"
     bonuses: dict[str, float] = {}
     for rank, hit in enumerate(hits, start=1):
@@ -2341,7 +2366,7 @@ def _load_vector_bonus_by_chunk_id(
         )
     except FileNotFoundError:
         return {}, "vector_index_unavailable:not_found:lexical_only"
-    except (OSError, ValueError):
+    except (OSError, VectorIndexError):
         return {}, "vector_index_unavailable:query_failed:lexical_only"
     bonuses: dict[str, float] = {}
     for rank, hit in enumerate(hits, start=1):
