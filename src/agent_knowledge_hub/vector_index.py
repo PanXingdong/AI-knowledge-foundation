@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -556,8 +557,24 @@ def _load_bge_m3_model(model_path: Path):
                 "FlagEmbedding is required for BGE-M3 vector indexes. "
                 "Install project dependencies first."
             ) from exc
-        _BGE_MODEL_CACHE[cache_key] = BGEM3FlagModel(str(model_path), use_fp16=False, device="cpu")
+        device = _select_bge_m3_device()
+        _BGE_MODEL_CACHE[cache_key] = BGEM3FlagModel(
+            str(model_path),
+            use_fp16=device.startswith("cuda"),
+            device=device,
+        )
     return _BGE_MODEL_CACHE[cache_key]
+
+
+def _select_bge_m3_device() -> str:
+    requested_device = os.environ.get("AKF_BGE_M3_DEVICE", "").strip()
+    if requested_device:
+        return requested_device
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _bge_metadata_path(index_path: Path) -> Path:
