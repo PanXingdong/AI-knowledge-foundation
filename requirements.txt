@@ -2,5 +2,7 @@ fastapi
 pydantic
 pypdf
 python-docx
+uvicorn
+lark-oapi
 FlagEmbedding
 sentence-transformers
