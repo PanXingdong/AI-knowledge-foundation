@@ -96,8 +96,10 @@ def _call_deepseek(
             data = json.loads(resp.read().decode("utf-8"))
         return str(data["choices"][0]["message"]["content"])
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8") if e.fp else str(e)
-        raise RuntimeError(f"DeepSeek API error {e.code}: {body}") from e
+        # Log only the status code, not the body, to avoid leaking API keys or
+        # sensitive response content into log aggregators.
+        logger.debug("DeepSeek API HTTP %d — body omitted from log", e.code)
+        raise RuntimeError(f"DeepSeek API error {e.code}") from e
 
 
 # ---------------------------------------------------------------------------

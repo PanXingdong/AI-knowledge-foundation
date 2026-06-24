@@ -9,6 +9,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Note on gap_report: the gap-report feature (baseline comparison) is still
+# available in feishu_bot.py (LocalAPIClient.get_gap_report + assemble_reply).
+# This SDK intentionally routes all user queries through the three-stage LLM
+# synthesis path instead. Gap reports remain accessible via the /api/gap-report
+# HTTP endpoint and the CLI `gap-report` sub-command.
 from agent_knowledge_hub.feishu_bot import (
     FeishuAPI,
     FeishuConfig,
@@ -156,7 +161,7 @@ class FeishuBotSDK:
             )
             t2 = time.time()
 
-            score_threshold = -30.0
+            score_threshold = self.config.score_threshold  # configurable via SCORE_THRESHOLD env var
             selected_chunks = context_pack.get("selected_chunks", [])
             has_evidence = bool(selected_chunks) and (
                 max((c.get("score", float("-inf")) for c in selected_chunks), default=float("-inf"))

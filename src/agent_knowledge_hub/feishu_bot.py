@@ -28,6 +28,9 @@ class FeishuConfig:
     default_top_k: int = 8
     default_per_document_limit: int = 2
     max_reply_length: int = 3000
+    # Minimum score for a retrieved chunk to be treated as useful evidence.
+    # Chunks scoring below this are treated as "no evidence found".
+    score_threshold: float = -30.0
 
     @classmethod
     def from_env(cls) -> FeishuConfig:
@@ -44,10 +47,11 @@ class FeishuConfig:
             default_top_k=int(os.getenv("DEFAULT_TOP_K", "8")),
             default_per_document_limit=int(os.getenv("DEFAULT_PER_DOCUMENT_LIMIT", "2")),
             max_reply_length=int(os.getenv("MAX_REPLY_LENGTH", "3000")),
+            score_threshold=float(os.getenv("SCORE_THRESHOLD", "-30.0")),
         )
 
 
-def _http_post(url: str, data: dict[str, Any], headers: dict[str, str] | None = None, timeout: int = 120) -> dict[str, Any]:
+def _http_post(url: str, data: dict[str, Any], headers: dict[str, str] | None = None, timeout: int = 30) -> dict[str, Any]:
     req_headers = headers or {}
     req = urllib.request.Request(
         url,

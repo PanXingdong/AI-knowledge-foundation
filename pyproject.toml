@@ -8,11 +8,14 @@ dependencies = [
   "pydantic",
   "pypdf",
   "python-docx",
-  "FlagEmbedding",
-  "sentence-transformers",
 ]
 
 [project.optional-dependencies]
+# Dense vector index (BGE-M3) — only needed when building/serving the NPZ index.
+bge = [
+  "FlagEmbedding",
+  "sentence-transformers",
+]
 ocr = [
   "pymupdf",
   "rapidocr",

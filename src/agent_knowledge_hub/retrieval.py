@@ -1589,7 +1589,7 @@ def build_context_pack_for_processed_dir(
         _bm25_cache_key = str(processed_root)
         if _bm25_cache_key not in _BM25_CONTEXT_CACHE:
             _BM25_CONTEXT_CACHE[_bm25_cache_key] = _build_bm25_context(list(loaded_chunks))
-        cached_bm25_context = _BM25_CONTEXT_CACHE[_bm25_cache_key]  # type: ignore[assignment]
+        cached_bm25_context = _BM25_CONTEXT_CACHE[_bm25_cache_key]
     scored_chunks = _build_candidate_scores(
         chunks=eligible_chunks,
         query_tokens=query_tokens,
@@ -1959,12 +1959,25 @@ def write_gap_report_bundle(
 # eliminating repeated disk I/O and corpus tokenization.
 # Call clear_retrieval_caches() to invalidate after re-ingestion.
 # ---------------------------------------------------------------------------
-_CHUNK_CACHE: dict[str, list] = {}          # str(processed_dir) → list[_LoadedChunk]
-_BM25_CONTEXT_CACHE: dict[str, object] = {} # str(processed_dir) → _Bm25Context
+_CHUNK_CACHE: dict[str, list["_LoadedChunk"]] = {}  # str(processed_dir) → list[_LoadedChunk]
+_BM25_CONTEXT_CACHE: dict[str, "_Bm25Context"] = {}  # str(processed_dir) → _Bm25Context
 # chunk_id → (topic_scores, topic_subfacets, coherence, structure, ev_quality, thin_penalty)
 _CHUNK_STATIC_SCORE_CACHE: dict[str, tuple] = {}
 # chunk_id → (chunk_tokens, title_normalized, section_text, leaf_section_text)
 _CHUNK_TOKEN_CACHE: dict[str, tuple] = {}
+
+# Hard cap on per-chunk caches. Each of the ~65k corpus chunks stores a small
+# fixed-size tuple; at 250k entries we evict the oldest half to stay within a
+# predictable memory footprint across long-running service deployments.
+_MAX_PER_CHUNK_CACHE_ENTRIES: int = 250_000
+
+
+def _evict_cache_if_needed(cache: dict, max_entries: int) -> None:
+    """Evict the oldest-inserted half of *cache* when it exceeds *max_entries*."""
+    if len(cache) > max_entries:
+        evict_count = max_entries // 2
+        for key in list(cache)[:evict_count]:
+            del cache[key]
 
 
 def clear_retrieval_caches() -> None:
@@ -1978,7 +1991,7 @@ def clear_retrieval_caches() -> None:
 def _load_processed_chunks(processed_dir: Path) -> list[_LoadedChunk]:
     cache_key = str(processed_dir)
     if cache_key in _CHUNK_CACHE:
-        return _CHUNK_CACHE[cache_key]  # type: ignore[return-value]
+        return _CHUNK_CACHE[cache_key]
     chunks: list[_LoadedChunk] = []
     for chunks_path, document_payload in _iter_latest_processed_versions(processed_dir):
         document_chunks: list[_LoadedChunk] = []
@@ -2691,6 +2704,7 @@ def _build_candidate_scores(
                 document_title=chunk.document_title,
                 section_titles=chunk.section_titles,
             )
+            _evict_cache_if_needed(_CHUNK_STATIC_SCORE_CACHE, _MAX_PER_CHUNK_CACHE_ENTRIES)
             _CHUNK_STATIC_SCORE_CACHE[static_key] = (
                 topic_scores,
                 topic_subfacets,
@@ -3103,13 +3117,14 @@ def _get_chunk_token_data(chunk: _LoadedChunk) -> tuple[Counter[str], str, str, 
     """Return pre-tokenised chunk data, using a module-level cache keyed by chunk_id."""
     cache_key = chunk.chunk_id
     if cache_key in _CHUNK_TOKEN_CACHE:
-        return _CHUNK_TOKEN_CACHE[cache_key]  # type: ignore[return-value]
+        return _CHUNK_TOKEN_CACHE[cache_key]  # type: narrowed via _evict guard
     chunk_text_normalized = normalize_space(chunk.text).lower()
     title_text = normalize_space(chunk.document_title).lower()
     section_text = normalize_space("\n".join(chunk.section_titles)).lower()
     leaf_section_text = normalize_space(chunk.section_titles[-1]).lower() if chunk.section_titles else ""
     chunk_tokens = _tokenize_for_search(f"{title_text}\n{section_text}\n{chunk_text_normalized}")
-    result = (chunk_tokens, title_text, section_text, leaf_section_text)
+    result: tuple[Counter[str], str, str, str] = (chunk_tokens, title_text, section_text, leaf_section_text)
+    _evict_cache_if_needed(_CHUNK_TOKEN_CACHE, _MAX_PER_CHUNK_CACHE_ENTRIES)
     _CHUNK_TOKEN_CACHE[cache_key] = result
     return result
 
