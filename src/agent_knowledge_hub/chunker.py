@@ -10,15 +10,33 @@ from agent_knowledge_hub.utils import stable_id
 # Noise section filter (封面/版权页、目录、索引、字母分组)
 # ---------------------------------------------------------------------------
 
-_NOISE_SECTION_PREFIXES: frozenset[str] = frozenset(
-    {"0", "Contents", "Index"}
-    | {chr(c) for c in range(ord("A"), ord("Z") + 1)}
+_NOISE_SECTION_PREFIXES: frozenset[str] = frozenset({"0", "Contents", "Index"})
+
+# Pattern that matches the ¦-separated letter navigation typical of
+# alphabetical index sections: "A ¦ B ¦ C ¦ D …"
+_ALPHA_NAV_PATTERN: re.Pattern[str] = re.compile(
+    r"^[A-Z](?:\s*[¦|]\s*[A-Z]){4,}",  # at least 5 letter entries
 )
 
 
-def _is_noise_block(section_path: list[str]) -> bool:
-    """Return True if this block belongs to a non-informative section."""
-    return bool(section_path) and section_path[0] in _NOISE_SECTION_PREFIXES
+def _is_noise_block(section_path: list[str], block_text: str = "") -> bool:
+    """Return True if this block belongs to a non-informative section.
+
+    Named-prefix sections ("Contents", "Index", section "0") are always
+    filtered.  Single-letter sections (A–Z) are only filtered when the
+    block text contains an alphabetical navigation bar (e.g. "A ¦ B ¦ C …"),
+    which is the giveaway for index letter-group headers.  Valid sections
+    named with a single letter (e.g. "A 模块设计", appendix "A") are kept.
+    """
+    if not section_path:
+        return False
+    head = section_path[0]
+    if head in _NOISE_SECTION_PREFIXES:
+        return True
+    # Single uppercase letter section: only noise if it contains alpha-nav
+    if len(head) == 1 and head.isupper():
+        return bool(_ALPHA_NAV_PATTERN.search(block_text))
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +101,7 @@ def build_chunks(
     max_chunk_chars: int = 1600,
     max_tokens: int | None = None,
     overlap_chars: int = 160,
-    min_chunk_chars: int = 80,
+    min_chunk_chars: int = 10,
 ) -> list[Chunk]:
     """Build section-aware chunks from canonical blocks.
 
@@ -104,6 +122,8 @@ def build_chunks(
         Chunks shorter than this threshold are silently dropped.  Catches
         residual page-header / footer fragments that survive the per-block
         filter (e.g. a lone copyright line that follows a section boundary).
+        Default is 10 — low enough to allow short CJK sentences (semantically
+        dense per character) while still filtering lone page numbers or dates.
 
     Changes vs. original implementation
     ------------------------------------
@@ -209,7 +229,7 @@ def build_chunks(
             continue
 
         # --- Filter 1: noise sections ---
-        if _is_noise_block(block.section_path):
+        if _is_noise_block(block.section_path, block_text):
             continue
 
         # --- Filter 2: fragment blocks (page headers/footers, dates, etc.) ---

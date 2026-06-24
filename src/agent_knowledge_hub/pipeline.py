@@ -25,7 +25,7 @@ def ingest_file(
     max_chunk_chars: int = 1600,
     max_tokens: int | None = None,
     overlap_chars: int = 160,
-    min_chunk_chars: int = 80,
+    min_chunk_chars: int = 10,
 ) -> IngestResult:
     source_path = Path(file_path).resolve()
     output_root = Path(out_dir).resolve()
@@ -84,7 +84,7 @@ def ingest_manifest(
     max_chunk_chars: int = 1600,
     max_tokens: int | None = None,
     overlap_chars: int = 160,
-    min_chunk_chars: int = 80,
+    min_chunk_chars: int = 10,
     fail_fast: bool = False,
 ) -> ManifestIngestSummary:
     manifest = Path(manifest_path).resolve()
