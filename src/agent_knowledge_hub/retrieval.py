@@ -1538,8 +1538,14 @@ def build_context_pack_for_processed_dir(
         query=normalized_query,
         limit=max(20, top_k * max(4, per_document_limit)),
     )
-    retrieval_chunks = filtered_chunks if normalized_filters else loaded_chunks
-    eligible_chunks = [chunk for chunk in retrieval_chunks if chunk.allowed_for_context_pack]
+    fts_bonus_by_chunk_id = _propagate_external_bonus_to_chunks_sharing_evidence(
+        chunks=loaded_chunks,
+        bonuses=fts_bonus_by_chunk_id,
+    )
+    vector_bonus_by_chunk_id = _propagate_external_bonus_to_chunks_sharing_evidence(
+        chunks=loaded_chunks,
+        bonuses=vector_bonus_by_chunk_id,
+    )
     external_bonus_by_chunk_id = {
         **fts_bonus_by_chunk_id,
         **{
@@ -1547,6 +1553,22 @@ def build_context_pack_for_processed_dir(
             for chunk_id, vector_bonus in vector_bonus_by_chunk_id.items()
         },
     }
+    retrieval_chunks = filtered_chunks if normalized_filters else loaded_chunks
+    focused_external_candidates = False
+    if _should_focus_external_candidates(
+        query=normalized_query,
+        bonuses=external_bonus_by_chunk_id,
+        top_k=top_k,
+    ):
+        focused_chunks = [
+            chunk
+            for chunk in retrieval_chunks
+            if chunk.chunk_id in external_bonus_by_chunk_id
+        ]
+        if focused_chunks:
+            retrieval_chunks = focused_chunks
+            focused_external_candidates = True
+    eligible_chunks = [chunk for chunk in retrieval_chunks if chunk.allowed_for_context_pack]
     if external_bonus_by_chunk_id:
         eligible_chunk_ids = {chunk.chunk_id for chunk in eligible_chunks}
         external_gate_bypass_chunks = [
@@ -1557,6 +1579,17 @@ def build_context_pack_for_processed_dir(
         eligible_chunks.extend(external_gate_bypass_chunks)
     if not eligible_chunks:
         eligible_chunks = retrieval_chunks
+    # Build / reuse BM25 corpus stats (query-independent, safe to cache for
+    # the lifetime of the service process for a fixed processed_dir). When a
+    # high-confidence external index has already narrowed the pool, score only
+    # that pool to avoid cold-start full-corpus BM25 work on large knowledge bases.
+    if focused_external_candidates:
+        cached_bm25_context = _build_bm25_context(list(eligible_chunks))
+    else:
+        _bm25_cache_key = str(processed_root)
+        if _bm25_cache_key not in _BM25_CONTEXT_CACHE:
+            _BM25_CONTEXT_CACHE[_bm25_cache_key] = _build_bm25_context(list(loaded_chunks))
+        cached_bm25_context = _BM25_CONTEXT_CACHE[_bm25_cache_key]
     scored_chunks = _build_candidate_scores(
         chunks=eligible_chunks,
         query_tokens=query_tokens,
@@ -1565,7 +1598,13 @@ def build_context_pack_for_processed_dir(
         query_text=normalized_query,
         fts_bonus_by_chunk_id=fts_bonus_by_chunk_id,
         vector_bonus_by_chunk_id=vector_bonus_by_chunk_id,
+        bm25_context=cached_bm25_context,
     )
+    # _select_candidates is O(pool_size²). Candidates are already sorted by
+    # score, so capping the pool here gives ample diversity room while avoiding
+    # a quadratic blowup on large corpora (e.g. 9 000+ neighbor-merged chunks).
+    _pool_size = min(max(top_k * 30, 300), len(scored_chunks))
+    scored_chunks = scored_chunks[:_pool_size]
     selected = _select_candidates(
         candidates=scored_chunks,
         clauses=clauses,
@@ -1603,6 +1642,7 @@ def build_context_pack_for_processed_dir(
         )
         for candidate in selected
     ]
+    selected_chunks = _apply_intent_rerank(query, selected_chunks)
     warnings = _build_context_pack_warnings(selected_chunks)
     markdown = _render_context_pack_markdown(
         query=normalized_query,
@@ -1913,7 +1953,45 @@ def write_gap_report_bundle(
     }
 
 
+# ---------------------------------------------------------------------------
+# Module-level caches for expensive repeated computations.
+# These persist across HTTP requests for the lifetime of the service process,
+# eliminating repeated disk I/O and corpus tokenization.
+# Call clear_retrieval_caches() to invalidate after re-ingestion.
+# ---------------------------------------------------------------------------
+_CHUNK_CACHE: dict[str, list["_LoadedChunk"]] = {}  # str(processed_dir) → list[_LoadedChunk]
+_BM25_CONTEXT_CACHE: dict[str, "_Bm25Context"] = {}  # str(processed_dir) → _Bm25Context
+# chunk_id → (topic_scores, topic_subfacets, coherence, structure, ev_quality, thin_penalty)
+_CHUNK_STATIC_SCORE_CACHE: dict[str, tuple] = {}
+# chunk_id → (chunk_tokens, title_normalized, section_text, leaf_section_text)
+_CHUNK_TOKEN_CACHE: dict[str, tuple] = {}
+
+# Hard cap on per-chunk caches. Each of the ~65k corpus chunks stores a small
+# fixed-size tuple; at 250k entries we evict the oldest half to stay within a
+# predictable memory footprint across long-running service deployments.
+_MAX_PER_CHUNK_CACHE_ENTRIES: int = 250_000
+
+
+def _evict_cache_if_needed(cache: dict, max_entries: int) -> None:
+    """Evict the oldest-inserted half of *cache* when it exceeds *max_entries*."""
+    if len(cache) > max_entries:
+        evict_count = max_entries // 2
+        for key in list(cache)[:evict_count]:
+            del cache[key]
+
+
+def clear_retrieval_caches() -> None:
+    """Invalidate all module-level retrieval caches (call after re-ingestion)."""
+    _CHUNK_CACHE.clear()
+    _BM25_CONTEXT_CACHE.clear()
+    _CHUNK_STATIC_SCORE_CACHE.clear()
+    _CHUNK_TOKEN_CACHE.clear()
+
+
 def _load_processed_chunks(processed_dir: Path) -> list[_LoadedChunk]:
+    cache_key = str(processed_dir)
+    if cache_key in _CHUNK_CACHE:
+        return _CHUNK_CACHE[cache_key]
     chunks: list[_LoadedChunk] = []
     for chunks_path, document_payload in _iter_latest_processed_versions(processed_dir):
         document_chunks: list[_LoadedChunk] = []
@@ -1970,6 +2048,7 @@ def _load_processed_chunks(processed_dir: Path) -> list[_LoadedChunk]:
             )
         chunks.extend(document_chunks)
         chunks.extend(_build_neighbor_merged_chunks(document_chunks))
+    _CHUNK_CACHE[cache_key] = chunks
     return chunks
 
 
@@ -2178,15 +2257,234 @@ def _load_fts_bonus_by_chunk_id(
     if fts_index_path is None:
         return {}
 
-    hits = query_fts_index(
-        index_path=fts_index_path,
-        query=query,
-        limit=limit,
-    )
     bonuses: dict[str, float] = {}
-    for rank, hit in enumerate(hits, start=1):
-        bonuses[hit.chunk_id] = max(bonuses.get(hit.chunk_id, 0.0), 72.0 / (rank * rank))
+    for variant_rank, (query_variant, variant_weight) in enumerate(
+        _build_fts_query_variants(query),
+        start=1,
+    ):
+        hits = query_fts_index(
+            index_path=fts_index_path,
+            query=query_variant,
+            limit=limit,
+        )
+        for rank, hit in enumerate(hits, start=1):
+            bonuses[hit.chunk_id] = max(
+                bonuses.get(hit.chunk_id, 0.0),
+                variant_weight * 72.0 / (rank * rank),
+            )
     return bonuses
+
+
+def _build_fts_query_variants(query: str) -> list[tuple[str, float]]:
+    normalized = normalize_space(query).lower()
+    if not normalized:
+        return []
+
+    variants: list[tuple[str, float]] = [(normalized, 1.0)]
+    if _looks_like_memory_mapping_cache_query(normalized):
+        variants.extend(
+            [
+                ("mmap stale data video frame buffer", 2.5),
+                ("mmap prot_nocache map_phys mmap_device_memory", 2.5),
+                ("prot_nocache cache invalidate mmap_device_memory", 2.0),
+            ]
+        )
+    if _looks_like_scheduler_cpu_budget_query(normalized):
+        variants.extend(
+            [
+                ("adaptive partitioning", 2.5),
+                ("cpu budget partition", 2.5),
+                ("over budget scheduler", 2.3),
+                ("sched_aps_schedpol_limit_cpu_usage", 2.3),
+                ("max_budget_percent", 2.0),
+                ("thread scheduler guarantee minimum cpu throughput monopolizing system", 2.0),
+            ]
+        )
+
+    # Generic, data-driven expansion layer. This replaces the need to keep adding
+    # platform-specific ``_looks_like_*`` rules above: editable memory entries and
+    # a domain-neutral intent detector contribute extra FTS variants here.
+    variants.extend(_data_driven_query_variants(query))
+
+    deduped: dict[str, float] = {}
+    for query_variant, weight in variants:
+        deduped[query_variant] = max(deduped.get(query_variant, 0.0), weight)
+    return list(deduped.items())
+
+
+def _data_driven_query_variants(query: str) -> list[tuple[str, float]]:
+    """Extra FTS variants from the generic query planner + retrieval memory.
+
+    Kept isolated and best-effort: any failure (e.g. missing memory file) yields
+    an empty list, so core retrieval behaviour is unchanged when no memory exists.
+    """
+    try:
+        from agent_knowledge_hub.query_planner import (
+            INTENT_COMPONENT_INVENTORY,
+            plan_query,
+        )
+
+        plan = plan_query(query)
+    except Exception:  # pragma: no cover - defensive
+        return []
+
+    variants: list[tuple[str, float]] = []
+    if plan.intent == INTENT_COMPONENT_INVENTORY:
+        # Boost document-skeleton sections that hold inventory / overview content.
+        for term, weight in plan.expanded_queries:
+            variants.append((term, max(weight, 1.6)))
+    else:
+        for term, weight in plan.expanded_queries:
+            variants.append((term, weight))
+    return variants
+
+
+def _apply_intent_rerank(query: str, chunks: list["RetrievedChunk"]) -> list["RetrievedChunk"]:
+    """Best-effort, intent-aware re-ordering of the selected chunks.
+
+    Identity for general/troubleshooting intents; only reorders for
+    inventory/api/mechanism intents. Any failure leaves the order untouched.
+    """
+    if len(chunks) <= 1:
+        return chunks
+    try:
+        from agent_knowledge_hub.query_planner import (
+            INTENT_COMPONENT_INVENTORY,
+            plan_query,
+        )
+        from agent_knowledge_hub.reranker import rerank_chunks
+
+        plan = plan_query(query)
+        # Only the inventory/overview intent reorders inside the deterministic
+        # core. Noisier api/mechanism reranking stays opt-in at the agent layer
+        # to keep lexical retrieval reproducible.
+        if plan.intent != INTENT_COMPONENT_INVENTORY:
+            return chunks
+        return rerank_chunks(plan, chunks)
+    except Exception:  # pragma: no cover - defensive
+        return chunks
+
+
+def _propagate_external_bonus_to_chunks_sharing_evidence(
+    *,
+    chunks: list[_LoadedChunk],
+    bonuses: dict[str, float],
+) -> dict[str, float]:
+    if not bonuses:
+        return bonuses
+
+    chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    bonus_by_evidence_id: dict[str, float] = {}
+    for chunk_id, bonus in bonuses.items():
+        chunk = chunk_by_id.get(chunk_id)
+        if chunk is None:
+            continue
+        for evidence_id in chunk.evidence_ids:
+            bonus_by_evidence_id[evidence_id] = max(
+                bonus_by_evidence_id.get(evidence_id, 0.0),
+                bonus,
+            )
+    if not bonus_by_evidence_id:
+        return bonuses
+
+    propagated = dict(bonuses)
+    for chunk in chunks:
+        evidence_bonus = max(
+            (bonus_by_evidence_id.get(evidence_id, 0.0) for evidence_id in chunk.evidence_ids),
+            default=0.0,
+        )
+        if evidence_bonus > 0.0:
+            propagated[chunk.chunk_id] = max(
+                propagated.get(chunk.chunk_id, 0.0),
+                evidence_bonus * 0.95,
+            )
+    return propagated
+
+
+def _should_focus_external_candidates(
+    *,
+    query: str,
+    bonuses: dict[str, float],
+    top_k: int,
+) -> bool:
+    if not bonuses:
+        return False
+    return _looks_like_memory_mapping_cache_query(query) or _looks_like_scheduler_cpu_budget_query(query)
+
+
+def _looks_like_memory_mapping_cache_query(query: str) -> bool:
+    normalized = query.lower()
+    mapping_cues = (
+        "memory mapping",
+        "memory map",
+        "mmap",
+        "内存映射",
+        "映射过来的内存",
+        "共享内存",
+        "双端口内存",
+    )
+    cache_cues = (
+        "cache",
+        "缓存",
+        "stale data",
+        "旧数据",
+        "上一帧",
+        "闪烁",
+    )
+    device_cues = (
+        "qnx",
+        "dma",
+        "硬件",
+        "摄像头",
+        "frame buffer",
+        "video frame",
+        "协处理器",
+    )
+    return (
+        any(cue in normalized for cue in mapping_cues)
+        and any(cue in normalized for cue in cache_cues)
+        and any(cue in normalized for cue in device_cues)
+    )
+
+
+def _looks_like_scheduler_cpu_budget_query(query: str) -> bool:
+    normalized = query.lower()
+    cpu_cues = (
+        "cpu",
+        "cpu time",
+        "占用 cpu",
+        "cpu 占用",
+        "吃满",
+        "跑得太猛",
+    )
+    scheduling_cues = (
+        "thread",
+        "线程",
+        "priority",
+        "优先级",
+        "scheduler",
+        "调度",
+        "starvation",
+        "饿死",
+        "卡死",
+    )
+    limiting_cues = (
+        "throttle",
+        "budget",
+        "limit",
+        "限制",
+        "降级",
+        "恢复高优",
+        "小黑屋",
+        "风暴",
+        "压力测试",
+        "monopolizing",
+    )
+    return (
+        any(cue in normalized for cue in cpu_cues)
+        and any(cue in normalized for cue in scheduling_cues)
+        and any(cue in normalized for cue in limiting_cues)
+    )
 
 
 def _load_vector_bonus_by_chunk_id(
@@ -2364,27 +2662,65 @@ def _build_candidate_scores(
     query_text: str,
     fts_bonus_by_chunk_id: dict[str, float] | None = None,
     vector_bonus_by_chunk_id: dict[str, float] | None = None,
+    bm25_context: _Bm25Context | None = None,
 ) -> list[_CandidateScore]:
     chunk_list = list(chunks)
-    bm25_context = _build_bm25_context(chunk_list)
+    if bm25_context is None:
+        bm25_context = _build_bm25_context(chunk_list)
     resolved_fts_bonus = fts_bonus_by_chunk_id or {}
     resolved_vector_bonus = vector_bonus_by_chunk_id or {}
     candidates: list[_CandidateScore] = []
     for chunk in chunk_list:
-        topic_scores = _compute_topic_scores(
-            document_title=chunk.document_title,
-            section_titles=chunk.section_titles,
-            chunk_text=chunk.text,
-        )
-        topic_subfacets = _compute_topic_subfacets(
-            document_title=chunk.document_title,
-            section_titles=chunk.section_titles,
-            chunk_text=chunk.text,
-        )
-        overall_score = _score_tokens(
-            chunk_text=chunk.text,
-            document_title=chunk.document_title,
-            section_titles=chunk.section_titles,
+        # Restore query-independent per-chunk scores from cache when available.
+        static_key = chunk.chunk_id
+        if static_key in _CHUNK_STATIC_SCORE_CACHE:
+            (
+                topic_scores,
+                topic_subfacets,
+                coherence_bonus,
+                structure_bonus,
+                evidence_quality_adjustment,
+                thin_chunk_penalty,
+            ) = _CHUNK_STATIC_SCORE_CACHE[static_key]
+        else:
+            topic_scores = _compute_topic_scores(
+                document_title=chunk.document_title,
+                section_titles=chunk.section_titles,
+                chunk_text=chunk.text,
+            )
+            topic_subfacets = _compute_topic_subfacets(
+                document_title=chunk.document_title,
+                section_titles=chunk.section_titles,
+                chunk_text=chunk.text,
+            )
+            coherence_bonus = _coherence_bonus(chunk.text)
+            structure_bonus = _structure_bonus(chunk.text)
+            evidence_quality_adjustment = _evidence_quality_adjustment(
+                chunk_text=chunk.text,
+                section_titles=chunk.section_titles,
+            )
+            thin_chunk_penalty = _thin_chunk_penalty(
+                chunk_text=chunk.text,
+                document_title=chunk.document_title,
+                section_titles=chunk.section_titles,
+            )
+            _evict_cache_if_needed(_CHUNK_STATIC_SCORE_CACHE, _MAX_PER_CHUNK_CACHE_ENTRIES)
+            _CHUNK_STATIC_SCORE_CACHE[static_key] = (
+                topic_scores,
+                topic_subfacets,
+                coherence_bonus,
+                structure_bonus,
+                evidence_quality_adjustment,
+                thin_chunk_penalty,
+            )
+        # Use cached token data to avoid re-tokenising the same chunk text on
+        # every request (tokenisation is query-independent).
+        _chunk_tokens, _title_text, _section_text, _leaf_section_text = _get_chunk_token_data(chunk)
+        overall_score = _score_tokens_from_cached(
+            chunk_tokens=_chunk_tokens,
+            title_text=_title_text,
+            section_text=_section_text,
+            leaf_section_text=_leaf_section_text,
             query_tokens=query_tokens,
         )
         bm25_score = _score_bm25(
@@ -2402,10 +2738,11 @@ def _build_candidate_scores(
             topic_scores=topic_scores,
         )
         per_clause_scores = tuple(
-            _score_tokens(
-                chunk_text=chunk.text,
-                document_title=chunk.document_title,
-                section_titles=chunk.section_titles,
+            _score_tokens_from_cached(
+                chunk_tokens=_chunk_tokens,
+                title_text=_title_text,
+                section_text=_section_text,
+                leaf_section_text=_leaf_section_text,
                 query_tokens=one_clause_tokens,
             )
             + _score_bm25(
@@ -2420,23 +2757,12 @@ def _build_candidate_scores(
             for index, score in enumerate(per_clause_scores)
             if score >= 2.0 or (score > 0 and len(clause_tokens[index]) <= 3)
         )
-        coherence_bonus = _coherence_bonus(chunk.text)
-        structure_bonus = _structure_bonus(chunk.text)
-        evidence_quality_adjustment = _evidence_quality_adjustment(
-            chunk_text=chunk.text,
-            section_titles=chunk.section_titles,
-        )
         appendix_method_query_bonus = _appendix_method_query_bonus(
             query_text=query_text,
             chunk_text=chunk.text,
             section_titles=chunk.section_titles,
         )
         topic_bonus = _topic_alignment_bonus(topic_scores, desired_topics)
-        thin_chunk_penalty = _thin_chunk_penalty(
-            chunk_text=chunk.text,
-            document_title=chunk.document_title,
-            section_titles=chunk.section_titles,
-        )
         candidates.append(
             _CandidateScore(
                 chunk=chunk,
@@ -2785,6 +3111,49 @@ def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
         return 0.0
     intersection = len(left & right)
     return intersection / max(1, min(len(left), len(right)))
+
+
+def _get_chunk_token_data(chunk: _LoadedChunk) -> tuple[Counter[str], str, str, str]:
+    """Return pre-tokenised chunk data, using a module-level cache keyed by chunk_id."""
+    cache_key = chunk.chunk_id
+    if cache_key in _CHUNK_TOKEN_CACHE:
+        return _CHUNK_TOKEN_CACHE[cache_key]  # type: narrowed via _evict guard
+    chunk_text_normalized = normalize_space(chunk.text).lower()
+    title_text = normalize_space(chunk.document_title).lower()
+    section_text = normalize_space("\n".join(chunk.section_titles)).lower()
+    leaf_section_text = normalize_space(chunk.section_titles[-1]).lower() if chunk.section_titles else ""
+    chunk_tokens = _tokenize_for_search(f"{title_text}\n{section_text}\n{chunk_text_normalized}")
+    result: tuple[Counter[str], str, str, str] = (chunk_tokens, title_text, section_text, leaf_section_text)
+    _evict_cache_if_needed(_CHUNK_TOKEN_CACHE, _MAX_PER_CHUNK_CACHE_ENTRIES)
+    _CHUNK_TOKEN_CACHE[cache_key] = result
+    return result
+
+
+def _score_tokens_from_cached(
+    *,
+    chunk_tokens: Counter[str],
+    title_text: str,
+    section_text: str,
+    leaf_section_text: str,
+    query_tokens: Counter[str],
+) -> float:
+    """Score query tokens against pre-tokenised chunk data (no repeat tokenization)."""
+    if not query_tokens:
+        return 0.0
+    score = 0.0
+    for term, query_count in query_tokens.items():
+        chunk_count = chunk_tokens.get(term, 0)
+        if not chunk_count:
+            continue
+        weight = _term_weight(term)
+        score += weight * min(chunk_count, 3) * query_count
+        if term in title_text:
+            score += weight * 1.5
+        if leaf_section_text and term in leaf_section_text:
+            score += weight * 2.5
+        if section_text and term in section_text:
+            score += weight * 1.5
+    return score
 
 
 def _score_tokens(

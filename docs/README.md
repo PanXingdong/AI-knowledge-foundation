@@ -6,6 +6,7 @@ Read these first:
 - [Architecture](architecture.md)
 - [Detailed design](detailed-design.md)
 - [Layer1 to Layer2 contract](layer1-to-layer2-contract.md)
+- [Layer2 hybrid retrieval and RAG](layer2-hybrid-retrieval-rag.md)
 - [Layer2 acceptance run](layer2-acceptance-run.md)
 - [Retrieval and Context Pack status](retrieval-context-pack-status.md)
 - [API contract](api-contract.md)

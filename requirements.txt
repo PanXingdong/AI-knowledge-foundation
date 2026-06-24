@@ -2,3 +2,5 @@ fastapi
 pydantic
 pypdf
 python-docx
+FlagEmbedding
+sentence-transformers

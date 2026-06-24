@@ -435,6 +435,147 @@ def test_build_context_pack_uses_fts_index_for_prefix_symbol_query(tmp_path: Pat
     assert "fts" in result.selected_chunks[0].retrieval_signals
 
 
+def test_build_context_pack_expands_qnx_memory_mapping_cache_terms(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "fts" / "chunks.db"
+
+    sentry = tmp_path / "remote-sentry.md"
+    sentry.write_text(
+        "\n".join(
+            [
+                "# XVR Shared Buffer",
+                "",
+                "座舱底层模块会读取摄像头 DMA 写入的共享内存，代码逻辑负责把图像数据编码。",
+                "共享内存、摄像头、DMA、图像数据、协处理器、硬件这些场景词会反复出现在设计说明里。",
+                "本文只描述业务侧 XVR 共享缓冲区处理流程，不说明 QNX mmap 缓存属性。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    qnx = tmp_path / "qnx-system-architecture.md"
+    qnx.write_text(
+        "\n".join(
+            [
+                "# QNX Neutrino RTOS System Architecture",
+                "",
+                "When a process uses mmap() to access a video frame buffer, stale data may appear.",
+                "Map the device memory with PROT_NOCACHE, or use mmap_device_memory() with MAP_PHYS when required.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=sentry,
+        out_dir=processed_root,
+        title="XVR Shared Buffer",
+        source_type="technical_document",
+        owner="checker",
+        project="remote_sentry",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=qnx,
+        out_dir=processed_root,
+        title="QNX Neutrino RTOS System Architecture",
+        source_type="official_manual",
+        owner="checker",
+        project="qnx",
+        document_version="v1",
+    )
+    build_fts_index(processed_dir=processed_root, index_path=index_path)
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query=(
+            "座舱底层模块直接读写硬件内存，摄像头通过 DMA 写图像数据，"
+            "读共享内存时偶尔闪烁或者读到上一帧旧数据 Stale Data。"
+            "怀疑是 Cache 没刷新，QNX 做 Memory Mapping 有没有必须加的标志位？"
+        ),
+        top_k=2,
+        per_document_limit=2,
+        fts_index_path=index_path,
+    )
+
+    top_chunk = result.selected_chunks[0]
+    assert any(
+        term in top_chunk.text
+        for term in ("PROT_NOCACHE", "mmap_device_memory", "MAP_PHYS")
+    )
+    assert "fts" in top_chunk.retrieval_signals
+
+
+def test_build_context_pack_expands_qnx_scheduler_cpu_budget_terms(tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    index_path = tmp_path / "fts" / "chunks.db"
+
+    network = tmp_path / "network-receiver.md"
+    network.write_text(
+        "\n".join(
+            [
+                "# Ethernet Receiver",
+                "",
+                "座舱网络通信模块有一个高优先级以太网收包线程，压力测试时会把 CPU 吃满。",
+                "报文风暴下 UI 渲染线程会被饿死，画面卡死；但降低优先级又可能丢包。",
+                "本文只描述业务线程和丢包现象，不说明 QNX 调度分区或 CPU budget。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    qnx = tmp_path / "qnx-adaptive-partitioning.md"
+    qnx.write_text(
+        "\n".join(
+            [
+                "# QNX Adaptive Partitioning User's Guide",
+                "",
+                "The adaptive partitioning thread scheduler throttles CPU usage by measuring the average CPU usage of each partition.",
+                "The percentage of CPU allotted to a partition is called a budget, computed over an averaging window.",
+                "If a partition is over budget and another partition demands time, the scheduler doesn't run the thread until usage falls below the partition's size.",
+                "SCHED_APS_SCHEDPOL_LIMIT_CPU_USAGE and max_budget_percent can limit how much a partition overruns its normal budget.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ingest_file(
+        file_path=network,
+        out_dir=processed_root,
+        title="Ethernet Receiver",
+        source_type="technical_document",
+        owner="checker",
+        project="cockpit_network",
+        document_version="v1",
+    )
+    ingest_file(
+        file_path=qnx,
+        out_dir=processed_root,
+        title="QNX Adaptive Partitioning User's Guide",
+        source_type="official_manual",
+        owner="checker",
+        project="qnx",
+        document_version="v1",
+    )
+    build_fts_index(processed_dir=processed_root, index_path=index_path)
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query=(
+            "座舱网络通信模块的高优先级以太网收包线程在报文风暴压力测试时把 CPU 吃满，"
+            "导致 UI 渲染线程被饿死卡死。能不能平时保持高优先级，异常时自动限制 CPU，"
+            "等它冷静后再恢复？"
+        ),
+        top_k=2,
+        per_document_limit=2,
+        fts_index_path=index_path,
+    )
+
+    top_chunk = result.selected_chunks[0]
+    assert "adaptive partitioning" in top_chunk.text.lower()
+    assert "budget" in top_chunk.text.lower()
+    assert "SCHED_APS_SCHEDPOL_LIMIT_CPU_USAGE" in top_chunk.text
+    assert "fts" in top_chunk.retrieval_signals
+
+
 def test_build_context_pack_prefers_chunks_covering_core_technical_terms(tmp_path: Path):
     processed_root = tmp_path / "processed"
 
