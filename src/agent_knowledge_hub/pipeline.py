@@ -23,7 +23,9 @@ def ingest_file(
     document_version: str = "unknown",
     sample_id: str | None = None,
     max_chunk_chars: int = 1600,
+    max_tokens: int | None = None,
     overlap_chars: int = 160,
+    min_chunk_chars: int = 80,
 ) -> IngestResult:
     source_path = Path(file_path).resolve()
     output_root = Path(out_dir).resolve()
@@ -47,7 +49,9 @@ def ingest_file(
     chunks = build_chunks(
         canonical,
         max_chunk_chars=max_chunk_chars,
+        max_tokens=max_tokens,
         overlap_chars=overlap_chars,
+        min_chunk_chars=min_chunk_chars,
     )
 
     safe_title = slugify(canonical.document.title, fallback="document")
@@ -78,7 +82,9 @@ def ingest_manifest(
     out_dir: Path | str,
     project_root: Path | str | None = None,
     max_chunk_chars: int = 1600,
+    max_tokens: int | None = None,
     overlap_chars: int = 160,
+    min_chunk_chars: int = 80,
     fail_fast: bool = False,
 ) -> ManifestIngestSummary:
     manifest = Path(manifest_path).resolve()
@@ -130,7 +136,9 @@ def ingest_manifest(
                     document_version=_optional(row, "document_version") or "unknown",
                     sample_id=sample_id,
                     max_chunk_chars=max_chunk_chars,
+                    max_tokens=max_tokens,
                     overlap_chars=overlap_chars,
+                    min_chunk_chars=min_chunk_chars,
                 )
                 results.append(result)
             except (DocumentParseError, OSError, ValueError) as exc:
