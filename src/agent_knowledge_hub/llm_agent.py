@@ -160,6 +160,38 @@ class LLMAgent:
             logger.exception("LLM synthesis failed, falling back to raw evidence")
             return context_pack_text  # show raw evidence if LLM fails
 
+    def plan_query(self, query: str, intent: str = "") -> dict:
+        """Optional LLM-backed query planning hook.
+
+        Returns a dict with optional keys ``intent``, ``expanded_queries`` and
+        ``preferred_sections``. On any failure (no API key, network error, bad
+        JSON) it returns ``{}`` so the deterministic planner is used unchanged.
+        """
+        if not self.api_key:
+            return {}
+        system = (
+            "你是检索查询规划助手。读取用户问题，输出 JSON："
+            '{"intent": "...", "expanded_queries": ["..."], "preferred_sections": ["..."]}。'
+            "expanded_queries 给 2-5 个用于全文检索的英文/中文关键词短语；"
+            "preferred_sections 给可能命中答案的章节名（如 overview/architecture/概述）。"
+            "只输出 JSON，不要解释。"
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": query},
+        ]
+        try:
+            raw = _call_deepseek(messages, self.api_key, self.model, self.timeout)
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                return {}
+            parsed = json.loads(raw[start : end + 1])
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            logger.exception("LLM plan_query failed, falling back to local planner")
+            return {}
+
     def no_evidence_reply(self, query: str) -> str:
         """Reply when knowledge base returned no useful results."""
         user_content = (
