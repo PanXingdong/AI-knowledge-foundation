@@ -221,7 +221,16 @@ def _build_fts_match_query(query: str) -> str | None:
                 char for char in token if char.isalnum() or char in {"_", ".", "/", "-"}
             )
             if len(cleaned) >= 2:
-                tokens.append(f"{_escape_fts_token(cleaned)}*")
+                # Tokens that contain dots but no letters (e.g. "7.1", "3.2.1") are
+                # version numbers. FTS5 treats "." as a separator, so prefix queries
+                # like "7.1"* only match the leading "7" part. Use an exact match
+                # instead so "7.1" in document text is found correctly.
+                has_letter = any("a" <= char <= "z" for char in cleaned)
+                has_dot = "." in cleaned
+                if has_dot and not has_letter:
+                    tokens.append(_escape_fts_token(cleaned))
+                else:
+                    tokens.append(f"{_escape_fts_token(cleaned)}*")
 
     if not tokens:
         return None

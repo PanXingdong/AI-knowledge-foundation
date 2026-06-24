@@ -67,7 +67,13 @@ def test_query_fts_index_handles_dotted_versions_and_punctuation(tmp_path: Path)
 
     source = tmp_path / "qnx.md"
     source.write_text(
-        "# QNX\n\nQNX SDP 7.1 high-performance networking uses resource managers.\n",
+        "# QNX Neutrino RTOS\n\n"
+        "QNX SDP 7.1 provides high-performance networking capabilities through "
+        "resource managers and the io-pkt networking stack. The QNX SDP 7.1 release "
+        "includes enhanced support for multi-core ARM and x86 platforms, along with "
+        "improved adaptive partitioning and real-time scheduling guarantees. "
+        "Developers targeting QNX SDP 7.1 should review the migration guide for "
+        "changes to the process manager and resource manager interfaces.\n",
         encoding="utf-8",
     )
     ingest_file(

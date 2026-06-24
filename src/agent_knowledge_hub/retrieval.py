@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -10,12 +11,34 @@ from typing import Iterable
 
 from agent_knowledge_hub.fts_index import query_fts_index
 from agent_knowledge_hub.utils import normalize_space, stable_id, write_json
-from agent_knowledge_hub.vector_index import query_vector_index
+from agent_knowledge_hub.vector_index import VectorIndexError, query_vector_index
 
 
 CONTEXT_PACK_SCHEMA_VERSION = "context-pack.v1"
 DEFAULT_CONTEXT_PACK_TASK_TYPE = "general_query"
 MAX_CHUNKS_FOR_NEIGHBOR_MERGE = 1200
+# Index bonus weights. Surfaced as named module-level knobs (instead of inline
+# magic numbers) so scoring behaviour is discoverable and tunable in one place.
+FTS_RANK_BONUS_WEIGHT = 72.0
+VECTOR_RANK_BONUS_WEIGHT = 54.0
+VECTOR_SIMILARITY_BONUS_WEIGHT = 32.0
+# Rough, dependency-free token-estimate weights used for context-pack budgeting.
+# CJK characters are pricier per token than latin text, so they are weighted up.
+_CJK_TOKEN_WEIGHT = 1.6
+_NON_CJK_TOKEN_DIVISOR = 4.0
+# Generous upper-bound placeholder for the two system-level warnings appended
+# *after* _apply_token_budget returns (token_budget_exceeded and
+# token_budget_too_small). Chunk-level quality warnings (_build_context_pack_warnings)
+# are measured accurately inside the trimming loop and do not need headroom here.
+# Values are intentionally larger than any realistic run:
+#   dropped  <= 9 999        (top_k is always < 1 000 in practice)
+#   budget   <= 9 999 999    (~10 M tokens)
+#   topics   <= 20 labels of 20 chars each
+_TOKEN_BUDGET_WARNING_RESERVE = (
+    "token_budget_exceeded:dropped=9999:budget=9999999:topics="
+    + ",".join(["x" * 20] * 20)
+    + "|token_budget_too_small:kept_single_best_chunk"
+)
 CONTEXT_PACK_STABLE_FIELDS = (
     "schema_version",
     "task_type",
@@ -1294,6 +1317,8 @@ class ContextPackResult:
     chunk_count: int
     document_count: int
     warnings: list[str]
+    token_used: int = 0
+    token_budget: int | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         sections = _build_context_pack_section_payloads(
@@ -1311,6 +1336,8 @@ class ContextPackResult:
             "applied_filters": {key: list(value) for key, value in self.applied_filters.items()},
             "chunk_count": self.chunk_count,
             "document_count": self.document_count,
+            "token_used": self.token_used,
+            "token_budget": self.token_budget,
             "warnings": list(self.warnings),
             "sections": sections,
             "selected_chunks": [chunk.to_dict() for chunk in self.selected_chunks],
@@ -1333,6 +1360,8 @@ class ContextPackResult:
             "applied_filters": {key: list(value) for key, value in self.applied_filters.items()},
             "chunk_count": self.chunk_count,
             "document_count": self.document_count,
+            "token_used": self.token_used,
+            "token_budget": self.token_budget,
             "warnings": list(self.warnings),
             "output_dir": str(output_dir) if output_dir else None,
             "sections": sections,
@@ -1484,6 +1513,74 @@ class _CandidateScore:
     retrieval_signals: frozenset[str]
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough, dependency-free token estimate used for context-pack budgeting.
+
+    CJK characters are counted as ~1.6 tokens each; the remaining characters are
+    counted as ~1 token per 4 characters (a common heuristic for latin text).
+    This intentionally over-estimates rather than under-estimates so the budget
+    stays conservative.
+    """
+    if not text:
+        return 0
+    cjk = sum(
+        1
+        for ch in text
+        if "\u4e00" <= ch <= "\u9fff"   # CJK Unified Ideographs
+        or "\u3400" <= ch <= "\u4dbf"   # CJK Extension A
+        or "\u3000" <= ch <= "\u303f"   # CJK Symbols and Punctuation (。，、；：)
+        or "\uff00" <= ch <= "\uffef"   # Halfwidth and Fullwidth Forms (full-width punct)
+    )
+    other = len(text) - cjk
+    return int(cjk * _CJK_TOKEN_WEIGHT + other / _NON_CJK_TOKEN_DIVISOR)
+
+
+def _apply_token_budget(
+    *,
+    chunks: list[RetrievedChunk],
+    token_budget: int,
+    query: str,
+    task_type: str,
+    task_profile: dict[str, object],
+    base_warnings: list[str],
+) -> tuple[list[RetrievedChunk], list[RetrievedChunk]]:
+    """Keep the highest-priority prefix of chunks that fits the token budget.
+
+    Chunks are kept whole (never truncated mid-chunk) so evidence stays
+    traceable, and the input order is treated as priority order (best first).
+    At least one chunk is retained when any exist - even if it alone exceeds the
+    budget - so the agent always receives the single best piece of evidence.
+    Returns ``(kept_chunks, dropped_chunks)``.
+    """
+    if not chunks:
+        return [], []
+    kept_count = 0
+    for count in range(1, len(chunks) + 1):
+        # Include per-chunk quality warnings in each candidate measurement so
+        # the budget estimate accounts for the actual warnings that will appear
+        # in the final markdown, not just the post-trimming system warnings
+        # covered by _TOKEN_BUDGET_WARNING_RESERVE.
+        candidate_warnings = list(
+            dict.fromkeys(
+                base_warnings + _build_context_pack_warnings(chunks[:count])
+            )
+        )
+        candidate_markdown = _render_context_pack_markdown(
+            query=query,
+            task_type=task_type,
+            task_profile=task_profile,
+            warnings=candidate_warnings,
+            chunks=chunks[:count],
+        )
+        if estimate_tokens(candidate_markdown) <= token_budget:
+            kept_count = count
+        else:
+            break
+    if kept_count == 0:
+        kept_count = 1
+    return chunks[:kept_count], chunks[kept_count:]
+
+
 def build_context_pack_for_processed_dir(
     *,
     processed_dir: Path | str,
@@ -1494,6 +1591,7 @@ def build_context_pack_for_processed_dir(
     metadata_filters: dict[str, list[str]] | None = None,
     fts_index_path: Path | str | None = None,
     vector_index_path: Path | str | None = None,
+    token_budget: int | None = None,
 ) -> ContextPackResult:
     processed_root = Path(processed_dir).resolve()
     normalized_task_type = _normalize_context_pack_task_type(task_type)
@@ -1502,6 +1600,8 @@ def build_context_pack_for_processed_dir(
         raise ValueError("top_k must be > 0")
     if per_document_limit <= 0:
         raise ValueError("per_document_limit must be > 0")
+    if token_budget is not None and token_budget <= 0:
+        raise ValueError("token_budget must be > 0 when provided")
     if not query.strip():
         raise ValueError("query must not be empty")
     if not processed_root.exists():
@@ -1528,12 +1628,15 @@ def build_context_pack_for_processed_dir(
         clauses=clauses,
         desired_topics=desired_topics,
     )
-    fts_bonus_by_chunk_id = _load_fts_bonus_by_chunk_id(
+    system_warnings: list[str] = []
+    fts_bonus_by_chunk_id, fts_warning = _load_fts_bonus_by_chunk_id(
         fts_index_path=fts_index_path,
         query=normalized_query,
         limit=max(20, top_k * max(4, per_document_limit)),
     )
-    vector_bonus_by_chunk_id = _load_vector_bonus_by_chunk_id(
+    if fts_warning:
+        system_warnings.append(fts_warning)
+    vector_bonus_by_chunk_id, vector_warning = _load_vector_bonus_by_chunk_id(
         vector_index_path=vector_index_path,
         query=normalized_query,
         limit=max(20, top_k * max(4, per_document_limit)),
@@ -1546,6 +1649,8 @@ def build_context_pack_for_processed_dir(
         chunks=loaded_chunks,
         bonuses=vector_bonus_by_chunk_id,
     )
+    if vector_warning:
+        system_warnings.append(vector_warning)
     external_bonus_by_chunk_id = {
         **fts_bonus_by_chunk_id,
         **{
@@ -1643,7 +1748,47 @@ def build_context_pack_for_processed_dir(
         for candidate in selected
     ]
     selected_chunks = _apply_intent_rerank(query, selected_chunks)
-    warnings = _build_context_pack_warnings(selected_chunks)
+    if selected_chunks and all(
+        not chunk.allowed_for_context_pack for chunk in selected_chunks
+    ):
+        system_warnings.append("no_allowed_chunks:all_selected_quality_gated")
+
+    if token_budget is not None:
+        kept_chunks, dropped_chunks = _apply_token_budget(
+            chunks=selected_chunks,
+            token_budget=token_budget,
+            query=normalized_query,
+            task_type=normalized_task_type,
+            task_profile=task_profile,
+            base_warnings=system_warnings + [_TOKEN_BUDGET_WARNING_RESERVE],
+        )
+        if dropped_chunks:
+            dropped_topics = sorted(
+                {_classify_chunk_topic(chunk) for chunk in dropped_chunks}
+            )
+            system_warnings.append(
+                "token_budget_exceeded:"
+                f"dropped={len(dropped_chunks)}:"
+                f"budget={token_budget}:"
+                f"topics={','.join(dropped_topics)}"
+            )
+        if len(kept_chunks) == 1 and dropped_chunks:
+            kept_markdown_tokens = estimate_tokens(
+                _render_context_pack_markdown(
+                    query=normalized_query,
+                    task_type=normalized_task_type,
+                    task_profile=task_profile,
+                    warnings=system_warnings,
+                    chunks=kept_chunks,
+                )
+            )
+            if kept_markdown_tokens > token_budget:
+                system_warnings.append("token_budget_too_small:kept_single_best_chunk")
+        selected_chunks = kept_chunks
+
+    warnings = list(
+        dict.fromkeys(system_warnings + _build_context_pack_warnings(selected_chunks))
+    )
     markdown = _render_context_pack_markdown(
         query=normalized_query,
         task_type=normalized_task_type,
@@ -1664,6 +1809,8 @@ def build_context_pack_for_processed_dir(
         chunk_count=len(selected_chunks),
         document_count=len({chunk.document_version_id for chunk in selected_chunks}),
         warnings=warnings,
+        token_used=estimate_tokens(markdown),
+        token_budget=token_budget,
     )
 
 
@@ -1874,6 +2021,12 @@ def load_context_pack_result(path: Path | str) -> ContextPackResult:
             or len({chunk.document_version_id for chunk in selected_chunks})
         ),
         warnings=warnings,
+        token_used=int(
+            payload["token_used"]
+            if payload.get("token_used") is not None
+            else estimate_tokens(markdown)
+        ),
+        token_budget=_optional_int(payload.get("token_budget")),
     )
 
 
@@ -2253,26 +2406,28 @@ def _load_fts_bonus_by_chunk_id(
     fts_index_path: Path | str | None,
     query: str,
     limit: int,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], str | None]:
     if fts_index_path is None:
-        return {}
+        return {}, None
 
     bonuses: dict[str, float] = {}
-    for variant_rank, (query_variant, variant_weight) in enumerate(
-        _build_fts_query_variants(query),
-        start=1,
-    ):
-        hits = query_fts_index(
-            index_path=fts_index_path,
-            query=query_variant,
-            limit=limit,
-        )
-        for rank, hit in enumerate(hits, start=1):
-            bonuses[hit.chunk_id] = max(
-                bonuses.get(hit.chunk_id, 0.0),
-                variant_weight * 72.0 / (rank * rank),
+    try:
+        for query_variant, variant_weight in _build_fts_query_variants(query):
+            hits = query_fts_index(
+                index_path=fts_index_path,
+                query=query_variant,
+                limit=limit,
             )
-    return bonuses
+            for rank, hit in enumerate(hits, start=1):
+                bonuses[hit.chunk_id] = max(
+                    bonuses.get(hit.chunk_id, 0.0),
+                    variant_weight * 72.0 / (rank * rank),
+                )
+    except FileNotFoundError:
+        return {}, "fts_index_unavailable:not_found:lexical_only"
+    except (OSError, sqlite3.Error):
+        return {}, "fts_index_unavailable:query_failed:lexical_only"
+    return bonuses, None
 
 
 def _build_fts_query_variants(query: str) -> list[tuple[str, float]]:
@@ -2492,24 +2647,29 @@ def _load_vector_bonus_by_chunk_id(
     vector_index_path: Path | str | None,
     query: str,
     limit: int,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], str | None]:
     if vector_index_path is None:
-        return {}
+        return {}, None
 
-    hits = query_vector_index(
-        index_path=vector_index_path,
-        query=query,
-        limit=limit,
-    )
+    try:
+        hits = query_vector_index(
+            index_path=vector_index_path,
+            query=query,
+            limit=limit,
+        )
+    except FileNotFoundError:
+        return {}, "vector_index_unavailable:not_found:lexical_only"
+    except (OSError, VectorIndexError):
+        return {}, "vector_index_unavailable:query_failed:lexical_only"
     bonuses: dict[str, float] = {}
     for rank, hit in enumerate(hits, start=1):
-        rank_bonus = 54.0 / (rank * rank)
-        similarity_bonus = hit.similarity_score * 32.0
+        rank_bonus = VECTOR_RANK_BONUS_WEIGHT / (rank * rank)
+        similarity_bonus = hit.similarity_score * VECTOR_SIMILARITY_BONUS_WEIGHT
         bonuses[hit.chunk_id] = max(
             bonuses.get(hit.chunk_id, 0.0),
             rank_bonus + similarity_bonus,
         )
-    return bonuses
+    return bonuses, None
 
 
 def _chunk_matches_metadata_filters(
@@ -2590,6 +2750,15 @@ def _optional_float(value: object) -> float | None:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
