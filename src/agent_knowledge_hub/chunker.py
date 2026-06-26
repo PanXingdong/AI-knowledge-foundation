@@ -92,6 +92,175 @@ def _estimate_tokens(text: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Sentence splitter — semantic boundary awareness
+# ---------------------------------------------------------------------------
+
+# Words (lower-cased) whose trailing "." must NOT be treated as a sentence
+# boundary.  Tuned for English technical / embedded-systems documentation.
+_ABBREVS: frozenset[str] = frozenset({
+    # Latin discourse markers
+    "e.g", "i.e", "etc", "vs", "cf",
+    # Document-structure references
+    "fig", "figs", "eq", "sec", "ch", "vol", "no", "ref", "p", "pp",
+    # Quantity qualifiers
+    "approx", "incl", "excl", "max", "min", "avg", "est",
+    # Abbreviated month names
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    # Titles
+    "dr", "mr", "mrs", "ms", "prof",
+})
+
+# CJK sentence-ending punctuation — always a safe split point.
+_CJK_SENT_END_RE: re.Pattern[str] = re.compile(r"(?<=[。！？])\s*")
+
+# Blank-line paragraph break — always safe.
+_BLANK_LINE_RE: re.Pattern[str] = re.compile(r"\n{2,}")
+
+# Match any word characters that precede a dot so we can check abbreviations.
+_WORD_BEFORE_DOT_RE: re.Pattern[str] = re.compile(r"[A-Za-z]+$")
+
+
+def _is_eng_sentence_boundary(text: str, dot_pos: int) -> bool:
+    """Return True if the dot at *dot_pos* ends an English sentence.
+
+    Conservative rules tuned for English technical documentation:
+
+    - Dot must be followed by whitespace then an uppercase letter or CJK char.
+    - Dot preceded by a digit → version / decimal number (7.1, 1.2.3).
+    - Dot preceded by an uppercase letter → acronym (U.S., API., QNX.).
+    - Dot preceded by a known abbreviation word → not a sentence end.
+    """
+    after = text[dot_pos + 1:]
+    if not after or not after[0].isspace():
+        return False
+    tail = after.lstrip()
+    if not tail:
+        return False
+    first = tail[0]
+    if not (first.isupper() or "\u4e00" <= first <= "\u9fff"):
+        return False
+
+    before = text[:dot_pos]
+    if not before:
+        return False
+    prev_char = before[-1]
+    if prev_char.isdigit():          # version / decimal: 3.14, v7.1
+        return False
+    if prev_char.isupper():          # acronym dot: U.S.A., QNX.
+        return False
+    m = _WORD_BEFORE_DOT_RE.search(before)
+    if m and m.group().lower() in _ABBREVS:
+        return False
+
+    return True
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split *text* into sentence-level fragments.
+
+    Split priority:
+    1. Blank lines (``\\n\\n``) — paragraph boundary, always safe.
+    2. CJK sentence-ending punctuation (。！？) — always safe.
+    3. English sentence boundaries (``". "`` + uppercase) with abbreviation
+       and version-number protection.
+
+    Returns ``[text]`` when no split points are found so callers can always
+    iterate the result safely.
+    """
+    # Phase 1 — macro splits: blank lines then CJK punctuation.
+    macro_parts: list[str] = []
+    for para in _BLANK_LINE_RE.split(text):
+        if not para.strip():
+            continue
+        for seg in _CJK_SENT_END_RE.split(para):
+            s = seg.strip()
+            if s:
+                macro_parts.append(s)
+
+    if not macro_parts:
+        return [text] if text.strip() else []
+
+    # Phase 2 — English sentence boundaries within each macro part.
+    result: list[str] = []
+    for part in macro_parts:
+        start = 0
+        for m in re.finditer(r"\.", part):
+            pos = m.start()
+            if _is_eng_sentence_boundary(part, pos):
+                fragment = part[start: pos + 1].strip()
+                if fragment:
+                    result.append(fragment)
+                start = pos + 1
+                while start < len(part) and part[start].isspace():
+                    start += 1
+        tail = part[start:].strip()
+        if tail:
+            result.append(tail)
+
+    return result or [text]
+
+
+def _sentence_split_if_needed(text: str, token_budget: int) -> list[str]:
+    """Return *text* split at sentence boundaries when it exceeds *token_budget*.
+
+    Falls back to line-level splitting, then to a character-window hard cut for
+    any fragment still above the budget (e.g. a single long code line or API
+    signature with no natural break points).  Always returns at least one
+    non-empty string.
+    """
+    if _estimate_tokens(text) <= token_budget:
+        return [text]
+
+    fragments: list[str] = []
+    for sent in _split_sentences(text):
+        if _estimate_tokens(sent) <= token_budget:
+            fragments.append(sent)
+        else:
+            for line in sent.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if _estimate_tokens(line) <= token_budget:
+                    fragments.append(line)
+                else:
+                    # Hard cut: token-budget-aware split for lines that still
+                    # exceed the budget (e.g. a long code line with no spaces).
+                    fragments.extend(_hard_cut_to_token_budget(line, token_budget))
+
+    return fragments or [text]
+
+
+def _hard_cut_to_token_budget(text: str, token_budget: int) -> list[str]:
+    """Split an unsplittable line into pieces that fit *token_budget*.
+
+    Uses the same estimator as the chunker itself, so CJK-dense text gets a
+    much smaller character window than ASCII text. The upper bound remains
+    ``token_budget * 4`` to preserve the previous ASCII behaviour.
+    """
+    if token_budget <= 0:
+        return [text]
+
+    pieces: list[str] = []
+    start = 0
+    max_chars = max(1, token_budget * 4)
+    while start < len(text):
+        low = start + 1
+        high = min(len(text), start + max_chars)
+        best = low
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = text[start:mid]
+            if _estimate_tokens(candidate) <= token_budget:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        pieces.append(text[start:best])
+        start = best
+    return pieces
+
+
+# ---------------------------------------------------------------------------
 # Main chunker
 # ---------------------------------------------------------------------------
 
@@ -99,7 +268,7 @@ def build_chunks(
     canonical: CanonicalDocument,
     *,
     max_chunk_chars: int = 1600,
-    max_tokens: int | None = None,
+    max_tokens: int = 512,
     overlap_chars: int = 160,
     min_chunk_chars: int = 10,
 ) -> list[Chunk]:
@@ -108,13 +277,16 @@ def build_chunks(
     Parameters
     ----------
     max_chunk_chars:
-        Hard character limit per chunk.  Ignored when *max_tokens* is set.
+        Character limit per chunk used only when *max_tokens* is explicitly
+        set to 0 (disabled).  In normal operation *max_tokens* takes
+        precedence, so this parameter mainly serves as a hard safety cap.
     max_tokens:
-        Preferred token budget per chunk (CJK-aware estimate).  When set this
-        takes precedence over *max_chunk_chars* and adapts to mixed-language
-        content — important for BGE-M3 whose 8 192-token window makes a fixed
-        character limit unstable across Chinese/English documents.
-        Typical value: 512 (dense retrieval) or 256 (high-precision RAG).
+        Token budget per chunk (CJK-aware estimate).  Defaults to 512, which
+        matches the sweet spot for BGE-M3 dense retrieval and correctly
+        handles mixed Chinese/English technical documents where a fixed
+        character limit would either under-fill (pure ASCII) or overflow
+        (pure CJK) the model's effective encoding window.
+        Set to 0 to disable token budgeting and fall back to *max_chunk_chars*.
     overlap_chars:
         Characters to carry forward between chunks within the same section.
         Hard-capped so a single oversized block cannot inflate the window.
@@ -133,10 +305,14 @@ def build_chunks(
     - Overlap is hard-capped at *overlap_chars* characters.
     - ``block_type="table"`` blocks are treated as atomic: the size check is
       skipped so a table is never split across chunks.
-    - ``block_type="heading"`` blocks are not emitted as standalone chunks;
-      they are carried into the following content block for context.
-    - Token-aware budget replaces the fixed character limit when *max_tokens*
-      is provided.
+    - ``block_type="heading"`` blocks are buffered separately and prepended to
+      the *next* content block (paragraph or table).  A heading immediately
+      preceding a table is therefore always included in the table's chunk
+      rather than being flushed as a useless standalone chunk.
+    - Pending-heading text is included in the budget check so that the
+      combined heading + paragraph text never silently exceeds *max_tokens*.
+    - Token-aware budget (CJK-adjusted) is the default; character limit is the
+      fallback when ``max_tokens=0``.
     """
     if max_chunk_chars < 50:
         raise ValueError("max_chunk_chars must be >= 50")
@@ -147,9 +323,19 @@ def build_chunks(
     if min_chunk_chars < 0:
         raise ValueError("min_chunk_chars must be >= 0")
 
+    # pending_heading_texts is captured by _over_budget closure; must be
+    # declared before _over_budget so Python's late-binding resolution works.
+    pending_heading_texts: list[str] = []
+    pending_heading_evidence: list[str] = []
+    _ph_page_start: int | None = None
+    _ph_page_end: int | None = None
+
     def _over_budget(texts: list[str], next_text: str) -> bool:
-        combined = "\n\n".join([*texts, next_text])
-        if max_tokens is not None:
+        # Include pending headings: they will be drained into the chunk before
+        # next_text is appended, so they must count toward the budget now.
+        all_texts = [*texts, *pending_heading_texts, next_text]
+        combined = "\n\n".join(all_texts)
+        if max_tokens:
             return _estimate_tokens(combined) > max_tokens
         return len(combined) > max_chunk_chars
 
@@ -223,6 +409,34 @@ def build_chunks(
         current_page_start = None
         current_page_end = None
 
+    def _drain_pending_headings() -> None:
+        """Merge the pending-heading buffer into the current chunk window.
+
+        Called immediately before a paragraph or table block is appended so
+        the heading text and its page range are incorporated into the same
+        chunk as the content it introduces.
+        """
+        nonlocal pending_heading_texts, pending_heading_evidence
+        nonlocal _ph_page_start, _ph_page_end
+        if not pending_heading_texts:
+            return
+        current_texts.extend(pending_heading_texts)
+        current_evidence.extend(e for e in pending_heading_evidence if e)
+        _absorb_page(_ph_page_start, _ph_page_end)
+        pending_heading_texts = []
+        pending_heading_evidence = []
+        _ph_page_start = None
+        _ph_page_end = None
+
+    def _discard_pending_headings() -> None:
+        """Drop stale headings when a section boundary invalidates them."""
+        nonlocal pending_heading_texts, pending_heading_evidence
+        nonlocal _ph_page_start, _ph_page_end
+        pending_heading_texts = []
+        pending_heading_evidence = []
+        _ph_page_start = None
+        _ph_page_end = None
+
     for block in canonical.blocks:
         block_text = block.text.strip()
         if not block_text:
@@ -243,28 +457,47 @@ def build_chunks(
         )
 
         # --- Heading blocks ---
-        # Headings update section context but are not emitted as standalone
-        # chunks.  They are prepended to the next content block so the heading
-        # text provides retrieval signal in the chunk it introduces.
+        # Headings are buffered in *pending_heading_texts* rather than appended
+        # directly to current_texts.  They are merged into the chunk only when
+        # the next content block (paragraph or table) is about to be added.
+        # This guarantees that a heading immediately preceding a table always
+        # lands in the same chunk as that table instead of being flushed alone.
         if block_type == "heading":
-            if section_changed and current_texts:
-                flush(preserve_overlap=False)
+            if section_changed:
+                if current_texts:
+                    flush(preserve_overlap=False)
+                _discard_pending_headings()
             current_section_path = list(block.section_path)
-            current_texts.append(block_text)
+            pending_heading_texts.append(block_text)
             if block_evidence:
-                current_evidence.append(block_evidence)
-            _absorb_page(block.page_start, block.page_end)
+                pending_heading_evidence.append(block_evidence)
+            # Track page range in the pending buffer (not in current chunk).
+            if block.page_start is not None:
+                _ph_page_start = (
+                    block.page_start if _ph_page_start is None
+                    else min(_ph_page_start, block.page_start)
+                )
+            if block.page_end is not None:
+                _ph_page_end = (
+                    block.page_end if _ph_page_end is None
+                    else max(_ph_page_end, block.page_end)
+                )
             continue
 
         # --- Table blocks (atomic — never split mid-table) ---
         if block_type == "table":
-            if section_changed and current_texts:
-                flush(preserve_overlap=False)
+            if section_changed:
+                if current_texts:
+                    flush(preserve_overlap=False)
+                _discard_pending_headings()
             elif current_texts:
                 # Flush any accumulated paragraph text before the table so
-                # the table lands in its own chunk.
+                # the table lands in its own chunk.  Pending headings are
+                # intentionally *not* discarded here — they belong to this
+                # table, not to the preceding paragraph chunk.
                 flush(preserve_overlap=True)
             current_section_path = list(block.section_path)
+            _drain_pending_headings()  # heading joins the table chunk
             current_texts.append(block_text)
             if block_evidence:
                 current_evidence.append(block_evidence)
@@ -274,15 +507,41 @@ def build_chunks(
             continue
 
         # --- Regular paragraph blocks ---
-        if current_texts and (section_changed or _over_budget(current_texts, block_text)):
-            flush(preserve_overlap=not section_changed)
+        # Split oversized blocks at sentence boundaries before accumulating.
+        # Each sub-block is processed as if it were a separate paragraph so
+        # the accumulator can group multiple short sentences into one chunk,
+        # keeping sub-blocks within the token budget on a best-effort basis.
+        #
+        # Token budget for splitting: use max_tokens when enabled, otherwise
+        # approximate from max_chunk_chars (4 ASCII chars ≈ 1 token).
+        _split_budget = max_tokens if max_tokens else max(64, max_chunk_chars // 4)
+        sub_blocks = _sentence_split_if_needed(block_text, _split_budget)
 
-        current_section_path = list(block.section_path)
-        current_texts.append(block_text)
-        if block_evidence:
-            current_evidence.append(block_evidence)
-        _absorb_page(block.page_start, block.page_end)
+        first_sub = True
+        for sub_text in sub_blocks:
+            # section_changed applies only to the first sub-block; subsequent
+            # sub-blocks from the same source block are in the same section.
+            effective_section_changed = section_changed and first_sub
 
+            if current_texts and (
+                effective_section_changed or _over_budget(current_texts, sub_text)
+            ):
+                flush(preserve_overlap=not effective_section_changed)
+                if effective_section_changed:
+                    _discard_pending_headings()
+
+            current_section_path = list(block.section_path)
+            if first_sub:
+                _drain_pending_headings()  # heading joins the first sub-block
+            current_texts.append(sub_text)
+            if block_evidence:
+                current_evidence.append(block_evidence)
+            _absorb_page(block.page_start, block.page_end)
+            first_sub = False
+
+    # Final drain: a document that ends with heading(s) and no trailing content
+    # emits those headings as a small standalone chunk rather than losing them.
+    _drain_pending_headings()
     flush()
     return chunks
 

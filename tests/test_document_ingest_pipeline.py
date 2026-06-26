@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_knowledge_hub.chunker import _estimate_tokens, _sentence_split_if_needed
 from agent_knowledge_hub.models import CANONICAL_DOCUMENT_SCHEMA_VERSION
 from agent_knowledge_hub.pipeline import ingest_file, ingest_manifest
 from agent_knowledge_hub.parsers import UnsupportedDocumentFormatError, _build_pdf_text_layer_blocks
@@ -325,3 +326,31 @@ def test_ingest_unsupported_format_fails_explicitly(tmp_path: Path):
         ingest_file(file_path=source, out_dir=tmp_path / "out")
 
     assert ".bin" in str(error.value)
+
+
+def test_sentence_split_hard_cuts_single_line_exceeding_budget():
+    # A single unbreakable line (no spaces, newlines, or sentence boundaries)
+    # that far exceeds the token budget must still be split into fragments each
+    # within the budget — the hard character-window fallback must fire.
+    budget = 16  # ~64 ASCII chars
+    long_line = "A" * (budget * 4 * 3)  # 3× the character window
+
+    fragments = _sentence_split_if_needed(long_line, budget)
+
+    assert len(fragments) > 1, "expected hard cut to produce multiple fragments"
+    for frag in fragments:
+        # Each fragment must fit within the budget (4 ASCII chars ≈ 1 token).
+        assert len(frag) <= budget * 4, f"fragment too long: {len(frag)} chars"
+    # Original content must be fully preserved across all fragments.
+    assert "".join(fragments) == long_line
+
+
+def test_sentence_split_hard_cuts_cjk_line_by_token_budget():
+    budget = 16
+    long_line = "中" * (budget * 5)
+
+    fragments = _sentence_split_if_needed(long_line, budget)
+
+    assert len(fragments) > 1
+    assert all(_estimate_tokens(fragment) <= budget for fragment in fragments)
+    assert "".join(fragments) == long_line

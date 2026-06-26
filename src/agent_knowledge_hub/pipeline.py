@@ -23,7 +23,7 @@ def ingest_file(
     document_version: str = "unknown",
     sample_id: str | None = None,
     max_chunk_chars: int = 1600,
-    max_tokens: int | None = None,
+    max_tokens: int = 512,
     overlap_chars: int = 160,
     min_chunk_chars: int = 10,
 ) -> IngestResult:
@@ -82,7 +82,7 @@ def ingest_manifest(
     out_dir: Path | str,
     project_root: Path | str | None = None,
     max_chunk_chars: int = 1600,
-    max_tokens: int | None = None,
+    max_tokens: int = 512,
     overlap_chars: int = 160,
     min_chunk_chars: int = 10,
     fail_fast: bool = False,

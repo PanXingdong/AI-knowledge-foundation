@@ -52,6 +52,7 @@ class IngestManifestRequest(BaseModel):
     out_dir: str = Field(..., min_length=1)
     project_root: str | None = None
     max_chunk_chars: int = Field(1600, ge=100, le=20000)
+    max_tokens: int = Field(512, ge=0, le=8192)
     overlap_chars: int = Field(160, ge=0, le=5000)
     fail_fast: bool = False
     incremental: bool = True
@@ -165,6 +166,7 @@ def create_app() -> FastAPI:
                     out_dir=Path(request.out_dir),
                     project_root=Path(request.project_root) if request.project_root else None,
                     max_chunk_chars=request.max_chunk_chars,
+                    max_tokens=request.max_tokens,
                     overlap_chars=request.overlap_chars,
                     fail_fast=request.fail_fast,
                 )
@@ -174,6 +176,7 @@ def create_app() -> FastAPI:
                     out_dir=Path(request.out_dir),
                     project_root=Path(request.project_root) if request.project_root else None,
                     max_chunk_chars=request.max_chunk_chars,
+                    max_tokens=request.max_tokens,
                     overlap_chars=request.overlap_chars,
                     fail_fast=request.fail_fast,
                 )
