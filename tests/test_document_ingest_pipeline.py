@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_knowledge_hub.chunker import _sentence_split_if_needed
+from agent_knowledge_hub.chunker import _estimate_tokens, _sentence_split_if_needed
 from agent_knowledge_hub.models import CANONICAL_DOCUMENT_SCHEMA_VERSION
 from agent_knowledge_hub.pipeline import ingest_file, ingest_manifest
 from agent_knowledge_hub.parsers import UnsupportedDocumentFormatError, _build_pdf_text_layer_blocks
@@ -342,4 +342,15 @@ def test_sentence_split_hard_cuts_single_line_exceeding_budget():
         # Each fragment must fit within the budget (4 ASCII chars ≈ 1 token).
         assert len(frag) <= budget * 4, f"fragment too long: {len(frag)} chars"
     # Original content must be fully preserved across all fragments.
+    assert "".join(fragments) == long_line
+
+
+def test_sentence_split_hard_cuts_cjk_line_by_token_budget():
+    budget = 16
+    long_line = "中" * (budget * 5)
+
+    fragments = _sentence_split_if_needed(long_line, budget)
+
+    assert len(fragments) > 1
+    assert all(_estimate_tokens(fragment) <= budget for fragment in fragments)
     assert "".join(fragments) == long_line

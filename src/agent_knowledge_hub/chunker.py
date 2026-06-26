@@ -223,14 +223,41 @@ def _sentence_split_if_needed(text: str, token_budget: int) -> list[str]:
                 if _estimate_tokens(line) <= token_budget:
                     fragments.append(line)
                 else:
-                    # Hard cut: character-window split for lines that still
+                    # Hard cut: token-budget-aware split for lines that still
                     # exceed the budget (e.g. a long code line with no spaces).
-                    # _estimate_tokens uses ~4 ASCII chars per token.
-                    window = max(1, token_budget * 4)
-                    for i in range(0, len(line), window):
-                        fragments.append(line[i : i + window])
+                    fragments.extend(_hard_cut_to_token_budget(line, token_budget))
 
     return fragments or [text]
+
+
+def _hard_cut_to_token_budget(text: str, token_budget: int) -> list[str]:
+    """Split an unsplittable line into pieces that fit *token_budget*.
+
+    Uses the same estimator as the chunker itself, so CJK-dense text gets a
+    much smaller character window than ASCII text. The upper bound remains
+    ``token_budget * 4`` to preserve the previous ASCII behaviour.
+    """
+    if token_budget <= 0:
+        return [text]
+
+    pieces: list[str] = []
+    start = 0
+    max_chars = max(1, token_budget * 4)
+    while start < len(text):
+        low = start + 1
+        high = min(len(text), start + max_chars)
+        best = low
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = text[start:mid]
+            if _estimate_tokens(candidate) <= token_budget:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        pieces.append(text[start:best])
+        start = best
+    return pieces
 
 
 # ---------------------------------------------------------------------------
