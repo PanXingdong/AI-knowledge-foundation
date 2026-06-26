@@ -63,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
                 document_version=args.document_version,
                 sample_id=args.sample_id,
                 max_chunk_chars=args.max_chunk_chars,
+                max_tokens=args.max_tokens,
                 overlap_chars=args.overlap_chars,
             )
             payload = result.to_summary_dict()
@@ -73,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
                     out_dir=args.out_dir,
                     project_root=args.project_root,
                     max_chunk_chars=args.max_chunk_chars,
+                    max_tokens=args.max_tokens,
                     overlap_chars=args.overlap_chars,
                     fail_fast=args.fail_fast,
                 )
@@ -82,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
                     out_dir=args.out_dir,
                     project_root=args.project_root,
                     max_chunk_chars=args.max_chunk_chars,
+                    max_tokens=args.max_tokens,
                     overlap_chars=args.overlap_chars,
                     fail_fast=args.fail_fast,
                 )
@@ -609,6 +612,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--max-chunk-chars", type=int, default=1600)
+    parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--overlap-chars", type=int, default=160)
 
 

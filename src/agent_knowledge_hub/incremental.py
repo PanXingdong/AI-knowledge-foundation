@@ -63,6 +63,7 @@ def ingest_manifest_incremental(
     out_dir: Path | str,
     project_root: Path | str | None = None,
     max_chunk_chars: int = 1600,
+    max_tokens: int = 512,
     overlap_chars: int = 160,
     fail_fast: bool = False,
 ) -> IncrementalIngestSummary:
@@ -149,6 +150,7 @@ def ingest_manifest_incremental(
                     document_version=_optional(row, "document_version") or "unknown",
                     sample_id=sample_id,
                     max_chunk_chars=max_chunk_chars,
+                    max_tokens=max_tokens,
                     overlap_chars=overlap_chars,
                 )
                 processed_count += 1
