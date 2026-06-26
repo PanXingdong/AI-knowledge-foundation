@@ -203,9 +203,10 @@ def _split_sentences(text: str) -> list[str]:
 def _sentence_split_if_needed(text: str, token_budget: int) -> list[str]:
     """Return *text* split at sentence boundaries when it exceeds *token_budget*.
 
-    Falls back to line-level splitting for any sentence still above the budget
-    (e.g. very long API descriptions or embedded code blocks).  Always returns
-    at least one non-empty string.
+    Falls back to line-level splitting, then to a character-window hard cut for
+    any fragment still above the budget (e.g. a single long code line or API
+    signature with no natural break points).  Always returns at least one
+    non-empty string.
     """
     if _estimate_tokens(text) <= token_budget:
         return [text]
@@ -215,11 +216,19 @@ def _sentence_split_if_needed(text: str, token_budget: int) -> list[str]:
         if _estimate_tokens(sent) <= token_budget:
             fragments.append(sent)
         else:
-            # Hard fallback: split at single newlines (e.g. long bullet lists).
             for line in sent.split("\n"):
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                if _estimate_tokens(line) <= token_budget:
                     fragments.append(line)
+                else:
+                    # Hard cut: character-window split for lines that still
+                    # exceed the budget (e.g. a long code line with no spaces).
+                    # _estimate_tokens uses ~4 ASCII chars per token.
+                    window = max(1, token_budget * 4)
+                    for i in range(0, len(line), window):
+                        fragments.append(line[i : i + window])
 
     return fragments or [text]
 
@@ -473,8 +482,8 @@ def build_chunks(
         # --- Regular paragraph blocks ---
         # Split oversized blocks at sentence boundaries before accumulating.
         # Each sub-block is processed as if it were a separate paragraph so
-        # the accumulator can group multiple short sentences into one chunk
-        # while never producing a chunk that exceeds the token budget.
+        # the accumulator can group multiple short sentences into one chunk,
+        # keeping sub-blocks within the token budget on a best-effort basis.
         #
         # Token budget for splitting: use max_tokens when enabled, otherwise
         # approximate from max_chunk_chars (4 ASCII chars ≈ 1 token).
