@@ -155,7 +155,11 @@ class LocalAPIClient:
 
 class MessageFormatter:
     @staticmethod
-    def format_context_pack(result: dict[str, Any], score_threshold: float = -30.0) -> str:
+    def format_context_pack(
+        result: dict[str, Any],
+        score_threshold: float = -30.0,
+        max_context_length: int = 12000,
+    ) -> str:
         selected_chunks = result.get("selected_chunks", [])
         qualified = [c for c in selected_chunks if c.get("score", float("-inf")) >= score_threshold]
 
@@ -166,7 +170,7 @@ class MessageFormatter:
         # full chunk text, section paths, scores, and evidence context.
         markdown = result.get("markdown", "")
         if markdown:
-            return markdown
+            return MessageFormatter.truncate_message(markdown, max_context_length)
 
         query = result.get("query", "N/A")
         doc_titles = {c.get("document_title", "Unknown") for c in qualified}
@@ -186,7 +190,7 @@ class MessageFormatter:
                 lines.append(f"  章节: {section}")
             lines.append(f"  {text}")
 
-        return "\n".join(lines)
+        return MessageFormatter.truncate_message("\n".join(lines), max_context_length)
 
     @staticmethod
     def format_gap_report(result: dict[str, Any]) -> str:
