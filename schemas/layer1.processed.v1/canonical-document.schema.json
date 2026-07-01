@@ -187,7 +187,44 @@
           "type": "integer"
         },
         "metadata": {
-          "type": "object"
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "content_kind": {
+              "type": "string"
+            },
+            "ocr": {
+              "type": "boolean"
+            },
+            "ocr_engine": {
+              "type": "string"
+            },
+            "ocr_lines": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "confidence": {
+              "type": "number"
+            },
+            "bbox": {
+              "$ref": "#/$defs/bbox"
+            },
+            "bbox_unit": {
+              "type": "string"
+            },
+            "media_ref": {
+              "type": "string"
+            },
+            "page_image_ref": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            }
+          }
         }
       }
     },
@@ -221,23 +258,50 @@
           "type": "string"
         },
         "bbox": {
-          "anyOf": [
-            {
-              "type": "array",
-              "items": {
-                "type": "number"
-              }
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/nullable_bbox"
         },
         "text": {
           "type": "string"
         },
         "text_hash": {
           "type": "string"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "content_kind": {
+              "type": "string"
+            },
+            "ocr": {
+              "type": "boolean"
+            },
+            "ocr_engine": {
+              "type": "string"
+            },
+            "ocr_lines": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "confidence": {
+              "type": "number"
+            },
+            "bbox_unit": {
+              "type": "string"
+            },
+            "media_ref": {
+              "type": "string"
+            },
+            "page_image_ref": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            }
+          }
         }
       }
     },
@@ -293,6 +357,22 @@
       "items": {
         "type": "string"
       }
+    },
+    "bbox": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      }
+    },
+    "nullable_bbox": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/bbox"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "nullable_integer": {
       "anyOf": [

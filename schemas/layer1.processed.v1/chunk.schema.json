@@ -84,6 +84,36 @@
         },
         "source_type": {
           "type": "string"
+        },
+        "content_kind": {
+          "type": "string"
+        },
+        "content_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ocr": {
+          "type": "boolean"
+        },
+        "media_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "page_image_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "media_types": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     }

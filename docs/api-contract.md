@@ -302,11 +302,21 @@ Response shape:
     "document_version": "v1",
     "source_path": "...",
     "page": 18,
+    "bbox": [10.0, 20.0, 200.0, 80.0],
+    "content_kind": "ocr_text",
+    "media_ref": "media/device-error.png",
+    "page_image_ref": "media/device-error.png",
+    "media_type": "image/png",
+    "confidence": 0.91,
+    "ocr": true,
+    "metadata": {},
     "section_titles": [],
     "text": "..."
   }
 }
 ```
+
+For text-only evidence, `bbox`, `content_kind`, `media_ref`, `page_image_ref`, `media_type`, and `confidence` may be `null`, and `ocr` is `false`. OCR evidence uses the same endpoint: callers retrieve text from `text`, then use `bbox` with `page_image_ref` or `media_ref` to jump back to the scanned page or image asset.
 
 ## POST /api/document-inventory
 

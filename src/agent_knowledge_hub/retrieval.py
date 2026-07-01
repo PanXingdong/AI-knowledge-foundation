@@ -1461,6 +1461,13 @@ class EvidenceTraceResult:
     block_id: str
     text: str
     bbox: list[float] | None
+    content_kind: str | None
+    media_ref: str | None
+    page_image_ref: str | None
+    media_type: str | None
+    confidence: float | None
+    ocr: bool
+    metadata: dict[str, object]
     chunk_references: list[EvidenceChunkReference]
 
     def to_dict(self) -> dict[str, object]:
@@ -1479,6 +1486,13 @@ class EvidenceTraceResult:
             "block_id": self.block_id,
             "text": self.text,
             "bbox": list(self.bbox) if self.bbox is not None else None,
+            "content_kind": self.content_kind,
+            "media_ref": self.media_ref,
+            "page_image_ref": self.page_image_ref,
+            "media_type": self.media_type,
+            "confidence": self.confidence,
+            "ocr": self.ocr,
+            "metadata": dict(self.metadata),
             "chunk_references": [reference.to_dict() for reference in self.chunk_references],
         }
 
@@ -1951,6 +1965,14 @@ def trace_evidence_in_processed_dir(
         trace_section_path = [str(part) for part in (evidence_payload.get("section_path") or [])]
         document_info = document_payload.get("document") or {}
         version_info = document_payload.get("document_version") or {}
+        block_payload = _find_block_payload(
+            document_payload,
+            str(evidence_payload.get("block_id") or ""),
+        )
+        trace_metadata = _extract_evidence_trace_metadata(
+            evidence_payload=evidence_payload,
+            block_payload=block_payload,
+        )
 
         return EvidenceTraceResult(
             evidence_id=normalized_evidence_id,
@@ -1972,6 +1994,13 @@ def trace_evidence_in_processed_dir(
             block_id=str(evidence_payload.get("block_id") or ""),
             text=str(evidence_payload.get("text") or ""),
             bbox=_normalize_optional_bbox(evidence_payload.get("bbox")),
+            content_kind=_optional_metadata_str(trace_metadata.get("content_kind")),
+            media_ref=_optional_metadata_str(trace_metadata.get("media_ref")),
+            page_image_ref=_optional_metadata_str(trace_metadata.get("page_image_ref")),
+            media_type=_optional_metadata_str(trace_metadata.get("media_type")),
+            confidence=_optional_float(trace_metadata.get("confidence")),
+            ocr=trace_metadata.get("ocr") is True,
+            metadata=trace_metadata,
             chunk_references=_load_evidence_chunk_references(
                 chunks_path=chunks_path,
                 evidence_id=normalized_evidence_id,
@@ -2947,6 +2976,52 @@ def _find_evidence_payload(document_payload: dict, evidence_id: str) -> dict | N
         if str(evidence.get("evidence_id") or "") == evidence_id:
             return evidence
     return None
+
+
+def _find_block_payload(document_payload: dict, block_id: str) -> dict | None:
+    if not block_id:
+        return None
+    for block in document_payload.get("blocks") or []:
+        if str(block.get("block_id") or "") == block_id:
+            return block
+    return None
+
+
+_TRACE_METADATA_KEYS = {
+    "bbox_unit",
+    "confidence",
+    "content_kind",
+    "media_ref",
+    "media_type",
+    "ocr",
+    "ocr_engine",
+    "ocr_lines",
+    "page_image_ref",
+    "source_page",
+}
+
+
+def _extract_evidence_trace_metadata(
+    *,
+    evidence_payload: dict,
+    block_payload: dict | None,
+) -> dict[str, object]:
+    merged: dict[str, object] = {}
+    for payload in (block_payload or {}, evidence_payload):
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        for key, value in metadata.items():
+            if key in _TRACE_METADATA_KEYS and value is not None:
+                merged[key] = value
+    return merged
+
+
+def _optional_metadata_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = normalize_space(str(value))
+    return text or None
 
 
 def _normalize_optional_bbox(value: object) -> list[float] | None:
