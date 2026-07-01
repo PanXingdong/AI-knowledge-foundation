@@ -211,12 +211,18 @@ def _build_fts_match_query(query: str) -> str | None:
     if not normalized:
         return None
 
+    def _has_cjk(value: str) -> bool:
+        return any("\u4e00" <= char <= "\u9fff" for char in value)
+
     tokens: list[str] = []
     for raw in normalized.replace("\n", " ").split(" "):
         token = raw.strip()
         if not token:
             continue
-        if any("a" <= char <= "z" or char.isdigit() or char == "_" for char in token):
+        if (
+            any("a" <= char <= "z" or char.isdigit() or char == "_" for char in token)
+            or _has_cjk(token)
+        ):
             cleaned = "".join(
                 char for char in token if char.isalnum() or char in {"_", ".", "/", "-"}
             )
@@ -227,7 +233,10 @@ def _build_fts_match_query(query: str) -> str | None:
                 # instead so "7.1" in document text is found correctly.
                 has_letter = any("a" <= char <= "z" for char in cleaned)
                 has_dot = "." in cleaned
+                has_cjk = _has_cjk(cleaned)
                 if has_dot and not has_letter:
+                    tokens.append(_escape_fts_token(cleaned))
+                elif has_cjk and not has_letter:
                     tokens.append(_escape_fts_token(cleaned))
                 else:
                     tokens.append(f"{_escape_fts_token(cleaned)}*")

@@ -81,7 +81,7 @@ def _call_deepseek(
         "model": model,
         "messages": messages,
         "temperature": 0.3,
-        "max_tokens": 1200,
+        "max_tokens": 4096,
     }
     req = urllib.request.Request(
         url,
@@ -144,7 +144,12 @@ class LLMAgent:
             logger.exception("LLM direct_reply failed, using fallback")
             return "你好！我是QNX助手，有什么 QNX 相关的技术问题都可以问我～"
 
-    def synthesize(self, query: str, context_pack_text: str) -> str:
+    def synthesize(
+        self,
+        query: str,
+        context_pack_text: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
         """Synthesize a final answer from retrieved evidence + original query."""
         user_content = (
             f"【用户问题】\n{query}\n\n"
@@ -152,10 +157,12 @@ class LLMAgent:
             "请根据参考资料回答用户问题。"
             "在回答末尾注明置信度（高/中/低）及简短理由。"
         )
-        messages = [
+        messages: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
         ]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_content})
         try:
             return _call_deepseek(messages, self.api_key, self.model, self.timeout)
         except Exception:

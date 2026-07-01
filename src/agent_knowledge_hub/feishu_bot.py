@@ -106,6 +106,7 @@ class LocalAPIClient:
         task_type: str | None = None,
         fts_index_path: str | None = None,
         vector_index_path: str | None = None,
+        timeout: int = 180,
     ) -> dict[str, Any]:
         url = f"{self.base_url}/api/context-pack"
         try:
@@ -121,7 +122,7 @@ class LocalAPIClient:
                 payload["fts_index_path"] = fts_index_path
             if vector_index_path is not None:
                 payload["vector_index_path"] = vector_index_path
-            data = _http_post(url, payload)
+            data = _http_post(url, payload, timeout=timeout)
             return data.get("data", {})
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8") if e.fp else str(e)
@@ -155,13 +156,19 @@ class LocalAPIClient:
 class MessageFormatter:
     @staticmethod
     def format_context_pack(result: dict[str, Any], score_threshold: float = -30.0) -> str:
-        query = result.get("query", "N/A")
         selected_chunks = result.get("selected_chunks", [])
         qualified = [c for c in selected_chunks if c.get("score", float("-inf")) >= score_threshold]
 
         if not qualified:
             return "未找到相关内容"
 
+        # Prefer the pre-rendered markdown from the API so the LLM receives
+        # full chunk text, section paths, scores, and evidence context.
+        markdown = result.get("markdown", "")
+        if markdown:
+            return markdown
+
+        query = result.get("query", "N/A")
         doc_titles = {c.get("document_title", "Unknown") for c in qualified}
         lines = [
             f"【Query】{query}",
@@ -172,8 +179,11 @@ class MessageFormatter:
 
         for i, chunk in enumerate(qualified[:8]):
             doc_title = chunk.get("document_title", "Unknown")
-            text = chunk.get("text", "")[:120]
+            section = " > ".join(chunk.get("section_titles", []) or [])
+            text = chunk.get("text", "")[:800]
             lines.append(f"\n▶ [{doc_title}]")
+            if section:
+                lines.append(f"  章节: {section}")
             lines.append(f"  {text}")
 
         return "\n".join(lines)

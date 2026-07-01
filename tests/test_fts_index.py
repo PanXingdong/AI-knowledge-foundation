@@ -60,6 +60,15 @@ def test_build_fts_index_writes_sqlite_db_and_supports_prefix_symbol_query(tmp_p
     assert hits[0].chunk_id
     assert hits[0].bm25_score <= 0.0
 
+    cjk_hits = query_fts_index(
+        index_path=index_path,
+        query="这是一份普通说明文档",
+        limit=5,
+    )
+
+    assert cjk_hits
+    assert cjk_hits[0].document_title == "Notes"
+
 
 def test_query_fts_index_handles_dotted_versions_and_punctuation(tmp_path: Path):
     processed_root = tmp_path / "processed"

@@ -156,6 +156,11 @@ class TestHealthCheck:
 
 
 class TestProcessQuery:
+    def test_detects_followup_queries(self, bot):
+        assert bot._is_followup("刚才那个问题具体怎么做")
+        assert bot._is_followup("还有吗")
+        assert not bot._is_followup("QNX resource manager 怎么配置")
+
     def test_sends_formatted_reply(self, bot):
         """正常流程：KB检索 → LLM综合 → 发送"""
         bot.formatter = MagicMock()
@@ -178,6 +183,32 @@ class TestProcessQuery:
         bot.local_api.get_context_pack.assert_called_once()
         bot.llm_agent.synthesize.assert_called_once()
         bot.feishu_api.send_text_message.assert_called_once_with("oc_test", "合成回答")
+        assert bot._history["oc_test"]
+        assert bot._last_query["oc_test"] == "QNX priority inheritance技术问题"
+
+    def test_followup_reuses_previous_search_query_and_passes_history(self, bot):
+        context_pack = {
+            "query": "QNX priority inheritance技术问题",
+            "chunk_count": 1,
+            "document_count": 1,
+            "selected_chunks": [
+                {"document_title": "Doc1", "text": "内容片段", "score": 0.9}
+            ],
+        }
+        bot.local_api.get_context_pack.return_value = context_pack
+        bot.formatter.format_context_pack.return_value = "格式化结果"
+        bot.formatter.truncate_message.side_effect = lambda text, max_length: text
+        bot.llm_agent.is_chitchat.return_value = False
+        bot.llm_agent.synthesize.return_value = "合成回答"
+
+        bot._process_query("oc_thread", "QNX priority inheritance技术问题")
+        bot._process_query("oc_thread", "刚才那个具体怎么做")
+
+        calls = bot.local_api.get_context_pack.call_args_list
+        assert calls[0].kwargs["query"] == "QNX priority inheritance技术问题"
+        assert calls[1].kwargs["query"] == "QNX priority inheritance技术问题"
+        second_synthesize_kwargs = bot.llm_agent.synthesize.call_args_list[1].kwargs
+        assert second_synthesize_kwargs["history"]
 
     def test_low_score_sends_not_found(self, bot):
         """所有 chunk 的 score 低于阈值时发送"未找到相关内容" """
