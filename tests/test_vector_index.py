@@ -1,7 +1,13 @@
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 from agent_knowledge_hub.pipeline import ingest_file
-from agent_knowledge_hub.vector_index import build_vector_index, query_vector_index
+from agent_knowledge_hub.vector_index import (
+    build_vector_index,
+    query_vector_index,
+    _select_bge_m3_device,
+)
 
 
 def test_build_vector_index_writes_json_and_supports_local_similarity_query(tmp_path: Path):
@@ -59,3 +65,25 @@ def test_build_vector_index_writes_json_and_supports_local_similarity_query(tmp_
     assert hits
     assert hits[0].document_title == "Z 出境限制"
     assert hits[0].similarity_score > 0.0
+
+
+def test_select_bge_m3_device_uses_cuda_when_available(monkeypatch):
+    monkeypatch.delenv("AKF_BGE_M3_DEVICE", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
+    )
+
+    assert _select_bge_m3_device() == "cuda"
+
+
+def test_select_bge_m3_device_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("AKF_BGE_M3_DEVICE", "cpu")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
+    )
+
+    assert _select_bge_m3_device() == "cpu"
