@@ -3,6 +3,7 @@ from pathlib import Path
 
 from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.pipeline import ingest_file
+from agent_knowledge_hub.parsers import ParsedBlock, ParsedDocument
 from agent_knowledge_hub.retrieval import (
     _normalize_query_text,
     build_context_pack_for_processed_dir,
@@ -2420,6 +2421,89 @@ def test_trace_evidence_in_processed_dir_returns_document_section_and_chunk_refs
     assert trace.chunk_references
     assert any(reference.chunk_id for reference in trace.chunk_references)
     assert all(reference.section_titles == ["API"] for reference in trace.chunk_references)
+
+
+def test_ocr_text_reaches_context_pack_and_trace_metadata(monkeypatch, tmp_path: Path):
+    processed_root = tmp_path / "processed"
+    source = tmp_path / "scan.pdf"
+    source.write_bytes(b"%PDF-1.4 fake scan")
+
+    def fake_parse_document(path: Path):
+        return ParsedDocument(
+            source_format="pdf",
+            parser_name="pypdf+rapidocr",
+            page_count=1,
+            blocks=[
+                ParsedBlock(
+                    block_type="heading",
+                    text="扫描页面",
+                    page_start=1,
+                    page_end=1,
+                    metadata={"level": 2, "ocr_page_marker": True},
+                ),
+                ParsedBlock(
+                    block_type="paragraph",
+                    text="控制器故障码 E42 需要复位并检查电源。",
+                    page_start=1,
+                    page_end=1,
+                    metadata={
+                        "ocr": True,
+                        "ocr_engine": "rapidocr",
+                        "content_kind": "ocr_text",
+                        "confidence": 0.93,
+                        "bbox": [12, 24, 220, 88],
+                        "bbox_unit": "pdf_points",
+                        "page_image_ref": "source:scan.pdf#page=1",
+                        "media_type": "application/pdf",
+                    },
+                )
+            ],
+            quality_report={
+                "score": 82.0,
+                "status": "recovered_by_fallback",
+                "fallback_used": True,
+                "fallback_parser": "rapidocr",
+                "reason_codes": ["text_too_short"],
+            },
+        )
+
+    monkeypatch.setattr("agent_knowledge_hub.pipeline.parse_document", fake_parse_document)
+    ingest_result = ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="扫描故障说明",
+        source_type="supplier_scan",
+        owner="checker",
+        document_version="v1",
+    )
+
+    result = build_context_pack_for_processed_dir(
+        processed_dir=processed_root,
+        query="E42 故障码怎么处理？",
+        top_k=1,
+        per_document_limit=1,
+    )
+
+    assert result.selected_chunks
+    assert "E42" in result.selected_chunks[0].text
+
+    payload = json.loads(ingest_result.document_json_path.read_text(encoding="utf-8"))
+    evidence_id = next(
+        evidence["evidence_id"]
+        for evidence in payload["evidence_spans"]
+        if "E42" in evidence["text"]
+    )
+    trace = trace_evidence_in_processed_dir(
+        processed_dir=processed_root,
+        evidence_id=evidence_id,
+    )
+
+    assert trace.bbox == [12.0, 24.0, 220.0, 88.0]
+    assert trace.content_kind == "ocr_text"
+    assert trace.page_image_ref == "source:scan.pdf#page=1"
+    assert trace.media_type == "application/pdf"
+    assert trace.confidence == 0.93
+    assert trace.ocr is True
 
 
 def test_build_context_pack_prefers_governance_modes_profile_details_and_approval_triggers(

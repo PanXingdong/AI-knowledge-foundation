@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import csv
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 
 from agent_knowledge_hub.builder import build_canonical_document
 from agent_knowledge_hub.chunker import build_chunks, chunks_to_dicts
 from agent_knowledge_hub.models import IngestResult, ManifestIngestSummary
-from agent_knowledge_hub.parsers import DocumentParseError, parse_document
+from agent_knowledge_hub.parsers import DocumentParseError, IMAGE_EXTENSIONS, parse_document
 from agent_knowledge_hub.utils import is_placeholder, slugify, write_json, write_jsonl
 
 
@@ -58,6 +59,11 @@ def ingest_file(
     document_dir = output_root / safe_title / canonical.document_version.document_version_id
     document_json_path = document_dir / "canonical-document.json"
     chunks_jsonl_path = document_dir / "chunks.jsonl"
+
+    if source_path.suffix.lower() in IMAGE_EXTENSIONS:
+        media_dir = document_dir / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, media_dir / source_path.name)
 
     write_json(document_json_path, canonical.to_dict())
     write_jsonl(chunks_jsonl_path, chunks_to_dicts(chunks))

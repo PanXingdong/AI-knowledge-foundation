@@ -342,6 +342,10 @@ def build_chunks(
     evidence_by_block = {
         evidence.block_id: evidence.evidence_id for evidence in canonical.evidence_spans
     }
+    evidence_by_id = {
+        evidence.evidence_id: evidence for evidence in canonical.evidence_spans
+    }
+    block_by_id = {block.block_id: block for block in canonical.blocks}
     chunks: list[Chunk] = []
     current_texts: list[str] = []
     current_evidence: list[str] = []
@@ -391,11 +395,7 @@ def build_chunks(
                 text=text,
                 evidence_ids=list(dict.fromkeys(current_evidence)),
                 embedding_id=None,
-                metadata={
-                    "document_id": canonical.document.document_id,
-                    "document_title": canonical.document.title,
-                    "source_type": canonical.document.source_type,
-                },
+                metadata=_build_chunk_metadata(list(dict.fromkeys(current_evidence))),
             )
         )
 
@@ -437,13 +437,62 @@ def build_chunks(
         _ph_page_start = None
         _ph_page_end = None
 
+    def _build_chunk_metadata(evidence_ids: list[str]) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "document_id": canonical.document.document_id,
+            "document_title": canonical.document.title,
+            "source_type": canonical.document.source_type,
+        }
+        content_kinds: set[str] = set()
+        media_refs: set[str] = set()
+        page_image_refs: set[str] = set()
+        media_types: set[str] = set()
+        has_ocr = False
+
+        for evidence_id in evidence_ids:
+            evidence = evidence_by_id.get(evidence_id)
+            if evidence is None:
+                continue
+            block = block_by_id.get(evidence.block_id)
+            block_metadata = block.metadata if block is not None else {}
+            evidence_metadata = evidence.metadata
+            for source_metadata in (block_metadata, evidence_metadata):
+                if source_metadata.get("ocr") is True:
+                    has_ocr = True
+                content_kind = source_metadata.get("content_kind")
+                if isinstance(content_kind, str) and content_kind:
+                    content_kinds.add(content_kind)
+                media_ref = source_metadata.get("media_ref")
+                if isinstance(media_ref, str) and media_ref:
+                    media_refs.add(media_ref)
+                page_image_ref = source_metadata.get("page_image_ref")
+                if isinstance(page_image_ref, str) and page_image_ref:
+                    page_image_refs.add(page_image_ref)
+                media_type = source_metadata.get("media_type")
+                if isinstance(media_type, str) and media_type:
+                    media_types.add(media_type)
+
+        if has_ocr:
+            metadata["ocr"] = True
+        if content_kinds:
+            metadata["content_kinds"] = sorted(content_kinds)
+            if len(content_kinds) == 1:
+                metadata["content_kind"] = next(iter(content_kinds))
+        if media_refs:
+            metadata["media_refs"] = sorted(media_refs)
+        if page_image_refs:
+            metadata["page_image_refs"] = sorted(page_image_refs)
+        if media_types:
+            metadata["media_types"] = sorted(media_types)
+        return metadata
+
     for block in canonical.blocks:
         block_text = block.text.strip()
         if not block_text:
             continue
 
         # --- Filter 1: noise sections ---
-        if _is_noise_block(block.section_path, block_text):
+        if _is_noise_block(block.section_path, block_text) and block.metadata.get("ocr") is not True:
             continue
 
         # --- Filter 2: fragment blocks (page headers/footers, dates, etc.) ---

@@ -164,6 +164,21 @@ Ordered parsed blocks.
 | `order` | integer | yes | 1-based source order |
 | `metadata` | object | yes | Empty object allowed |
 
+OCR and image-derived text may use optional block metadata:
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `content_kind` | string | no | Use `ocr_text` for text recognized from an image or scanned page |
+| `ocr` | boolean | no | `true` when the block text came from OCR |
+| `ocr_engine` | string | no | Example: `rapidocr` |
+| `ocr_lines` | object[] | no | OCR line objects with `text`, optional `confidence`, and optional `bbox` |
+| `confidence` | number | no | Average OCR confidence for the block when available |
+| `bbox` | number[] | no | Union bbox for this block in the unit named by `bbox_unit` |
+| `bbox_unit` | string | no | Example: `pdf_points` for rendered PDF pages, `pixels` for image files |
+| `media_ref` | string | no | Relative media asset path, e.g. `media/device-error.png` |
+| `page_image_ref` | string | no | Page or image reference for visual trace-back |
+| `media_type` | string | no | MIME type for the referenced media |
+
 ### evidence_spans
 
 Traceable source evidence. Layer 2 uses this for `/api/evidence/{evidence_id}`.
@@ -178,6 +193,9 @@ Traceable source evidence. Layer 2 uses this for `/api/evidence/{evidence_id}`.
 | `bbox` | number[]/null | yes | `[x0, y0, x1, y1]` when available |
 | `text` | string | yes | Evidence text |
 | `text_hash` | string | yes | SHA-256 of `text` |
+| `metadata` | object | no | Optional OCR/media trace metadata copied from the source block |
+
+For OCR evidence, `bbox` should be the union of OCR line boxes when available. `metadata.page_image_ref` or `metadata.media_ref` tells consumers which page image or image asset the bbox belongs to. Existing text-only evidence can keep `bbox: null` and omit `metadata`.
 
 ### parse_report
 
@@ -254,7 +272,29 @@ Minimum chunk metadata:
 }
 ```
 
+OCR/image chunks may add optional metadata while preserving the same required fields:
+
+```json
+{
+  "ocr": true,
+  "content_kind": "ocr_text",
+  "content_kinds": ["ocr_text"],
+  "media_refs": ["media/device-error.png"],
+  "page_image_refs": ["media/device-error.png"],
+  "media_types": ["image/png"]
+}
+```
+
 Layer 2 also reads project, supplier, and version from `canonical-document.json`, so they do not need to be duplicated in every chunk.
+
+## Image And OCR Inputs
+
+Layer 1 supports OCR text as a text-first extension to the existing contract:
+
+- Scanned PDF pages can produce `paragraph` blocks with `content_kind: ocr_text` and bbox metadata.
+- Standalone image files such as PNG, JPEG, TIFF, and WebP are treated as single-page documents. The original image is copied into the processed document version under `media/`, and chunks continue to index the recognized text.
+- Context Pack v1 remains text-first. Layer 2 should use OCR text for retrieval and use `/api/evidence/{evidence_id}` to recover bbox and image/page references when visual trace-back is needed.
+- This does not define multimodal image embeddings or visual search. Those should be versioned separately if added later.
 
 ## Minimal Valid Example
 

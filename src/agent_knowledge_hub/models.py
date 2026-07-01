@@ -62,6 +62,7 @@ class EvidenceSpan:
     bbox: list[float] | None
     text: str
     text_hash: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

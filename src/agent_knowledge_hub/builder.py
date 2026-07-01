@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace as dc_replace
 from pathlib import Path
+from typing import Any
 
 from agent_knowledge_hub.models import (
     Block,
@@ -274,9 +275,10 @@ def build_canonical_document(
                 page=parsed_block.page_start,
                 section_path=list(current_section_path),
                 block_id=block_id,
-                bbox=None,
+                bbox=_metadata_bbox(parsed_block.metadata),
                 text=parsed_block.text,
                 text_hash=sha256_text(parsed_block.text),
+                metadata=_evidence_metadata(parsed_block.metadata),
             )
         )
 
@@ -302,3 +304,58 @@ def build_canonical_document(
         evidence_spans=evidence_spans,
         parse_report=parse_report,
     )
+
+
+_EVIDENCE_METADATA_KEYS = {
+    "bbox_unit",
+    "confidence",
+    "content_kind",
+    "media_ref",
+    "media_type",
+    "ocr",
+    "ocr_engine",
+    "ocr_lines",
+    "page_image_ref",
+    "source_page",
+}
+
+
+def _evidence_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key in _EVIDENCE_METADATA_KEYS and value is not None
+    }
+
+
+def _metadata_bbox(metadata: dict[str, Any]) -> list[float] | None:
+    bbox = _normalize_bbox(metadata.get("bbox"))
+    if bbox is not None:
+        return bbox
+
+    line_bboxes = []
+    for line in metadata.get("ocr_lines") or []:
+        if not isinstance(line, dict):
+            continue
+        line_bbox = _normalize_bbox(line.get("bbox"))
+        if line_bbox is not None:
+            line_bboxes.append(line_bbox)
+    if not line_bboxes:
+        return None
+    return [
+        min(box[0] for box in line_bboxes),
+        min(box[1] for box in line_bboxes),
+        max(box[2] for box in line_bboxes),
+        max(box[3] for box in line_bboxes),
+    ]
+
+
+def _normalize_bbox(value: Any) -> list[float] | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    normalized: list[float] = []
+    for item in value:
+        if not isinstance(item, (int, float)):
+            return None
+        normalized.append(float(item))
+    return normalized
