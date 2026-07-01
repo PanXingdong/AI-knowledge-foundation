@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -13,11 +16,15 @@ from agent_knowledge_hub.pipeline import ingest_manifest
 from agent_knowledge_hub.vector_index import build_vector_index
 from agent_knowledge_hub.retrieval import (
     build_context_pack_for_processed_dir,
+    configure_llm_planner,
     compare_context_pack_against_reference,
+    prewarm,
     search_processed_dir,
     trace_evidence_in_processed_dir,
 )
 from agent_knowledge_hub.quality import build_parse_quality_summary
+
+logger = logging.getLogger(__name__)
 
 
 class ContextPackRequest(BaseModel):
@@ -74,6 +81,25 @@ def create_app() -> FastAPI:
         version="0.1.0",
         description="Auto Context Pack Engine v1 service core.",
     )
+
+    @app.on_event("startup")
+    def _startup_prewarm() -> None:
+        """Pre-warm retrieval caches at boot so the first user query is fast."""
+        configure_llm_planner(
+            api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
+            timeout=int(os.environ.get("LLM_PLANNER_TIMEOUT", "30")),
+        )
+
+        processed_dir = os.environ.get("PROCESSED_DIR", "")
+        if not processed_dir:
+            logger.info("PROCESSED_DIR not set, skipping cache prewarm")
+            return
+        vector_index_path = os.environ.get("VECTOR_INDEX_PATH") or None
+        t0 = time.time()
+        logger.info("=== Cache prewarm starting ===")
+        prewarm(processed_dir, vector_index_path=vector_index_path)
+        logger.info("=== Cache prewarm done in %.1fs ===", time.time() - t0)
 
     @app.get("/health")
     def health() -> dict[str, object]:

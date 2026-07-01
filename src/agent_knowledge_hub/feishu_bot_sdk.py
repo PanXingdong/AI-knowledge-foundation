@@ -27,8 +27,19 @@ from agent_knowledge_hub.llm_agent import LLMAgent
 logger = logging.getLogger(__name__)
 
 
+_FOLLOWUP_PATTERNS = (
+    "刚才", "上面", "上一个", "前面", "那个问题", "那个",
+    "继续", "接着", "然后呢", "还有吗", "补充", "追问",
+    "这种方式", "那种方式", "其他方式",
+    "命令行", "不用代码", "有没有工具", "具体怎么",
+)
+
+
 class FeishuBotSDK:
     _HEALTH_CHECK_DELAY = 30.0
+    _MAX_HISTORY_TURNS = 3
+    _MAX_MEMORY_KEYS = 1000
+    _MEMORY_TTL_SECONDS = 6 * 60 * 60
 
     def __init__(self, config: FeishuConfig | None = None) -> None:
         self.config = config or FeishuConfig.from_env()
@@ -40,6 +51,10 @@ class FeishuBotSDK:
         self._message_count = 0
         self._start_time: float = 0
         self._health_timer: threading.Timer | None = None
+        self._history: dict[str, list[dict[str, str]]] = {}
+        self._last_query: dict[str, str] = {}
+        self._last_seen: dict[str, float] = {}
+        self._memory_lock = threading.Lock()
 
     def run(self) -> None:
         try:
@@ -128,24 +143,60 @@ class FeishuBotSDK:
                 return
 
             chat_id = event.chat_id if hasattr(event, "chat_id") else ""
+            user_id = ""
+            sender = getattr(event, "sender", None)
+            if sender is not None:
+                sender_id = getattr(sender, "sender_id", None) or getattr(sender, "id", None)
+                if sender_id is not None:
+                    user_id = getattr(sender_id, "open_id", "") or ""
+            memory_key = f"{chat_id}:{user_id}" if user_id else chat_id
 
-            logger.info("收到消息: %s", text[:50])
-            self._process_query(chat_id, text, start_time)
+            logger.info("收到消息: [%s] %s", user_id[:12] or "?", text[:50])
+            self._process_query(
+                chat_id,
+                text,
+                start_time,
+                memory_key=memory_key,
+                allow_followup=bool(user_id),
+            )
 
         except Exception:
             logger.exception("处理消息事件失败")
 
-    def _process_query(self, chat_id: str, query: str, start_time: float = 0) -> None:
+    @staticmethod
+    def _is_followup(query: str) -> bool:
+        q = query.strip()
+        if len(q) <= 60:
+            return any(pattern in q for pattern in _FOLLOWUP_PATTERNS)
+        return False
+
+    def _process_query(
+        self,
+        chat_id: str,
+        query: str,
+        start_time: float = 0,
+        *,
+        memory_key: str | None = None,
+        allow_followup: bool = True,
+    ) -> None:
         if start_time == 0:
             start_time = time.time()
+        memory_key = memory_key or chat_id
 
         try:
+            search_query = query
+            history, previous_query = self._get_memory_snapshot(memory_key)
+            if allow_followup and self._is_followup(query) and previous_query:
+                search_query = previous_query
+                logger.info("Follow-up detected, reusing previous query: %s", search_query[:50])
+
             # ── Step 1: chitchat shortcut (no KB call) ──────────────────
             if self.llm_agent.is_chitchat(query):
                 logger.info("Intent: chitchat, skipping KB retrieval")
                 reply = self.llm_agent.direct_reply(query)
                 reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
                 self.feishu_api.send_text_message(chat_id, reply)
+                self._update_history(memory_key, query, reply)
                 logger.info("总耗时: %.2fs", time.time() - start_time)
                 return
 
@@ -153,7 +204,7 @@ class FeishuBotSDK:
             t1 = time.time()
             context_pack = self.local_api.get_context_pack(
                 processed_dir=self.config.processed_dir,
-                query=query,
+                query=search_query,
                 top_k=self.config.default_top_k,
                 per_document_limit=self.config.default_per_document_limit,
                 fts_index_path=self.config.fts_index_path or None,
@@ -168,7 +219,7 @@ class FeishuBotSDK:
                 >= score_threshold
             )
 
-            # ── Step 3: LLM synthesis ───────────────────────────────────
+            # ── Step 3: LLM synthesis (with conversation history) ───────
             if not has_evidence:
                 logger.info("KB: no relevant evidence for query=%s", query[:40])
                 reply = self.llm_agent.no_evidence_reply(query)
@@ -176,15 +227,60 @@ class FeishuBotSDK:
                 context_pack_text = self.formatter.format_context_pack(context_pack, score_threshold)
                 t3 = time.time()
                 logger.info("步骤耗时: KB=%.2fs, 格式化=%.2fs", t2 - t1, t3 - t2)
-                reply = self.llm_agent.synthesize(query, context_pack_text)
+                reply = self.llm_agent.synthesize(query, context_pack_text, history=history or None)
 
             reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
             self.feishu_api.send_text_message(chat_id, reply)
+            self._update_history(memory_key, query, reply)
+            self._set_last_query(memory_key, search_query)
             logger.info("总耗时: %.2fs", time.time() - start_time)
 
         except Exception:
             logger.exception("处理用户查询失败")
             self.feishu_api.send_text_message(chat_id, f"处理查询时出错，请稍后重试。")
+
+    def _get_memory_snapshot(self, memory_key: str) -> tuple[list[dict[str, str]], str | None]:
+        with self._memory_lock:
+            self._cleanup_memory_locked(now=time.time())
+            self._last_seen[memory_key] = time.time()
+            return list(self._history.get(memory_key, [])), self._last_query.get(memory_key)
+
+    def _set_last_query(self, memory_key: str, search_query: str) -> None:
+        with self._memory_lock:
+            self._cleanup_memory_locked(now=time.time())
+            self._last_query[memory_key] = search_query
+            self._last_seen[memory_key] = time.time()
+
+    def _update_history(self, memory_key: str, user_msg: str, assistant_msg: str) -> None:
+        with self._memory_lock:
+            self._cleanup_memory_locked(now=time.time())
+            turns = list(self._history.get(memory_key, []))
+            turns.append({"role": "user", "content": user_msg})
+            turns.append({"role": "assistant", "content": assistant_msg[:500]})
+            max_msgs = self._MAX_HISTORY_TURNS * 2
+            self._history[memory_key] = turns[-max_msgs:]
+            self._last_seen[memory_key] = time.time()
+
+    def _cleanup_memory_locked(self, *, now: float) -> None:
+        expired_keys = [
+            key
+            for key, last_seen in self._last_seen.items()
+            if now - last_seen > self._MEMORY_TTL_SECONDS
+        ]
+        for key in expired_keys:
+            self._history.pop(key, None)
+            self._last_query.pop(key, None)
+            self._last_seen.pop(key, None)
+
+        if len(self._last_seen) <= self._MAX_MEMORY_KEYS:
+            return
+
+        overflow = len(self._last_seen) - self._MAX_MEMORY_KEYS
+        oldest_keys = sorted(self._last_seen, key=self._last_seen.get)[:overflow]
+        for key in oldest_keys:
+            self._history.pop(key, None)
+            self._last_query.pop(key, None)
+            self._last_seen.pop(key, None)
 
 
 def main() -> int:

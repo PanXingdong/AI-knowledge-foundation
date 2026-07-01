@@ -100,6 +100,41 @@ class TestMessageFormatter:
         text = MessageFormatter.format_context_pack(result)
         assert "未找到相关内容" in text
 
+    def test_format_context_pack_prefers_api_markdown(self):
+        result = {
+            "query": "test query",
+            "markdown": "# Context Pack\n\nfull evidence text",
+            "selected_chunks": [
+                {
+                    "document_title": "Doc1",
+                    "text": "short text",
+                    "score": 0.85,
+                }
+            ],
+        }
+
+        text = MessageFormatter.format_context_pack(result)
+
+        assert text == "# Context Pack\n\nfull evidence text"
+
+    def test_format_context_pack_truncates_long_markdown(self):
+        result = {
+            "query": "test query",
+            "markdown": "# Context Pack\n\n" + ("x" * 200),
+            "selected_chunks": [
+                {
+                    "document_title": "Doc1",
+                    "text": "short text",
+                    "score": 0.85,
+                }
+            ],
+        }
+
+        text = MessageFormatter.format_context_pack(result, max_context_length=40)
+
+        assert len(text) == 40
+        assert text.endswith("...")
+
     def test_format_gap_report(self):
         result = {
             "covered_reference_item_count": 3,

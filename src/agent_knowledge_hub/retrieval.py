@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import sqlite3
+import time
+import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -12,6 +15,8 @@ from typing import Iterable
 from agent_knowledge_hub.fts_index import query_fts_index
 from agent_knowledge_hub.utils import normalize_space, stable_id, write_json
 from agent_knowledge_hub.vector_index import VectorIndexError, query_vector_index
+
+logger = logging.getLogger(__name__)
 
 
 CONTEXT_PACK_SCHEMA_VERSION = "context-pack.v1"
@@ -1594,6 +1599,7 @@ def build_context_pack_for_processed_dir(
     token_budget: int | None = None,
 ) -> ContextPackResult:
     processed_root = Path(processed_dir).resolve()
+    _t_prev = time.time()
     normalized_task_type = _normalize_context_pack_task_type(task_type)
     task_profile = _build_context_pack_task_profile(normalized_task_type)
     if top_k <= 0:
@@ -1608,6 +1614,9 @@ def build_context_pack_for_processed_dir(
         raise FileNotFoundError(f"Processed directory does not exist: {processed_root}")
 
     loaded_chunks = _load_processed_chunks(processed_root)
+    _t_now = time.time()
+    logger.info("[perf] load_chunks: %.2fs (%d chunks)", _t_now - _t_prev, len(loaded_chunks))
+    _t_prev = _t_now
     if not loaded_chunks:
         raise ValueError(f"No chunks.jsonl files found under: {processed_root}")
     normalized_filters = _normalize_metadata_filters(metadata_filters)
@@ -1634,6 +1643,9 @@ def build_context_pack_for_processed_dir(
         query=normalized_query,
         limit=max(20, top_k * max(4, per_document_limit)),
     )
+    _t_now = time.time()
+    logger.info("[perf] fts_search: %.2fs", _t_now - _t_prev)
+    _t_prev = _t_now
     if fts_warning:
         system_warnings.append(fts_warning)
     vector_bonus_by_chunk_id, vector_warning = _load_vector_bonus_by_chunk_id(
@@ -1641,6 +1653,9 @@ def build_context_pack_for_processed_dir(
         query=normalized_query,
         limit=max(20, top_k * max(4, per_document_limit)),
     )
+    _t_now = time.time()
+    logger.info("[perf] vector_search: %.2fs", _t_now - _t_prev)
+    _t_prev = _t_now
     fts_bonus_by_chunk_id = _propagate_external_bonus_to_chunks_sharing_evidence(
         chunks=loaded_chunks,
         bonuses=fts_bonus_by_chunk_id,
@@ -1684,10 +1699,29 @@ def build_context_pack_for_processed_dir(
         eligible_chunks.extend(external_gate_bypass_chunks)
     if not eligible_chunks:
         eligible_chunks = retrieval_chunks
+
+    # External indexes already rank the most likely candidates. On large
+    # corpora, cap the expensive heuristic scoring pool to keep latency bounded.
+    _PRE_FILTER_MAX = 2000
+    if external_bonus_by_chunk_id and len(eligible_chunks) > _PRE_FILTER_MAX:
+        ranked_by_bonus = sorted(
+            eligible_chunks,
+            key=lambda chunk: external_bonus_by_chunk_id.get(chunk.chunk_id, 0.0),
+            reverse=True,
+        )
+        pre_filtered = ranked_by_bonus[:_PRE_FILTER_MAX]
+        logger.info(
+            "[perf] pre_filter: %d -> %d eligible chunks (by external bonus)",
+            len(eligible_chunks),
+            len(pre_filtered),
+        )
+        eligible_chunks = pre_filtered
+
     # Build / reuse BM25 corpus stats (query-independent, safe to cache for
     # the lifetime of the service process for a fixed processed_dir). When a
     # high-confidence external index has already narrowed the pool, score only
     # that pool to avoid cold-start full-corpus BM25 work on large knowledge bases.
+    _bm25_cached = str(processed_root) in _BM25_CONTEXT_CACHE
     if focused_external_candidates:
         cached_bm25_context = _build_bm25_context(list(eligible_chunks))
     else:
@@ -1695,6 +1729,14 @@ def build_context_pack_for_processed_dir(
         if _bm25_cache_key not in _BM25_CONTEXT_CACHE:
             _BM25_CONTEXT_CACHE[_bm25_cache_key] = _build_bm25_context(list(loaded_chunks))
         cached_bm25_context = _BM25_CONTEXT_CACHE[_bm25_cache_key]
+    _t_now = time.time()
+    logger.info(
+        "[perf] bm25_context: %.2fs (cached=%s, %d eligible)",
+        _t_now - _t_prev,
+        _bm25_cached,
+        len(eligible_chunks),
+    )
+    _t_prev = _t_now
     scored_chunks = _build_candidate_scores(
         chunks=eligible_chunks,
         query_tokens=query_tokens,
@@ -2139,6 +2181,120 @@ def clear_retrieval_caches() -> None:
     _BM25_CONTEXT_CACHE.clear()
     _CHUNK_STATIC_SCORE_CACHE.clear()
     _CHUNK_TOKEN_CACHE.clear()
+    _LLM_EXPANSION_CACHE.clear()
+
+
+_LLM_API_KEY: str = ""
+_LLM_MODEL: str = "deepseek-v4-pro"
+_LLM_TIMEOUT: int = 30
+_LLM_EXPANSION_CACHE: dict[str, list[str]] = {}
+
+_LLM_EXPAND_PROMPT = (
+    "知识库全是英文文档(QNX RTOS/Qualcomm SA8xxx/嵌入式系统)。"
+    "将用户中文查询翻译为英文搜索关键词。"
+    "规则: 每个短语最多2个单词, 生成3-5个短语, 用空格分隔不同概念。"
+    '只输出JSON: {"expanded_queries": ["term1 term2", "term3", "term4 term5"]}'
+)
+
+
+def configure_llm_planner(
+    api_key: str,
+    model: str = "deepseek-v4-pro",
+    timeout: int = 30,
+) -> None:
+    """Configure optional LLM-backed query expansion."""
+    global _LLM_API_KEY, _LLM_MODEL, _LLM_TIMEOUT
+    _LLM_API_KEY = api_key
+    _LLM_MODEL = model
+    _LLM_TIMEOUT = timeout
+    logger.info(
+        "[llm_planner] %s (model=%s, timeout=%ds)",
+        "enabled" if api_key else "disabled (no API key)",
+        model,
+        timeout,
+    )
+
+
+def _llm_expand_query(query: str) -> list[str]:
+    if not _LLM_API_KEY:
+        return []
+    cache_key = query.strip().lower()
+    if cache_key in _LLM_EXPANSION_CACHE:
+        return _LLM_EXPANSION_CACHE[cache_key]
+
+    payload = {
+        "model": _LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": _LLM_EXPAND_PROMPT},
+            {"role": "user", "content": query},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 2048,
+    }
+    request = urllib.request.Request(
+        "https://api.deepseek.com/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {_LLM_API_KEY}",
+        },
+    )
+    try:
+        t0 = time.time()
+        with urllib.request.urlopen(request, timeout=_LLM_TIMEOUT) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        raw = str(data["choices"][0]["message"]["content"])
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            logger.warning("[llm_expand] no JSON found in LLM response")
+            return []
+        parsed = json.loads(raw[start : end + 1])
+        expanded = [str(item).strip() for item in parsed.get("expanded_queries", []) if item]
+        expanded = expanded[:5]
+        _LLM_EXPANSION_CACHE[cache_key] = expanded
+        logger.info("[llm_expand] %.1fs | %s -> %s", time.time() - t0, query[:40], expanded)
+        return expanded
+    except Exception:
+        logger.warning("[llm_expand] failed for query=%s", query[:40], exc_info=True)
+        return []
+
+
+def prewarm(
+    processed_dir: Path | str,
+    vector_index_path: Path | str | None = None,
+) -> None:
+    """Pre-load chunks, BM25 context, and optionally vector index at service startup."""
+    processed_root = Path(processed_dir).resolve()
+    if not processed_root.exists():
+        logger.warning("[prewarm] processed_dir not found, skipping: %s", processed_root)
+        return
+
+    t0 = time.time()
+    logger.info("[prewarm] loading chunks from %s ...", processed_root)
+    chunks = _load_processed_chunks(processed_root)
+    t1 = time.time()
+    logger.info("[prewarm] load_chunks: %.1fs (%d chunks)", t1 - t0, len(chunks))
+
+    cache_key = str(processed_root)
+    if cache_key not in _BM25_CONTEXT_CACHE:
+        logger.info("[prewarm] building BM25 context ...")
+        _BM25_CONTEXT_CACHE[cache_key] = _build_bm25_context(chunks)
+        logger.info("[prewarm] bm25_context: %.1fs", time.time() - t1)
+
+    if vector_index_path is not None:
+        vector_path = Path(vector_index_path).resolve()
+        if vector_path.exists():
+            logger.info("[prewarm] loading vector index ...")
+            try:
+                query_vector_index(index_path=vector_path, query="warmup", limit=1)
+                logger.info("[prewarm] vector_index warmup complete")
+            except Exception:
+                logger.warning("[prewarm] vector index warmup failed", exc_info=True)
+        else:
+            logger.warning("[prewarm] vector index not found, skipping: %s", vector_path)
+
+    logger.info("[prewarm] done. total: %.1fs", time.time() - t0)
 
 
 def _load_processed_chunks(processed_dir: Path) -> list[_LoadedChunk]:
@@ -2461,6 +2617,11 @@ def _build_fts_query_variants(query: str) -> list[tuple[str, float]]:
     # a domain-neutral intent detector contribute extra FTS variants here.
     variants.extend(_data_driven_query_variants(query))
 
+    for expanded in _llm_expand_query(query):
+        expanded_lower = expanded.strip().lower()
+        if expanded_lower:
+            variants.append((expanded_lower, 2.0))
+
     deduped: dict[str, float] = {}
     for query_variant, weight in variants:
         deduped[query_variant] = max(deduped.get(query_variant, 0.0), weight)
@@ -2651,24 +2812,42 @@ def _load_vector_bonus_by_chunk_id(
     if vector_index_path is None:
         return {}, None
 
+    bonuses: dict[str, float] = {}
+
+    def _merge_hits(hits: list, weight: float = 1.0) -> None:
+        for rank, hit in enumerate(hits, start=1):
+            rank_bonus = weight * VECTOR_RANK_BONUS_WEIGHT / (rank * rank)
+            similarity_bonus = hit.similarity_score * VECTOR_SIMILARITY_BONUS_WEIGHT
+            bonuses[hit.chunk_id] = max(
+                bonuses.get(hit.chunk_id, 0.0),
+                rank_bonus + similarity_bonus,
+            )
+
     try:
         hits = query_vector_index(
             index_path=vector_index_path,
             query=query,
             limit=limit,
         )
+        _merge_hits(hits, weight=1.0)
     except FileNotFoundError:
         return {}, "vector_index_unavailable:not_found:lexical_only"
     except (OSError, VectorIndexError):
         return {}, "vector_index_unavailable:query_failed:lexical_only"
-    bonuses: dict[str, float] = {}
-    for rank, hit in enumerate(hits, start=1):
-        rank_bonus = VECTOR_RANK_BONUS_WEIGHT / (rank * rank)
-        similarity_bonus = hit.similarity_score * VECTOR_SIMILARITY_BONUS_WEIGHT
-        bonuses[hit.chunk_id] = max(
-            bonuses.get(hit.chunk_id, 0.0),
-            rank_bonus + similarity_bonus,
-        )
+
+    expanded = _llm_expand_query(query)
+    if expanded:
+        expanded_query = " ".join(expanded)
+        try:
+            expanded_hits = query_vector_index(
+                index_path=vector_index_path,
+                query=expanded_query,
+                limit=limit,
+            )
+            _merge_hits(expanded_hits, weight=0.8)
+        except Exception:
+            logger.debug("[vector] expanded query search failed", exc_info=True)
+
     return bonuses, None
 
 

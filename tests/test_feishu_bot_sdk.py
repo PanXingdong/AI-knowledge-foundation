@@ -63,7 +63,16 @@ class TestHandleMessageEvent:
         event = SimpleNamespace(content_text="你好", chat_id="oc_xxx")
         with patch.object(bot, "_process_query") as mock_process:
             bot._handle_message_event(event)
-            mock_process.assert_called_once_with("oc_xxx", "你好", pytest.approx(time.time(), abs=5))
+            mock_process.assert_called_once()
+            assert mock_process.call_args.args == (
+                "oc_xxx",
+                "你好",
+                pytest.approx(time.time(), abs=5),
+            )
+            assert mock_process.call_args.kwargs == {
+                "memory_key": "oc_xxx",
+                "allow_followup": False,
+            }
 
     def test_fallback_to_content_object_with_text_attr(self, bot):
         """content_text 为空时，尝试 event.content.text"""
@@ -128,6 +137,32 @@ class TestHandleMessageEvent:
             bot._handle_message_event(event)
             assert mock_process.call_args[0][0] == ""
 
+    def test_sender_open_id_is_used_only_for_memory_key(self, bot):
+        """群聊里发送仍使用 chat_id，记忆使用 chat_id + user_id 隔离。"""
+        event = SimpleNamespace(
+            content_text="群聊问题",
+            chat_id="oc_group",
+            sender=SimpleNamespace(sender_id=SimpleNamespace(open_id="ou_user_a")),
+        )
+
+        with patch.object(bot, "_process_query") as mock_process:
+            bot._handle_message_event(event)
+
+        mock_process.assert_called_once()
+        assert mock_process.call_args.args[0] == "oc_group"
+        assert mock_process.call_args.args[1] == "群聊问题"
+        assert mock_process.call_args.kwargs["memory_key"] == "oc_group:ou_user_a"
+        assert mock_process.call_args.kwargs["allow_followup"] is True
+
+    def test_missing_user_id_disables_followup_reuse(self, bot):
+        """拿不到用户 id 时不复用 chat 级上一轮查询，避免群聊串上下文。"""
+        event = SimpleNamespace(content_text="没有用户ID")
+
+        with patch.object(bot, "_process_query") as mock_process:
+            bot._handle_message_event(event)
+
+        assert mock_process.call_args.kwargs["allow_followup"] is False
+
     def test_exception_in_handling_is_caught(self, bot, caplog):
         """处理消息事件时发生异常不会向外抛出"""
         event = SimpleNamespace(content_text="trigger_error", chat_id="oc_err")
@@ -156,6 +191,11 @@ class TestHealthCheck:
 
 
 class TestProcessQuery:
+    def test_detects_followup_queries(self, bot):
+        assert bot._is_followup("刚才那个问题具体怎么做")
+        assert bot._is_followup("还有吗")
+        assert not bot._is_followup("QNX resource manager 怎么配置")
+
     def test_sends_formatted_reply(self, bot):
         """正常流程：KB检索 → LLM综合 → 发送"""
         bot.formatter = MagicMock()
@@ -178,6 +218,93 @@ class TestProcessQuery:
         bot.local_api.get_context_pack.assert_called_once()
         bot.llm_agent.synthesize.assert_called_once()
         bot.feishu_api.send_text_message.assert_called_once_with("oc_test", "合成回答")
+        assert bot._history["oc_test"]
+        assert bot._last_query["oc_test"] == "QNX priority inheritance技术问题"
+
+    def test_followup_reuses_previous_search_query_and_passes_history(self, bot):
+        context_pack = {
+            "query": "QNX priority inheritance技术问题",
+            "chunk_count": 1,
+            "document_count": 1,
+            "selected_chunks": [
+                {"document_title": "Doc1", "text": "内容片段", "score": 0.9}
+            ],
+        }
+        bot.local_api.get_context_pack.return_value = context_pack
+        bot.formatter.format_context_pack.return_value = "格式化结果"
+        bot.formatter.truncate_message.side_effect = lambda text, max_length: text
+        bot.llm_agent.is_chitchat.return_value = False
+        bot.llm_agent.synthesize.return_value = "合成回答"
+
+        bot._process_query("oc_thread", "QNX priority inheritance技术问题")
+        bot._process_query("oc_thread", "刚才那个具体怎么做")
+
+        calls = bot.local_api.get_context_pack.call_args_list
+        assert calls[0].kwargs["query"] == "QNX priority inheritance技术问题"
+        assert calls[1].kwargs["query"] == "QNX priority inheritance技术问题"
+        second_synthesize_kwargs = bot.llm_agent.synthesize.call_args_list[1].kwargs
+        assert second_synthesize_kwargs["history"]
+
+    def test_followup_memory_is_isolated_by_user_key(self, bot):
+        context_pack = {
+            "query": "placeholder",
+            "chunk_count": 1,
+            "document_count": 1,
+            "selected_chunks": [
+                {"document_title": "Doc1", "text": "内容片段", "score": 0.9}
+            ],
+        }
+        bot.local_api.get_context_pack.return_value = context_pack
+        bot.formatter.format_context_pack.return_value = "格式化结果"
+        bot.formatter.truncate_message.side_effect = lambda text, max_length: text
+        bot.llm_agent.is_chitchat.return_value = False
+        bot.llm_agent.synthesize.return_value = "合成回答"
+
+        bot._process_query("oc_group", "A 的原问题", memory_key="oc_group:ou_a")
+        bot._process_query("oc_group", "B 的原问题", memory_key="oc_group:ou_b")
+        bot._process_query("oc_group", "刚才那个", memory_key="oc_group:ou_a")
+
+        queries = [call.kwargs["query"] for call in bot.local_api.get_context_pack.call_args_list]
+        assert queries == ["A 的原问题", "B 的原问题", "A 的原问题"]
+
+    def test_followup_reuse_can_be_disabled_when_user_identity_is_missing(self, bot):
+        context_pack = {
+            "query": "placeholder",
+            "chunk_count": 1,
+            "document_count": 1,
+            "selected_chunks": [
+                {"document_title": "Doc1", "text": "内容片段", "score": 0.9}
+            ],
+        }
+        bot.local_api.get_context_pack.return_value = context_pack
+        bot.formatter.format_context_pack.return_value = "格式化结果"
+        bot.formatter.truncate_message.side_effect = lambda text, max_length: text
+        bot.llm_agent.is_chitchat.return_value = False
+        bot.llm_agent.synthesize.return_value = "合成回答"
+
+        bot._process_query("oc_group", "A 的原问题", memory_key="oc_group")
+        bot._process_query(
+            "oc_group",
+            "刚才那个",
+            memory_key="oc_group",
+            allow_followup=False,
+        )
+
+        queries = [call.kwargs["query"] for call in bot.local_api.get_context_pack.call_args_list]
+        assert queries == ["A 的原问题", "刚才那个"]
+
+    def test_memory_cleanup_removes_stale_keys(self, bot):
+        bot._MEMORY_TTL_SECONDS = 1
+        bot._history["stale"] = [{"role": "user", "content": "old"}]
+        bot._last_query["stale"] = "old query"
+        bot._last_seen["stale"] = time.time() - 60
+
+        bot._update_history("fresh", "new", "reply")
+
+        assert "stale" not in bot._history
+        assert "stale" not in bot._last_query
+        assert "stale" not in bot._last_seen
+        assert "fresh" in bot._history
 
     def test_low_score_sends_not_found(self, bot):
         """所有 chunk 的 score 低于阈值时发送"未找到相关内容" """
