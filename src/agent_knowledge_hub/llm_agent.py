@@ -177,7 +177,7 @@ class LLMAgent:
             '    "demos": "有/没有/不确定 + 一句话说明"\n'
             "  },\n"
             '  "summary": "2-4行直接结论",\n'
-            '  "answer_type": "tool_lookup | demo_lookup | how_to | concept | troubleshooting | api_usage | general",\n'
+            '  "answer_type": "tool_lookup | demo_lookup | how_to | concept | troubleshooting | api_usage | solution_design | general",\n'
             '  "details": [\n'
             "    {\n"
             '      "name": "工具/API/概念/步骤名",\n'
@@ -186,6 +186,14 @@ class LLMAgent:
             '      "when_to_use": "什么场景下使用；不适用可省略"\n'
             "    }\n"
             "  ],\n"
+            '  "solution": {\n'
+            '    "recommended": "推荐方案摘要；仅 answer_type=solution_design 时填写",\n'
+            '    "steps": ["实施步骤"],\n'
+            '    "variants": ["可选方案"],\n'
+            '    "not_recommended": ["不推荐做法"],\n'
+            '    "risks": ["风险"],\n'
+            '    "open_questions": ["待确认点"]\n'
+            "  },\n"
             '  "key_points": ["可选：关键要点"],\n'
             '  "evidence_items": [\n'
             "    {\n"
@@ -204,13 +212,16 @@ class LLMAgent:
             "2. title 用中性短标题，渲染显示调试类问题优先用“QNX 渲染调试工具查询结果”。\n"
             "3. summary 只写总览，不重复 direct_answer，不提 IDE/GDB/System Profiler 这类通用调试噪声。\n"
             "4. 根据问题选择 answer_type。工具/demo 查询用 tool_lookup/demo_lookup；概念解释用 concept；排障用 troubleshooting；API 用法用 api_usage。\n"
-            "5. details 是通用细节列表：工具问题写工具作用/用法/适用场景；概念问题写概念拆解；API 问题写 API/参数/注意事项。不要只列名字。\n"
-            "6. key_points 最多 2 条；不要重复 evidence_items 或 details 中已经展示的内容。\n"
-            "7. evidence_items 最多 2 条，只放强相关证据；不要把 IDE/GDB 通用调试配置作为渲染显示问题的主依据。\n"
-            "8. 不要在 summary 或 caveats 中展示 span id；span id 只放在 evidence_ids 字段。\n"
-            "9. next_steps 必须和用户问题直接相关，不要推荐无关文档。\n"
-            "10. 如果资料不足，如实说明缺口。\n"
-            "11. confidence 必须填写。"
+            "5. 当用户问方案、架构、最佳实践、怎么实现、给 demo、有没有办法时，优先选择 solution_design。\n"
+            "6. solution_design 要基于证据组合方案；如果文档没有现成方案，也要说明哪些是直接证据、哪些是推导。\n"
+            "7. zero-copy/dma-buf/screen buffer 方案必须区分：真零拷贝、共享内存/PMEM 近似方案、memcpy fallback；不要把 fallback 说成真零拷贝。\n"
+            "8. details 是通用细节列表：工具问题写工具作用/用法/适用场景；概念问题写概念拆解；API 问题写 API/参数/注意事项。不要只列名字。\n"
+            "9. key_points 最多 2 条；不要重复 evidence_items 或 details 中已经展示的内容。\n"
+            "10. evidence_items 最多 2 条，只放强相关证据；不要把 IDE/GDB 通用调试配置作为渲染显示问题的主依据。\n"
+            "11. 不要在 summary 或 caveats 中展示 span id；span id 只放在 evidence_ids 字段。\n"
+            "12. next_steps 必须和用户问题直接相关，不要推荐无关文档。\n"
+            "13. 如果资料不足，如实说明缺口。\n"
+            "14. confidence 必须填写。"
         )
         messages: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},

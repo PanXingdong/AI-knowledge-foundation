@@ -1,13 +1,15 @@
 import json
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent_knowledge_hub.feishu_bot import (
     FeishuConfig,
     FeishuAPI,
+    FeishuMessageHandler,
     FormattedReply,
+    KnowledgeQueryResponder,
     MessageFormatter,
     assemble_reply,
     filter_mentions,
@@ -71,6 +73,64 @@ class TestFilterMentions:
 
     def test_empty_string(self):
         assert filter_mentions("") == ""
+
+
+class TestKnowledgeQueryResponder:
+    def test_process_query_builds_formatted_reply_for_evidence(self):
+        config = FeishuConfig(processed_dir="/tmp/processed", fts_index_path="fts.db")
+        local_api = MagicMock()
+        formatter = MagicMock()
+        llm_agent = MagicMock()
+        context_pack = {
+            "selected_chunks": [
+                {"document_title": "Doc1", "text": "evidence", "score": 1.0}
+            ]
+        }
+        formatted = FormattedReply(title="标题", summary="答案", plain_text="答案")
+        local_api.get_context_pack.return_value = context_pack
+        formatter.format_context_pack.return_value = "context text"
+        formatter.truncate_message.side_effect = lambda text, max_length: text
+        formatter.build_user_reply.return_value = formatted
+        llm_agent.is_chitchat.return_value = False
+        llm_agent.synthesize.return_value = "answer json"
+
+        result = KnowledgeQueryResponder(
+            config=config,
+            local_api=local_api,
+            formatter=formatter,
+            llm_agent=llm_agent,
+        ).process_query("技术问题", history=[{"role": "user", "content": "上一轮"}])
+
+        assert result.has_evidence is True
+        assert result.formatted_reply is formatted
+        assert result.text == "answer json"
+        local_api.get_context_pack.assert_called_once()
+        llm_agent.synthesize.assert_called_once_with(
+            "技术问题",
+            "context text",
+            history=[{"role": "user", "content": "上一轮"}],
+        )
+
+    def test_process_query_chitchat_skips_retrieval(self):
+        config = FeishuConfig(processed_dir="/tmp/processed")
+        local_api = MagicMock()
+        formatter = MagicMock()
+        llm_agent = MagicMock()
+        formatter.truncate_message.side_effect = lambda text, max_length: text
+        llm_agent.is_chitchat.return_value = True
+        llm_agent.direct_reply.return_value = "你好"
+
+        result = KnowledgeQueryResponder(
+            config=config,
+            local_api=local_api,
+            formatter=formatter,
+            llm_agent=llm_agent,
+        ).process_query("你好")
+
+        assert result.has_evidence is False
+        assert result.formatted_reply is None
+        assert result.text == "你好"
+        local_api.get_context_pack.assert_not_called()
 
 
 class TestMessageFormatter:
@@ -314,6 +374,84 @@ class TestMessageFormatter:
         assert reply.caveats == ["没有看到窗口合成专用 demo。"]
         assert reply.next_steps == ["先运行 screeninfo。"]
         assert reply.confidence == "高：文档直接列出工具。"
+
+    def test_build_user_reply_parses_solution_design_json(self):
+        answer = json.dumps(
+            {
+                "title": "进程间 Screen Buffer 零拷贝共享方案",
+                "answer_type": "solution_design",
+                "summary": "文档没有直接给出现成方案，但可以基于 Screen buffer、共享内存和同步机制组合方案。",
+                "solution": {
+                    "recommended": "优先寻找平台支持的 buffer handle/import 机制；若无，则退化为共享内存近似方案。",
+                    "steps": [
+                        "生产者负责创建并拥有 Screen buffer。",
+                        "通过受支持的 handle/import 机制传递引用。",
+                        "用 fence/semaphore 协调 buffer 生命周期。"
+                    ],
+                    "variants": [
+                        "POSIX shared memory 可作为兼容方案，但不是严格零拷贝。"
+                    ],
+                    "not_recommended": [
+                        "不要无同步地跨进程直接传物理地址 mmap。",
+                        "memcpy 到共享内存只能作为 fallback，不是真零拷贝。"
+                    ],
+                    "risks": [
+                        "需要确认目标平台是否支持跨进程导入 Screen buffer。",
+                        "需要处理 cache coherency 和 ownership。"
+                    ],
+                    "open_questions": [
+                        "是否有平台专用 buffer sharing API。"
+                    ],
+                },
+                "evidence_items": [
+                    {
+                        "name": "QNX Shared Memory",
+                        "source": "System Architecture / Shared memory / page 95",
+                        "why_relevant": "说明可用 POSIX 共享内存在进程间映射内存。",
+                        "evidence_ids": ["span_shm"],
+                    }
+                ],
+                "confidence": "中：方案由多个证据组合推导，不是官方单篇文档直接给出。",
+            },
+            ensure_ascii=False,
+        )
+
+        reply = MessageFormatter.build_user_reply(
+            query="给一个进程间 screen buffer 零 copy 共享的方案",
+            answer_text=answer,
+            context_pack={"selected_chunks": []},
+        )
+
+        assert reply.answer_type == "solution_design"
+        assert reply.solution["recommended"].startswith("优先寻找")
+        assert "memcpy" in reply.solution["not_recommended"][1]
+        assert "cache coherency" in reply.solution["risks"][1]
+
+    def test_solution_design_card_renders_solution_sections(self):
+        reply = FormattedReply(
+            title="Screen Buffer 零拷贝共享方案",
+            summary="基于证据组合出可落地方案。",
+            answer_type="solution_design",
+            solution={
+                "recommended": "优先使用平台支持的 buffer handle/import 机制。",
+                "steps": ["生产者创建 buffer。", "消费者导入 handle。"],
+                "variants": ["共享内存近似方案。"],
+                "not_recommended": ["memcpy fallback 不是真零拷贝。"],
+                "risks": ["需要确认 cache coherency。"],
+                "open_questions": ["平台是否支持导出 handle。"],
+            },
+            confidence="中：方案由证据组合推导。",
+        )
+
+        card = MessageFormatter.format_user_answer_card(reply)
+        rendered_card = json.dumps(card, ensure_ascii=False)
+
+        assert "推荐方案" in rendered_card
+        assert "实施步骤" in rendered_card
+        assert "可选方案" in rendered_card
+        assert "不推荐做法" in rendered_card
+        assert "风险与待确认" in rendered_card
+        assert "memcpy fallback 不是真零拷贝" in rendered_card
 
     def test_candidate_facts_correct_contradictory_direct_answer(self):
         answer = json.dumps(
@@ -691,6 +829,26 @@ class TestMessageFormatter:
         assert action["value"]["evidence_refs"][0]["evidence_id"] == "span_1"
         assert action["value"]["evidence_refs"][0]["label"] == "Display Surface Dumps"
         assert "导出显示表面数据" in action["value"]["evidence_refs"][0]["supports"]
+
+
+class TestFeishuMessageHandler:
+    def test_process_query_uses_shared_responder(self):
+        config = FeishuConfig(processed_dir="/tmp/processed")
+        with patch("agent_knowledge_hub.feishu_bot.LocalAPIClient"), \
+             patch("agent_knowledge_hub.feishu_bot.FeishuAPI"), \
+             patch("agent_knowledge_hub.feishu_bot.LLMAgent"):
+            handler = FeishuMessageHandler(config)
+        formatted = FormattedReply(title="标题", summary="答案")
+        handler.responder = MagicMock()
+        handler.responder.process_query.return_value = MagicMock(
+            text="answer",
+            formatted_reply=formatted,
+        )
+
+        handler._process_query("oc_chat", "技术问题")
+
+        handler.responder.process_query.assert_called_once_with("技术问题")
+        handler.feishu_api.send_reply_message.assert_called_once_with("oc_chat", formatted)
 
 
 class TestFeishuAPIRichText:

@@ -30,6 +30,8 @@ def test_synthesize_includes_history(monkeypatch):
     assert "只输出一个 JSON 对象" in messages[-1]["content"]
     assert '"summary"' in messages[-1]["content"]
     assert '"confidence"' in messages[-1]["content"]
+    assert '"solution"' in messages[-1]["content"]
+    assert "solution_design" in messages[-1]["content"]
     assert captured["temperature"] == 0.0
 
 

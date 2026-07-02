@@ -9,8 +9,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
+
+from agent_knowledge_hub.llm_agent import LLMAgent
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +60,22 @@ class FormattedReply:
     answer_type: str = "general"
     direct_answer: dict[str, str] | None = None
     details: list[dict[str, str]] | None = None
+    solution: dict[str, Any] | None = None
     key_points: list[str] | None = None
     evidence_items: list[dict[str, Any]] | None = None
     caveats: list[str] | None = None
     next_steps: list[str] | None = None
     confidence: str = ""
     plain_text: str = ""
+
+
+@dataclass(frozen=True)
+class BotReplyResult:
+    text: str
+    search_query: str
+    has_evidence: bool = False
+    formatted_reply: FormattedReply | None = None
+    context_pack: dict[str, Any] | None = None
 
 
 def _http_post(url: str, data: dict[str, Any], headers: dict[str, str] | None = None, timeout: int = 30) -> dict[str, Any]:
@@ -383,6 +394,23 @@ class MessageFormatter:
             lines.extend(["", "要点"])
             lines.extend(f"{index}. {item}" for index, item in enumerate(key_points, start=1))
 
+        if reply.answer_type == "solution_design" and reply.solution:
+            solution = reply.solution
+            recommended = solution.get("recommended")
+            if recommended:
+                lines.extend(["", "推荐方案", str(recommended)])
+            for title, key in (
+                ("实施步骤", "steps"),
+                ("可选方案", "variants"),
+                ("不推荐做法", "not_recommended"),
+                ("风险", "risks"),
+                ("待确认", "open_questions"),
+            ):
+                items = solution.get(key) or []
+                if items:
+                    lines.extend(["", title])
+                    lines.extend(f"{index}. {item}" for index, item in enumerate(items, start=1))
+
         evidence_items = (reply.evidence_items or [])[:2]
         if evidence_items:
             lines.extend(["", "关键依据"])
@@ -505,7 +533,13 @@ class MessageFormatter:
         else:
             add_markdown(f"**结论**\n{MessageFormatter._escape_card_markdown(reply.summary)}")
 
-        if reply.details:
+        if reply.answer_type == "solution_design" and reply.solution:
+            MessageFormatter._append_solution_card_sections(
+                add_hr=add_hr,
+                add_markdown=add_markdown,
+                solution=reply.solution,
+            )
+        elif reply.details:
             add_hr()
             detail_lines = []
             for item in reply.details[:4]:
@@ -738,6 +772,8 @@ class MessageFormatter:
 
     @staticmethod
     def _details_section_title(answer_type: str) -> str:
+        if answer_type == "solution_design":
+            return "推荐方案"
         if answer_type in {"tool_lookup", "demo_lookup"}:
             return "怎么用这些工具"
         if answer_type == "api_usage":
@@ -745,6 +781,44 @@ class MessageFormatter:
         if answer_type in {"concept", "troubleshooting", "how_to"}:
             return "关键说明"
         return "补充说明"
+
+    @staticmethod
+    def _append_solution_card_sections(
+        *,
+        add_hr: Any,
+        add_markdown: Any,
+        solution: dict[str, Any],
+    ) -> None:
+        recommended = str(solution.get("recommended") or "").strip()
+        if recommended:
+            add_hr()
+            add_markdown(f"**推荐方案**\n{MessageFormatter._escape_card_markdown(recommended)}")
+
+        def add_list_section(title: str, key: str) -> None:
+            items = solution.get(key) or []
+            if not items:
+                return
+            add_hr()
+            lines = "\n".join(
+                f"{index}. {MessageFormatter._escape_card_markdown(str(item))}"
+                for index, item in enumerate(items, start=1)
+            )
+            add_markdown(f"**{title}**\n{lines}")
+
+        add_list_section("实施步骤", "steps")
+        add_list_section("可选方案", "variants")
+        add_list_section("不推荐做法", "not_recommended")
+
+        risks = list(solution.get("risks") or [])
+        open_questions = list(solution.get("open_questions") or [])
+        if risks or open_questions:
+            add_hr()
+            lines = []
+            for item in risks:
+                lines.append(f"- 风险：{MessageFormatter._escape_card_markdown(str(item))}")
+            for item in open_questions:
+                lines.append(f"- 待确认：{MessageFormatter._escape_card_markdown(str(item))}")
+            add_markdown("**风险与待确认**\n" + "\n".join(lines))
 
     @staticmethod
     def _confidence_card_template(confidence: str) -> str:
@@ -891,6 +965,7 @@ class MessageFormatter:
             answer_type=MessageFormatter._normalize_answer_type(payload.get("answer_type")),
             direct_answer=direct_answer,
             details=MessageFormatter._normalize_detail_items(payload.get("details")),
+            solution=MessageFormatter._normalize_solution(payload.get("solution")),
             key_points=MessageFormatter._polish_key_points(
                 MessageFormatter._normalize_string_list(payload.get("key_points")),
                 direct_answer=direct_answer,
@@ -939,6 +1014,7 @@ class MessageFormatter:
             "concept",
             "troubleshooting",
             "api_usage",
+            "solution_design",
             "general",
         }
         return text if text in allowed else "general"
@@ -959,6 +1035,20 @@ class MessageFormatter:
             if normalized.get("name"):
                 details.append(normalized)
         return details[:4]
+
+    @staticmethod
+    def _normalize_solution(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        normalized: dict[str, Any] = {}
+        recommended = MessageFormatter._clean_inline_text(str(value.get("recommended") or ""))
+        if recommended:
+            normalized["recommended"] = recommended
+        for key in ("steps", "variants", "not_recommended", "risks", "open_questions"):
+            items = MessageFormatter._normalize_string_list(value.get(key))
+            if items:
+                normalized[key] = items
+        return normalized or None
 
     @staticmethod
     def _normalize_direct_answer(value: Any) -> dict[str, str]:
@@ -1092,6 +1182,76 @@ class MessageFormatter:
         return polished
 
 
+class KnowledgeQueryResponder:
+    """Shared knowledge-answer pipeline used by Feishu entrypoints."""
+
+    def __init__(
+        self,
+        *,
+        config: FeishuConfig,
+        local_api: LocalAPIClient,
+        formatter: MessageFormatter,
+        llm_agent: LLMAgent,
+    ) -> None:
+        self.config = config
+        self.local_api = local_api
+        self.formatter = formatter
+        self.llm_agent = llm_agent
+
+    def process_query(
+        self,
+        query: str,
+        *,
+        search_query: str | None = None,
+        history: list[dict[str, str]] | None = None,
+    ) -> BotReplyResult:
+        effective_search_query = search_query or query
+        if self.llm_agent.is_chitchat(query):
+            reply = self.llm_agent.direct_reply(query)
+            reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
+            return BotReplyResult(text=reply, search_query=effective_search_query)
+
+        context_pack = self.local_api.get_context_pack(
+            processed_dir=self.config.processed_dir,
+            query=effective_search_query,
+            top_k=self.config.default_top_k,
+            per_document_limit=self.config.default_per_document_limit,
+            fts_index_path=self.config.fts_index_path or None,
+            vector_index_path=self.config.vector_index_path or None,
+        )
+        score_threshold = self.config.score_threshold
+        selected_chunks = context_pack.get("selected_chunks", [])
+        has_evidence = bool(selected_chunks) and (
+            max((chunk.get("score", float("-inf")) for chunk in selected_chunks), default=float("-inf"))
+            >= score_threshold
+        )
+        if not has_evidence:
+            reply = self.llm_agent.no_evidence_reply(query)
+            reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
+            return BotReplyResult(
+                text=reply,
+                search_query=effective_search_query,
+                has_evidence=False,
+                context_pack=context_pack,
+            )
+
+        context_pack_text = self.formatter.format_context_pack(context_pack, score_threshold)
+        reply = self.llm_agent.synthesize(query, context_pack_text, history=history or None)
+        reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
+        formatted_reply = self.formatter.build_user_reply(
+            query=query,
+            answer_text=reply,
+            context_pack=context_pack,
+        )
+        return BotReplyResult(
+            text=reply,
+            search_query=effective_search_query,
+            has_evidence=True,
+            formatted_reply=formatted_reply,
+            context_pack=context_pack,
+        )
+
+
 
 class FeishuAPI:
     def __init__(self, config: FeishuConfig):
@@ -1189,6 +1349,13 @@ class FeishuMessageHandler:
         self.local_api = LocalAPIClient(self.config.local_api_base)
         self.feishu_api = FeishuAPI(self.config)
         self.formatter = MessageFormatter()
+        self.llm_agent = LLMAgent.from_env()
+        self.responder = KnowledgeQueryResponder(
+            config=self.config,
+            local_api=self.local_api,
+            formatter=self.formatter,
+            llm_agent=self.llm_agent,
+        )
 
     def handle_event(self, event_data: dict[str, Any]) -> dict[str, Any]:
         if event_data.get("type") == "url_verification":
@@ -1223,29 +1390,11 @@ class FeishuMessageHandler:
 
     def _process_query(self, chat_id: str, query: str) -> None:
         try:
-            context_pack = self.local_api.get_context_pack(
-                processed_dir=self.config.processed_dir,
-                query=query,
-                top_k=self.config.default_top_k,
-                per_document_limit=self.config.default_per_document_limit,
-            )
-            context_pack_text = self.formatter.format_context_pack(context_pack)
-
-            gap_report_text = ""
-            ref_path = self.config.reference_markdown_path
-            if ref_path and Path(ref_path).exists():
-                gap_report = self.local_api.get_gap_report(
-                    processed_dir=self.config.processed_dir,
-                    query=query,
-                    reference_markdown_path=ref_path,
-                    top_k=self.config.default_top_k,
-                    per_document_limit=self.config.default_per_document_limit,
-                )
-                gap_report_text = self.formatter.format_gap_report(gap_report)
-
-            full_reply = self._assemble_reply(context_pack_text, gap_report_text)
-            full_reply = self.formatter.truncate_message(full_reply, self.config.max_reply_length)
-            self.feishu_api.send_text_message(chat_id, full_reply)
+            result = self.responder.process_query(query)
+            if result.formatted_reply is not None:
+                self.feishu_api.send_reply_message(chat_id, result.formatted_reply)
+            else:
+                self.feishu_api.send_text_message(chat_id, result.text)
 
         except Exception:
             logger.exception("处理用户查询失败")

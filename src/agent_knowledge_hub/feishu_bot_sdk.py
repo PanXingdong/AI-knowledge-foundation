@@ -18,9 +18,9 @@ from typing import Any
 from agent_knowledge_hub.feishu_bot import (
     FeishuAPI,
     FeishuConfig,
+    KnowledgeQueryResponder,
     LocalAPIClient,
     MessageFormatter,
-    assemble_reply,
     filter_mentions,
 )
 from agent_knowledge_hub.llm_agent import LLMAgent
@@ -48,6 +48,12 @@ class FeishuBotSDK:
         self.feishu_api = FeishuAPI(self.config)
         self.formatter = MessageFormatter()
         self.llm_agent = LLMAgent.from_env()
+        self.responder = KnowledgeQueryResponder(
+            config=self.config,
+            local_api=self.local_api,
+            formatter=self.formatter,
+            llm_agent=self.llm_agent,
+        )
         self._channel = None
         self._message_count = 0
         self._start_time: float = 0
@@ -335,57 +341,25 @@ class FeishuBotSDK:
                 search_query = previous_query
                 logger.info("Follow-up detected, reusing previous query: %s", search_query[:50])
 
-            # ── Step 1: chitchat shortcut (no KB call) ──────────────────
-            if self.llm_agent.is_chitchat(query):
-                logger.info("Intent: chitchat, skipping KB retrieval")
-                reply = self.llm_agent.direct_reply(query)
-                reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
-                self.feishu_api.send_text_message(chat_id, reply)
-                self._update_history(memory_key, query, reply)
-                logger.info("总耗时: %.2fs", time.time() - start_time)
-                return
-
-            # ── Step 2: knowledge base retrieval ───────────────────────
+            # ── Shared knowledge-answer pipeline ───────────────────────
             t1 = time.time()
-            context_pack = self.local_api.get_context_pack(
-                processed_dir=self.config.processed_dir,
-                query=search_query,
-                top_k=self.config.default_top_k,
-                per_document_limit=self.config.default_per_document_limit,
-                fts_index_path=self.config.fts_index_path or None,
-                vector_index_path=self.config.vector_index_path or None,
+            self.responder.local_api = self.local_api
+            self.responder.formatter = self.formatter
+            self.responder.llm_agent = self.llm_agent
+            result = self.responder.process_query(
+                query,
+                search_query=search_query,
+                history=history or None,
             )
             t2 = time.time()
+            logger.info("步骤耗时: shared_pipeline=%.2fs", t2 - t1)
 
-            score_threshold = self.config.score_threshold  # configurable via SCORE_THRESHOLD env var
-            selected_chunks = context_pack.get("selected_chunks", [])
-            has_evidence = bool(selected_chunks) and (
-                max((c.get("score", float("-inf")) for c in selected_chunks), default=float("-inf"))
-                >= score_threshold
-            )
-
-            # ── Step 3: LLM synthesis (with conversation history) ───────
-            if not has_evidence:
-                logger.info("KB: no relevant evidence for query=%s", query[:40])
-                reply = self.llm_agent.no_evidence_reply(query)
+            if result.formatted_reply is not None:
+                self.feishu_api.send_reply_message(chat_id, result.formatted_reply)
             else:
-                context_pack_text = self.formatter.format_context_pack(context_pack, score_threshold)
-                t3 = time.time()
-                logger.info("步骤耗时: KB=%.2fs, 格式化=%.2fs", t2 - t1, t3 - t2)
-                reply = self.llm_agent.synthesize(query, context_pack_text, history=history or None)
-
-            reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
-            if has_evidence:
-                formatted_reply = self.formatter.build_user_reply(
-                    query=query,
-                    answer_text=reply,
-                    context_pack=context_pack,
-                )
-                self.feishu_api.send_reply_message(chat_id, formatted_reply)
-            else:
-                self.feishu_api.send_text_message(chat_id, reply)
-            self._update_history(memory_key, query, reply)
-            self._set_last_query(memory_key, search_query)
+                self.feishu_api.send_text_message(chat_id, result.text)
+            self._update_history(memory_key, query, result.text)
+            self._set_last_query(memory_key, result.search_query)
             logger.info("总耗时: %.2fs", time.time() - start_time)
 
         except Exception:

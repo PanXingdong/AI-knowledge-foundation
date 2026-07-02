@@ -17,6 +17,7 @@ class QueryCase:
     query: str
     must_have_facts: tuple[str, ...] = ()
     must_have_documents: tuple[str, ...] = ()
+    expected_answer_type: str | None = None
 
 
 CASES: tuple[QueryCase, ...] = (
@@ -41,6 +42,21 @@ CASES: tuple[QueryCase, ...] = (
         case_id="process-vram-allocation",
         query="实际进程的显存是如何分配的",
         must_have_facts=("memory",),
+    ),
+    QueryCase(
+        case_id="screen-pixmap-buffer-demo",
+        query="给我一个创建screen pixmap buffer的接口调用demo",
+        expected_answer_type="solution_design",
+    ),
+    QueryCase(
+        case_id="qnx-dmabuf-sharing-practice",
+        query="有没有QNX系统进程间共享dma-buf的最佳实践方案？",
+        expected_answer_type="solution_design",
+    ),
+    QueryCase(
+        case_id="screen-buffer-zero-copy-sharing",
+        query="给一个进程间screen buffer零copy共享的方案",
+        expected_answer_type="solution_design",
     ),
 )
 
@@ -105,9 +121,13 @@ def main() -> int:
                 for item in case.must_have_documents
             },
         }
+        if case.expected_answer_type and parsed_reply:
+            checks["expected_answer_type"] = {
+                case.expected_answer_type: parsed_reply.get("answer_type") == case.expected_answer_type
+            }
         passed = all(checks["must_have_facts"].values()) and all(
             checks["must_have_documents"].values()
-        )
+        ) and all(checks.get("expected_answer_type", {None: True}).values())
         results.append(
             {
                 "case": asdict(case),
