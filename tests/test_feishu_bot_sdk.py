@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent_knowledge_hub.feishu_bot import FeishuConfig
+from agent_knowledge_hub.feishu_bot import FeishuConfig, FormattedReply
 from agent_knowledge_hub.feishu_bot_sdk import FeishuBotSDK
 
 
@@ -172,6 +172,87 @@ class TestHandleMessageEvent:
             assert any("处理消息事件失败" in r.message for r in caplog.records)
 
 
+class TestHandleCardAction:
+    def test_show_full_evidence_action_replies_with_trace_text(self, bot):
+        event = SimpleNamespace(
+            open_id="ou_user",
+            chat_id="oc_chat",
+            action=SimpleNamespace(
+                value={
+                    "action": "show_full_evidence",
+                    "evidence_refs": [
+                        {
+                            "evidence_id": "span_1",
+                            "label": "screeninfo",
+                            "supports": "说明 Screen 图形调试工具用途",
+                        }
+                    ],
+                }
+            ),
+        )
+        bot.local_api.get_evidence.return_value = {
+            "document_title": "QNX Screen Guide",
+            "document_version": "7.1",
+            "page": 309,
+            "section_titles": ["Debugging"],
+            "text": "screeninfo and tracelogger can help debug display issues.",
+        }
+
+        bot._handle_card_action_event(event)
+
+        bot.local_api.get_evidence.assert_called_once_with(
+            processed_dir=bot.config.processed_dir,
+            evidence_id="span_1",
+        )
+        bot.feishu_api.send_text_message.assert_called_once()
+        sent = bot.feishu_api.send_text_message.call_args.args[1]
+        assert "QNX Screen Guide" in sent
+        assert "支撑：screeninfo - 说明 Screen 图形调试工具用途" in sent
+        assert "page 309" in sent
+        assert "screeninfo" in sent
+
+    def test_evidence_trace_formatter_filters_heading_fragments(self, bot):
+        text = bot._format_evidence_traces(
+            [
+                {
+                    "document_title": "QNX Screen Guide",
+                    "page": 309,
+                    "section_titles": ["Debugging", "Chapter 13"],
+                    "text": "Chapter 13",
+                },
+                {
+                    "document_title": "QNX Screen Guide",
+                    "page": 309,
+                    "section_titles": ["Debugging", "Chapter 13"],
+                    "text": "Debugging graphics isn't easy. These tools help debug graphics problems.",
+                },
+            ]
+            ,
+            evidence_refs=[
+                {
+                    "evidence_id": "span_2",
+                    "label": "Screen 调试工具集",
+                    "supports": "说明图形调试章节提供工具和方法",
+                }
+            ],
+        )
+
+        assert "Chapter 13\n" not in text
+        assert "支撑：Screen 调试工具集 - 说明图形调试章节提供工具和方法" in text
+        assert "Debugging graphics isn't easy" in text
+        assert "证据 1" in text
+
+    def test_ignores_unknown_card_action(self, bot):
+        event = SimpleNamespace(
+            chat_id="oc_chat",
+            action=SimpleNamespace(value={"action": "unknown"}),
+        )
+
+        bot._handle_card_action_event(event)
+
+        bot.feishu_api.send_text_message.assert_not_called()
+
+
 class TestHealthCheck:
     def test_health_check_logs_when_no_messages(self, bot, caplog):
         """30秒内无消息时输出诊断提示"""
@@ -209,6 +290,11 @@ class TestProcessQuery:
         }
         bot.local_api.get_context_pack.return_value = context_pack
         bot.formatter.format_context_pack.return_value = "格式化结果"
+        bot.formatter.build_user_reply.return_value = FormattedReply(
+            title="QNX priority inheritance技术问题",
+            summary="合成回答",
+            plain_text="合成回答",
+        )
         bot.formatter.truncate_message.return_value = "合成回答"
         bot.llm_agent.is_chitchat.return_value = False
         bot.llm_agent.synthesize.return_value = "合成回答"
@@ -217,7 +303,9 @@ class TestProcessQuery:
 
         bot.local_api.get_context_pack.assert_called_once()
         bot.llm_agent.synthesize.assert_called_once()
-        bot.feishu_api.send_text_message.assert_called_once_with("oc_test", "合成回答")
+        bot.formatter.build_user_reply.assert_called_once()
+        bot.feishu_api.send_reply_message.assert_called_once()
+        assert bot.feishu_api.send_reply_message.call_args.args[0] == "oc_test"
         assert bot._history["oc_test"]
         assert bot._last_query["oc_test"] == "QNX priority inheritance技术问题"
 
@@ -321,6 +409,7 @@ class TestProcessQuery:
         bot._process_query("oc_low", "冷门问题")
 
         bot.feishu_api.send_text_message.assert_called_once_with("oc_low", "未找到相关内容")
+        bot.feishu_api.send_reply_message.assert_not_called()
 
     def test_empty_chunks_sends_reply(self, bot):
         """selected_chunks 为空时正常走格式化流程（由 formatter 处理空结果）"""
@@ -337,6 +426,7 @@ class TestProcessQuery:
         bot._process_query("oc_empty", "空查询")
 
         bot.feishu_api.send_text_message.assert_called_once_with("oc_empty", "未找到相关内容")
+        bot.feishu_api.send_reply_message.assert_not_called()
 
     def test_exception_sends_error_message(self, bot):
         """处理查询异常时向用户发送错误提示"""
@@ -371,7 +461,7 @@ class TestProcessQuery:
 
         bot.local_api.get_context_pack.assert_called_once()
         bot.llm_agent.synthesize.assert_called_once()
-        bot.feishu_api.send_text_message.assert_called_once()
+        bot.feishu_api.send_reply_message.assert_called_once()
 
 
 class TestHandleRejectEvent:

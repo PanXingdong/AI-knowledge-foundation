@@ -75,12 +75,13 @@ def _call_deepseek(
     api_key: str,
     model: str,
     timeout: int = 60,
+    temperature: float = 0.3,
 ) -> str:
     url = f"{DEEPSEEK_API_BASE}/chat/completions"
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.3,
+        "temperature": temperature,
         "max_tokens": 4096,
     }
     req = urllib.request.Request(
@@ -113,10 +114,16 @@ class LLMAgent:
         api_key: str = "",
         model: str = DEFAULT_MODEL,
         timeout: int = 90,
+        synthesis_temperature: float | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
         self.model = model or os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL)
         self.timeout = timeout
+        self.synthesis_temperature = (
+            synthesis_temperature
+            if synthesis_temperature is not None
+            else float(os.getenv("DEEPSEEK_SYNTHESIS_TEMPERATURE", "0"))
+        )
 
     @classmethod
     def from_env(cls) -> LLMAgent:
@@ -139,7 +146,13 @@ class LLMAgent:
             {"role": "user", "content": query},
         ]
         try:
-            return _call_deepseek(messages, self.api_key, self.model, self.timeout)
+            return _call_deepseek(
+                messages,
+                self.api_key,
+                self.model,
+                self.timeout,
+                temperature=0.3,
+            )
         except Exception:
             logger.exception("LLM direct_reply failed, using fallback")
             return "你好！我是QNX助手，有什么 QNX 相关的技术问题都可以问我～"
@@ -154,8 +167,50 @@ class LLMAgent:
         user_content = (
             f"【用户问题】\n{query}\n\n"
             f"【参考资料】\n{context_pack_text}\n\n"
-            "请根据参考资料回答用户问题。"
-            "在回答末尾注明置信度（高/中/低）及简短理由。"
+            "请根据参考资料生成适合飞书聊天窗口阅读的中文回答。\n"
+            "只输出一个 JSON 对象，不要输出 Markdown，不要输出代码块，不要解释 JSON 之外的内容。\n"
+            "JSON schema:\n"
+            "{\n"
+            '  "title": "问题简短标题",\n'
+            '  "direct_answer": {\n'
+            '    "tools": "有/没有/不确定 + 一句话说明",\n'
+            '    "demos": "有/没有/不确定 + 一句话说明"\n'
+            "  },\n"
+            '  "summary": "2-4行直接结论",\n'
+            '  "answer_type": "tool_lookup | demo_lookup | how_to | concept | troubleshooting | api_usage | general",\n'
+            '  "details": [\n'
+            "    {\n"
+            '      "name": "工具/API/概念/步骤名",\n'
+            '      "purpose": "它解决什么问题或说明什么",\n'
+            '      "usage": "怎么用；如果资料不足就写不确定",\n'
+            '      "when_to_use": "什么场景下使用；不适用可省略"\n'
+            "    }\n"
+            "  ],\n"
+            '  "key_points": ["可选：关键要点"],\n'
+            '  "evidence_items": [\n'
+            "    {\n"
+            '      "name": "工具/概念名，例如 Display Surface Dumps",\n'
+            '      "source": "文档名 / 章节 / 页码",\n'
+            '      "why_relevant": "为什么这条证据能回答用户问题",\n'
+            '      "evidence_ids": ["span_xxx"]\n'
+            "    }\n"
+            "  ],\n"
+            '  "caveats": ["可选：限制或缺口"],\n'
+            '  "next_steps": ["可选：下一步建议"],\n'
+            '  "confidence": "高/中/低：简短理由"\n'
+            "}\n"
+            "要求：\n"
+            "1. 先拆解用户问题。如果用户同时问工具和 demo，必须分别填写 direct_answer.tools 和 direct_answer.demos。\n"
+            "2. title 用中性短标题，渲染显示调试类问题优先用“QNX 渲染调试工具查询结果”。\n"
+            "3. summary 只写总览，不重复 direct_answer，不提 IDE/GDB/System Profiler 这类通用调试噪声。\n"
+            "4. 根据问题选择 answer_type。工具/demo 查询用 tool_lookup/demo_lookup；概念解释用 concept；排障用 troubleshooting；API 用法用 api_usage。\n"
+            "5. details 是通用细节列表：工具问题写工具作用/用法/适用场景；概念问题写概念拆解；API 问题写 API/参数/注意事项。不要只列名字。\n"
+            "6. key_points 最多 2 条；不要重复 evidence_items 或 details 中已经展示的内容。\n"
+            "7. evidence_items 最多 2 条，只放强相关证据；不要把 IDE/GDB 通用调试配置作为渲染显示问题的主依据。\n"
+            "8. 不要在 summary 或 caveats 中展示 span id；span id 只放在 evidence_ids 字段。\n"
+            "9. next_steps 必须和用户问题直接相关，不要推荐无关文档。\n"
+            "10. 如果资料不足，如实说明缺口。\n"
+            "11. confidence 必须填写。"
         )
         messages: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -164,7 +219,13 @@ class LLMAgent:
             messages.extend(history)
         messages.append({"role": "user", "content": user_content})
         try:
-            return _call_deepseek(messages, self.api_key, self.model, self.timeout)
+            return _call_deepseek(
+                messages,
+                self.api_key,
+                self.model,
+                self.timeout,
+                temperature=self.synthesis_temperature,
+            )
         except Exception:
             logger.exception("LLM synthesis failed, falling back to raw evidence")
             return context_pack_text  # show raw evidence if LLM fails
@@ -190,7 +251,13 @@ class LLMAgent:
             {"role": "user", "content": query},
         ]
         try:
-            raw = _call_deepseek(messages, self.api_key, self.model, self.timeout)
+            raw = _call_deepseek(
+                messages,
+                self.api_key,
+                self.model,
+                self.timeout,
+                temperature=0.1,
+            )
             start = raw.find("{")
             end = raw.rfind("}")
             if start == -1 or end == -1 or end <= start:
@@ -213,7 +280,13 @@ class LLMAgent:
             {"role": "user", "content": user_content},
         ]
         try:
-            return _call_deepseek(messages, self.api_key, self.model, self.timeout)
+            return _call_deepseek(
+                messages,
+                self.api_key,
+                self.model,
+                self.timeout,
+                temperature=0.2,
+            )
         except Exception:
             logger.exception("LLM no_evidence_reply failed, using fallback")
             return (
