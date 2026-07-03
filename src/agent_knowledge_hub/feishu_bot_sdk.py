@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -17,9 +18,9 @@ from typing import Any
 from agent_knowledge_hub.feishu_bot import (
     FeishuAPI,
     FeishuConfig,
+    KnowledgeQueryResponder,
     LocalAPIClient,
     MessageFormatter,
-    assemble_reply,
     filter_mentions,
 )
 from agent_knowledge_hub.llm_agent import LLMAgent
@@ -47,6 +48,12 @@ class FeishuBotSDK:
         self.feishu_api = FeishuAPI(self.config)
         self.formatter = MessageFormatter()
         self.llm_agent = LLMAgent.from_env()
+        self.responder = KnowledgeQueryResponder(
+            config=self.config,
+            local_api=self.local_api,
+            formatter=self.formatter,
+            llm_agent=self.llm_agent,
+        )
         self._channel = None
         self._message_count = 0
         self._start_time: float = 0
@@ -77,6 +84,15 @@ class FeishuBotSDK:
         )
         self._channel.on(Events.MESSAGE, self._handle_message_event)
         self._channel.on(Events.REJECT, self._handle_reject_event)
+        for event_name in (
+            "CARD_ACTION",
+            "CARD_ACTION_TRIGGER",
+            "MESSAGE_ACTION",
+            "INTERACTIVE_CARD_ACTION",
+        ):
+            event_value = getattr(Events, event_name, None)
+            if event_value is not None:
+                self._channel.on(event_value, self._handle_card_action_event)
 
         logger.info("启动飞书Bot长连接...")
         logger.info("App ID: %s", self.config.app_id)
@@ -99,6 +115,141 @@ class FeishuBotSDK:
             logger.warning("消息被过滤: reason=%s, chat_id=%s, text=%s", reason, chat_id, text[:50] if text else "")
         else:
             logger.warning("消息被过滤: reason=%s, event=%s", reason, type(event))
+
+    def _handle_card_action_event(self, event: Any) -> None:
+        try:
+            value = self._extract_action_value(event)
+            if value.get("action") != "show_full_evidence":
+                return
+            evidence_refs = self._extract_evidence_refs(value)[:6]
+            if not evidence_refs:
+                return
+            chat_id = self._extract_action_chat_id(event)
+            if not chat_id:
+                logger.warning("卡片回调缺少 chat_id，无法发送证据详情")
+                return
+            traces = []
+            for evidence_ref in evidence_refs:
+                evidence_id = evidence_ref["evidence_id"]
+                try:
+                    trace = self.local_api.get_evidence(
+                        processed_dir=self.config.processed_dir,
+                        evidence_id=evidence_id,
+                    )
+                    trace["_evidence_ref"] = evidence_ref
+                    traces.append(trace)
+                except Exception:
+                    logger.warning("获取证据失败: %s", evidence_id, exc_info=True)
+            if not traces:
+                self.feishu_api.send_text_message(chat_id, "未能获取完整证据，请稍后重试。")
+                return
+            self.feishu_api.send_text_message(chat_id, self._format_evidence_traces(traces))
+        except Exception:
+            logger.exception("处理卡片按钮事件失败")
+
+    @staticmethod
+    def _extract_action_value(event: Any) -> dict[str, Any]:
+        action = getattr(event, "action", None)
+        value = getattr(action, "value", None) if action is not None else None
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+        event_value = getattr(event, "value", None)
+        return event_value if isinstance(event_value, dict) else {}
+
+    @staticmethod
+    def _extract_evidence_refs(value: dict[str, Any]) -> list[dict[str, str]]:
+        refs: list[dict[str, str]] = []
+        raw_refs = value.get("evidence_refs")
+        if isinstance(raw_refs, list):
+            for item in raw_refs:
+                if not isinstance(item, dict):
+                    continue
+                evidence_id = str(item.get("evidence_id") or "").strip()
+                if not evidence_id:
+                    continue
+                refs.append(
+                    {
+                        "evidence_id": evidence_id,
+                        "label": str(item.get("label") or "").strip(),
+                        "supports": str(item.get("supports") or "").strip(),
+                    }
+                )
+        if refs:
+            return refs
+        return [
+            {"evidence_id": str(evidence_id), "label": "", "supports": ""}
+            for evidence_id in (value.get("evidence_ids") or [])
+            if str(evidence_id).strip()
+        ]
+
+    @staticmethod
+    def _extract_action_chat_id(event: Any) -> str:
+        for attr in ("chat_id", "open_chat_id"):
+            value = getattr(event, attr, "")
+            if value:
+                return str(value)
+        message = getattr(event, "message", None)
+        if message is not None:
+            value = getattr(message, "chat_id", "") or getattr(message, "open_chat_id", "")
+            if value:
+                return str(value)
+        return ""
+
+    @staticmethod
+    def _format_evidence_traces(
+        traces: list[dict[str, Any]],
+        evidence_refs: list[dict[str, str]] | None = None,
+    ) -> str:
+        lines = ["完整证据"]
+        useful_traces = [
+            trace
+            for trace in traces
+            if not FeishuBotSDK._is_low_value_evidence_text(str(trace.get("text") or ""))
+        ]
+        if not useful_traces:
+            useful_traces = traces
+        for index, trace in enumerate(useful_traces, start=1):
+            title = str(trace.get("document_title") or "Unknown")
+            evidence_ref = trace.get("_evidence_ref")
+            if not isinstance(evidence_ref, dict) and evidence_refs:
+                evidence_ref = evidence_refs[min(index - 1, len(evidence_refs) - 1)]
+            page = trace.get("page")
+            sections = " > ".join(str(item) for item in (trace.get("section_titles") or []) if item)
+            text = str(trace.get("text") or "").strip()
+            if len(text) > 600:
+                text = text[:597] + "..."
+            location_parts = []
+            if sections:
+                location_parts.append(sections)
+            if page is not None:
+                location_parts.append(f"page {page}")
+            location = " / ".join(location_parts) or "source"
+            lines.extend(["", f"证据 {index}. {title}"])
+            if isinstance(evidence_ref, dict):
+                label = str(evidence_ref.get("label") or "").strip()
+                supports = str(evidence_ref.get("supports") or "").strip()
+                if label or supports:
+                    relation = label if not supports else f"{label} - {supports}" if label else supports
+                    lines.append(f"支撑：{relation}")
+            lines.extend([f"位置：{location}", f"原文：{text}"])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _is_low_value_evidence_text(text: str) -> bool:
+        normalized = text.strip()
+        if not normalized:
+            return True
+        if len(normalized) <= 30 and re.fullmatch(r"(?i)(chapter|section|part)\s+\d+", normalized):
+            return True
+        if len(normalized) <= 20 and not any(char in normalized for char in ".。,:：;；"):
+            return True
+        return False
 
     def _health_check(self) -> None:
         """启动30秒后执行：若未收到任何消息事件，输出诊断提示。"""
@@ -190,49 +341,25 @@ class FeishuBotSDK:
                 search_query = previous_query
                 logger.info("Follow-up detected, reusing previous query: %s", search_query[:50])
 
-            # ── Step 1: chitchat shortcut (no KB call) ──────────────────
-            if self.llm_agent.is_chitchat(query):
-                logger.info("Intent: chitchat, skipping KB retrieval")
-                reply = self.llm_agent.direct_reply(query)
-                reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
-                self.feishu_api.send_text_message(chat_id, reply)
-                self._update_history(memory_key, query, reply)
-                logger.info("总耗时: %.2fs", time.time() - start_time)
-                return
-
-            # ── Step 2: knowledge base retrieval ───────────────────────
+            # ── Shared knowledge-answer pipeline ───────────────────────
             t1 = time.time()
-            context_pack = self.local_api.get_context_pack(
-                processed_dir=self.config.processed_dir,
-                query=search_query,
-                top_k=self.config.default_top_k,
-                per_document_limit=self.config.default_per_document_limit,
-                fts_index_path=self.config.fts_index_path or None,
-                vector_index_path=self.config.vector_index_path or None,
+            self.responder.local_api = self.local_api
+            self.responder.formatter = self.formatter
+            self.responder.llm_agent = self.llm_agent
+            result = self.responder.process_query(
+                query,
+                search_query=search_query,
+                history=history or None,
             )
             t2 = time.time()
+            logger.info("步骤耗时: shared_pipeline=%.2fs", t2 - t1)
 
-            score_threshold = self.config.score_threshold  # configurable via SCORE_THRESHOLD env var
-            selected_chunks = context_pack.get("selected_chunks", [])
-            has_evidence = bool(selected_chunks) and (
-                max((c.get("score", float("-inf")) for c in selected_chunks), default=float("-inf"))
-                >= score_threshold
-            )
-
-            # ── Step 3: LLM synthesis (with conversation history) ───────
-            if not has_evidence:
-                logger.info("KB: no relevant evidence for query=%s", query[:40])
-                reply = self.llm_agent.no_evidence_reply(query)
+            if result.formatted_reply is not None:
+                self.feishu_api.send_reply_message(chat_id, result.formatted_reply)
             else:
-                context_pack_text = self.formatter.format_context_pack(context_pack, score_threshold)
-                t3 = time.time()
-                logger.info("步骤耗时: KB=%.2fs, 格式化=%.2fs", t2 - t1, t3 - t2)
-                reply = self.llm_agent.synthesize(query, context_pack_text, history=history or None)
-
-            reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
-            self.feishu_api.send_text_message(chat_id, reply)
-            self._update_history(memory_key, query, reply)
-            self._set_last_query(memory_key, search_query)
+                self.feishu_api.send_text_message(chat_id, result.text)
+            self._update_history(memory_key, query, result.text)
+            self._set_last_query(memory_key, result.search_query)
             logger.info("总耗时: %.2fs", time.time() - start_time)
 
         except Exception:
