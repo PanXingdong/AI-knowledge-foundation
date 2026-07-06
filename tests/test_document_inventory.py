@@ -19,6 +19,7 @@ def test_document_inventory_discovers_supported_documents_and_writes_manifest(tm
         "Bosch diagnostic constraints require DTC synchronization.",
         encoding="utf-8",
     )
+    (root / "device-error.png").write_bytes(b"fake image bytes")
     (root / "notes.bin").write_bytes(b"ignored")
     excluded = root / ".git"
     excluded.mkdir()
@@ -31,10 +32,10 @@ def test_document_inventory_discovers_supported_documents_and_writes_manifest(tm
     )
     paths = {Path(item.source_path).name for item in inventory.documents}
 
-    assert inventory.document_count == 2
-    assert paths == {"qualcomm-bsp.md", "bosch-diagnostic.txt"}
+    assert inventory.document_count == 3
+    assert paths == {"qualcomm-bsp.md", "bosch-diagnostic.txt", "device-error.png"}
     assert inventory.documents[0].content_hash
-    assert {item.supplier for item in inventory.documents} == {"Qualcomm", "Bosch"}
+    assert {item.supplier for item in inventory.documents} == {"Qualcomm", "Bosch", "unknown"}
     assert any(skipped["reason"] == "unsupported_extension" for skipped in inventory.skipped)
 
     bundle = write_document_inventory_bundle(
@@ -44,7 +45,7 @@ def test_document_inventory_discovers_supported_documents_and_writes_manifest(tm
     )
 
     payload = json.loads(bundle["json_path"].read_text(encoding="utf-8"))
-    assert payload["document_count"] == 2
+    assert payload["document_count"] == 3
     assert "Document Inventory" in bundle["markdown_path"].read_text(encoding="utf-8")
 
     with bundle["manifest_path"].open("r", encoding="utf-8-sig", newline="") as handle:

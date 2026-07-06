@@ -7,7 +7,12 @@ import pytest
 from agent_knowledge_hub.chunker import _estimate_tokens, _sentence_split_if_needed
 from agent_knowledge_hub.models import CANONICAL_DOCUMENT_SCHEMA_VERSION
 from agent_knowledge_hub.pipeline import ingest_file, ingest_manifest
-from agent_knowledge_hub.parsers import UnsupportedDocumentFormatError, _build_pdf_text_layer_blocks
+from agent_knowledge_hub.parsers import (
+    ParsedBlock,
+    ParsedDocument,
+    UnsupportedDocumentFormatError,
+    _build_pdf_text_layer_blocks,
+)
 
 
 def read_json(path: Path):
@@ -326,6 +331,136 @@ def test_ingest_unsupported_format_fails_explicitly(tmp_path: Path):
         ingest_file(file_path=source, out_dir=tmp_path / "out")
 
     assert ".bin" in str(error.value)
+
+
+def test_ingest_preserves_ocr_metadata_in_evidence_and_chunks(monkeypatch, tmp_path: Path):
+    source = tmp_path / "scan.pdf"
+    source.write_bytes(b"%PDF-1.4 fake scan")
+
+    def fake_parse_document(path: Path):
+        return ParsedDocument(
+            source_format="pdf",
+            parser_name="pypdf+rapidocr",
+            page_count=1,
+            blocks=[
+                ParsedBlock(
+                    block_type="heading",
+                    text="扫描页面",
+                    page_start=1,
+                    page_end=1,
+                    metadata={"level": 2, "ocr_page_marker": True},
+                ),
+                ParsedBlock(
+                    block_type="paragraph",
+                    text="控制器故障码 E42 需要复位并检查电源。",
+                    page_start=1,
+                    page_end=1,
+                    metadata={
+                        "ocr": True,
+                        "ocr_engine": "rapidocr",
+                        "content_kind": "ocr_text",
+                        "confidence": 0.91,
+                        "bbox": [10, 20, 200, 80],
+                        "bbox_unit": "pdf_points",
+                        "page_image_ref": "source:scan.pdf#page=1",
+                        "media_type": "application/pdf",
+                        "ocr_lines": [
+                            {
+                                "text": "控制器故障码 E42",
+                                "confidence": 0.92,
+                                "bbox": [10, 20, 120, 45],
+                            },
+                            {
+                                "text": "需要复位并检查电源。",
+                                "confidence": 0.90,
+                                "bbox": [10, 48, 200, 80],
+                            },
+                        ],
+                    },
+                )
+            ],
+        )
+
+    monkeypatch.setattr("agent_knowledge_hub.pipeline.parse_document", fake_parse_document)
+
+    result = ingest_file(
+        file_path=source,
+        out_dir=tmp_path / "out",
+        title="扫描手册",
+        source_type="supplier_scan",
+        document_version="v1",
+    )
+
+    document = read_json(result.document_json_path)
+    chunks = [
+        json.loads(line)
+        for line in result.chunks_jsonl_path.read_text(encoding="utf-8").splitlines()
+    ]
+    evidence = next(
+        span for span in document["evidence_spans"] if "E42" in span["text"]
+    )
+
+    assert evidence["bbox"] == [10.0, 20.0, 200.0, 80.0]
+    assert evidence["metadata"]["ocr"] is True
+    assert evidence["metadata"]["confidence"] == 0.91
+    assert evidence["metadata"]["page_image_ref"] == "source:scan.pdf#page=1"
+    assert chunks[0]["metadata"]["ocr"] is True
+    assert chunks[0]["metadata"]["content_kind"] == "ocr_text"
+    assert chunks[0]["metadata"]["page_image_refs"] == ["source:scan.pdf#page=1"]
+
+
+def test_ingest_image_copies_media_asset(monkeypatch, tmp_path: Path):
+    source = tmp_path / "device-error.png"
+    source.write_bytes(b"fake image bytes")
+
+    def fake_parse_document(path: Path):
+        return ParsedDocument(
+            source_format="image",
+            parser_name="rapidocr-image",
+            page_count=1,
+            blocks=[
+                ParsedBlock(
+                    block_type="heading",
+                    text="截图内容",
+                    page_start=1,
+                    page_end=1,
+                    metadata={"level": 2},
+                ),
+                ParsedBlock(
+                    block_type="paragraph",
+                    text="设备截图显示错误码 E42。",
+                    page_start=1,
+                    page_end=1,
+                    metadata={
+                        "ocr": True,
+                        "content_kind": "ocr_text",
+                        "media_ref": "media/device-error.png",
+                        "page_image_ref": "media/device-error.png",
+                        "media_type": "image/png",
+                        "bbox": [2, 4, 80, 30],
+                        "bbox_unit": "pixels",
+                    },
+                )
+            ],
+        )
+
+    monkeypatch.setattr("agent_knowledge_hub.pipeline.parse_document", fake_parse_document)
+
+    result = ingest_file(
+        file_path=source,
+        out_dir=tmp_path / "out",
+        title="设备错误截图",
+        source_type="screenshot",
+    )
+
+    document = read_json(result.document_json_path)
+    evidence = next(
+        span for span in document["evidence_spans"] if "E42" in span["text"]
+    )
+
+    assert (result.output_dir / "media" / "device-error.png").read_bytes() == b"fake image bytes"
+    assert evidence["metadata"]["media_ref"] == "media/device-error.png"
+    assert evidence["metadata"]["page_image_ref"] == "media/device-error.png"
 
 
 def test_sentence_split_hard_cuts_single_line_exceeding_budget():

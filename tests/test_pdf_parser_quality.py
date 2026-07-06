@@ -4,6 +4,7 @@ from agent_knowledge_hub.parsers import (
     ParsedBlock,
     ParsedDocument,
     assess_pdf_text_quality,
+    parse_document,
     parse_pdf,
 )
 
@@ -168,3 +169,36 @@ def test_parse_pdf_exposes_structured_quality_report(monkeypatch, tmp_path: Path
     assert parsed.quality_report["status"] == "ok"
     assert parsed.quality_report["metrics"]["cjk_count"] >= 20
     assert parsed.quality_report["reason_codes"] == []
+
+
+def test_parse_document_routes_image_files_to_rapidocr(monkeypatch, tmp_path: Path):
+    image_path = tmp_path / "screenshot.png"
+    image_path.write_bytes(b"fake image bytes")
+
+    def fake_image_ocr(path: Path):
+        return ParsedDocument(
+            source_format="image",
+            parser_name="rapidocr-image",
+            page_count=1,
+            blocks=[
+                ParsedBlock(
+                    block_type="paragraph",
+                    text="系统错误码 E42 需要复位控制器",
+                    page_start=1,
+                    page_end=1,
+                    metadata={
+                        "ocr": True,
+                        "content_kind": "ocr_text",
+                        "media_ref": "media/screenshot.png",
+                    },
+                )
+            ],
+        )
+
+    monkeypatch.setattr("agent_knowledge_hub.parsers._parse_image_with_rapidocr", fake_image_ocr)
+
+    parsed = parse_document(image_path)
+
+    assert parsed.source_format == "image"
+    assert parsed.parser_name == "rapidocr-image"
+    assert parsed.blocks[0].metadata["media_ref"] == "media/screenshot.png"

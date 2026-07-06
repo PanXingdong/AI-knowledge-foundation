@@ -93,6 +93,15 @@ class PdfTextQualityReport:
         }
 
 
+IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+
 SUPPORTED_EXTENSIONS = {
     ".md",
     ".markdown",
@@ -101,7 +110,7 @@ SUPPORTED_EXTENSIONS = {
     ".htm",
     ".pdf",
     ".docx",
-}
+} | IMAGE_EXTENSIONS
 
 _MIN_TRUSTED_PDF_TEXT_CHARS = 40
 _MIN_CJK_CHARS_FOR_MOJIBAKE_CHECK = 20
@@ -129,6 +138,8 @@ def parse_document(path: Path) -> ParsedDocument:
         return parse_pdf(path)
     if suffix == ".docx":
         return parse_docx(path)
+    if suffix in IMAGE_EXTENSIONS:
+        return parse_image(path)
     raise UnsupportedDocumentFormatError(
         f"Unsupported document format '{suffix}' for {path}. "
         f"Supported formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
@@ -254,6 +265,10 @@ def parse_pdf(path: Path) -> ParsedDocument:
             fallback_parser=None,
         ),
     )
+
+
+def parse_image(path: Path) -> ParsedDocument:
+    return _parse_image_with_rapidocr(path)
 
 
 def assess_pdf_text_quality(text: str) -> PdfTextQualityReport:
@@ -523,10 +538,15 @@ def _parse_pdf_with_rapidocr(path: Path) -> ParsedDocument:
                     alpha=False,
                 )
                 result = ocr(pixmap.tobytes("png"), text_score=_RAPIDOCR_TEXT_SCORE)
-                lines = _rapidocr_result_to_lines(result)
+                line_items = _rapidocr_result_to_line_items(
+                    result,
+                    bbox_scale=1 / _RAPIDOCR_RENDER_SCALE,
+                )
+                lines = [line["text"] for line in line_items]
             except Exception as exc:  # pragma: no cover - depends on PDF/OCR internals
                 warnings.append(f"page {page_number}: ocr failed: {exc}")
                 lines = []
+                line_items = []
 
             blocks.append(
                 ParsedBlock(
@@ -544,7 +564,14 @@ def _parse_pdf_with_rapidocr(path: Path) -> ParsedDocument:
                         text="\n".join(lines),
                         page_start=page_number,
                         page_end=page_number,
-                        metadata={"ocr": True},
+                        metadata=_build_ocr_block_metadata(
+                            line_items=line_items,
+                            content_kind="ocr_text",
+                            media_type="application/pdf",
+                            page_image_ref=f"source:{path.name}#page={page_number}",
+                            bbox_unit="pdf_points",
+                            source_page=page_number,
+                        ),
                     )
                 )
             else:
@@ -564,6 +591,60 @@ def _parse_pdf_with_rapidocr(path: Path) -> ParsedDocument:
         quality_report=_build_generic_quality_report(
             blocks=blocks,
             source_format="pdf",
+            fallback_parser="rapidocr",
+        ),
+    )
+
+
+def _parse_image_with_rapidocr(path: Path) -> ParsedDocument:
+    try:
+        from rapidocr import RapidOCR
+    except ImportError as exc:
+        raise DocumentParseError(
+            "Image OCR requires optional dependencies 'rapidocr' and 'onnxruntime'. "
+            "Install them before ingesting image files."
+        ) from exc
+
+    ocr = RapidOCR()
+    try:
+        result = ocr(path.read_bytes(), text_score=_RAPIDOCR_TEXT_SCORE)
+        line_items = _rapidocr_result_to_line_items(result)
+    except Exception as exc:  # pragma: no cover - depends on OCR internals
+        raise DocumentParseError(f"Image OCR failed for {path}: {exc}") from exc
+
+    blocks: list[ParsedBlock] = []
+    warnings: list[str] = []
+    lines = [line["text"] for line in line_items]
+    if lines:
+        blocks.append(
+            ParsedBlock(
+                block_type="paragraph",
+                text="\n".join(lines),
+                page_start=1,
+                page_end=1,
+                metadata=_build_ocr_block_metadata(
+                    line_items=line_items,
+                    content_kind="ocr_text",
+                    media_ref=f"media/{path.name}",
+                    page_image_ref=f"media/{path.name}",
+                    media_type=_image_media_type(path),
+                    bbox_unit="pixels",
+                    source_page=1,
+                ),
+            )
+        )
+    else:
+        warnings.append("no_ocr_text_blocks_extracted")
+
+    return ParsedDocument(
+        source_format="image",
+        parser_name="rapidocr-image",
+        page_count=1,
+        blocks=blocks,
+        warnings=warnings,
+        quality_report=_build_generic_quality_report(
+            blocks=blocks,
+            source_format="image",
             fallback_parser="rapidocr",
         ),
     )
@@ -750,31 +831,98 @@ def _is_mojibake_suspect_char(char: str) -> bool:
 
 
 def _rapidocr_result_to_lines(result: Any) -> list[str]:
+    return [line["text"] for line in _rapidocr_result_to_line_items(result)]
+
+
+def _rapidocr_result_to_line_items(
+    result: Any,
+    *,
+    bbox_scale: float = 1.0,
+) -> list[dict[str, Any]]:
     if result is None:
         return []
 
     if hasattr(result, "txts"):
-        txts = list(getattr(result, "txts") or [])
-        scores = list(getattr(result, "scores") or [])
-        return _filter_ocr_lines(txts, scores)
+        txts = _to_list(getattr(result, "txts", None))
+        scores = _to_list(getattr(result, "scores", None))
+        boxes_value = _first_present_attr(result, ("boxes", "dt_boxes", "rec_boxes"))
+        boxes = _to_list(boxes_value)
+        return _filter_ocr_line_items(txts, scores, boxes, bbox_scale=bbox_scale)
 
     if isinstance(result, tuple) and result:
-        return _rapidocr_result_to_lines(result[0])
+        return _rapidocr_result_to_line_items(result[0], bbox_scale=bbox_scale)
 
     if isinstance(result, list):
         txts: list[str] = []
         scores: list[float | None] = []
+        boxes: list[Any] = []
         for item in result:
             if isinstance(item, str):
                 txts.append(item)
                 scores.append(None)
+                boxes.append(None)
             elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                txts.append(str(item[1]))
-                score = item[2] if len(item) >= 3 else None
+                if isinstance(item[0], str):
+                    box = None
+                    text = item[0]
+                    score = item[1] if len(item) >= 2 else None
+                else:
+                    box = item[0]
+                    text = item[1]
+                    score = item[2] if len(item) >= 3 else None
+                txts.append(str(text))
                 scores.append(float(score) if isinstance(score, (int, float)) else None)
-        return _filter_ocr_lines(txts, scores)
+                boxes.append(box)
+        return _filter_ocr_line_items(txts, scores, boxes, bbox_scale=bbox_scale)
 
     return []
+
+
+def _filter_ocr_line_items(
+    txts: list[str],
+    scores: list[float | None],
+    boxes: list[Any],
+    *,
+    bbox_scale: float,
+) -> list[dict[str, Any]]:
+    lines: list[dict[str, Any]] = []
+    for index, raw_text in enumerate(txts):
+        score = scores[index] if index < len(scores) else None
+        if score is not None and score < _RAPIDOCR_TEXT_SCORE:
+            continue
+        text = normalize_space(raw_text)
+        if not text:
+            continue
+        line: dict[str, Any] = {"text": text}
+        if score is not None:
+            line["confidence"] = round(float(score), 4)
+        box = boxes[index] if index < len(boxes) else None
+        bbox = _normalize_ocr_bbox(box, scale=bbox_scale)
+        if bbox is not None:
+            line["bbox"] = bbox
+        lines.append(line)
+    return lines
+
+
+def _first_present_attr(value: Any, names: tuple[str, ...]) -> Any:
+    for name in names:
+        if not hasattr(value, name):
+            continue
+        attr = getattr(value, name)
+        if attr is not None:
+            return attr
+    return None
+
+
+def _to_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
 
 
 def _filter_ocr_lines(txts: list[str], scores: list[float | None]) -> list[str]:
@@ -787,6 +935,105 @@ def _filter_ocr_lines(txts: list[str], scores: list[float | None]) -> list[str]:
         if text:
             lines.append(text)
     return lines
+
+
+def _build_ocr_block_metadata(
+    *,
+    line_items: list[dict[str, Any]],
+    content_kind: str,
+    media_type: str,
+    bbox_unit: str,
+    source_page: int,
+    media_ref: str | None = None,
+    page_image_ref: str | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "ocr": True,
+        "ocr_engine": "rapidocr",
+        "content_kind": content_kind,
+        "media_type": media_type,
+        "bbox_unit": bbox_unit,
+        "source_page": source_page,
+        "ocr_lines": line_items,
+    }
+    if media_ref:
+        metadata["media_ref"] = media_ref
+    if page_image_ref:
+        metadata["page_image_ref"] = page_image_ref
+
+    confidences = [
+        float(line["confidence"])
+        for line in line_items
+        if isinstance(line.get("confidence"), (int, float))
+    ]
+    if confidences:
+        metadata["confidence"] = round(sum(confidences) / len(confidences), 4)
+
+    bbox = _union_bboxes(
+        line["bbox"]
+        for line in line_items
+        if isinstance(line.get("bbox"), list)
+    )
+    if bbox is not None:
+        metadata["bbox"] = bbox
+    return metadata
+
+
+def _normalize_ocr_bbox(value: Any, *, scale: float = 1.0) -> list[float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        return None
+
+    if len(value) == 4 and all(isinstance(item, (int, float)) for item in value):
+        x0, y0, x1, y1 = (float(item) * scale for item in value)
+        return [round(x0, 3), round(y0, 3), round(x1, 3), round(y1, 3)]
+
+    points: list[tuple[float, float]] = []
+    for point in value:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        x, y = point[0], point[1]
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            points.append((float(x) * scale, float(y) * scale))
+    if not points:
+        return None
+
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return [round(min(xs), 3), round(min(ys), 3), round(max(xs), 3), round(max(ys), 3)]
+
+
+def _union_bboxes(values: Any) -> list[float] | None:
+    boxes: list[list[float]] = []
+    for value in values:
+        if (
+            isinstance(value, list)
+            and len(value) == 4
+            and all(isinstance(item, (int, float)) for item in value)
+        ):
+            boxes.append([float(item) for item in value])
+    if not boxes:
+        return None
+    return [
+        round(min(box[0] for box in boxes), 3),
+        round(min(box[1] for box in boxes), 3),
+        round(max(box[2] for box in boxes), 3),
+        round(max(box[3] for box in boxes), 3),
+    ]
+
+
+def _image_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix in {".tif", ".tiff"}:
+        return "image/tiff"
+    if suffix == ".webp":
+        return "image/webp"
+    return "application/octet-stream"
 
 
 class _BlockHtmlParser(HTMLParser):
