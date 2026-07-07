@@ -646,17 +646,27 @@ def parse_image(path: Path) -> ParsedDocument:
             "Install them via: pip install -r requirements-ocr.txt"
         ) from exc
 
-    ocr = RapidOCR()
+    # P2: RapidOCR() 初始化失败（如 onnxruntime/模型缺失）也转换为 DocumentParseError
+    try:
+        ocr = RapidOCR()
+    except Exception as exc:
+        raise DocumentParseError(
+            f"RapidOCR initialization failed (check onnxruntime and model files): {exc}"
+        ) from exc
+
     blocks: list[ParsedBlock] = []
     warnings: list[str] = []
 
+    # P1: OCR 运行时失败应 raise，不产生空 chunks 的坏产物
     try:
         result = ocr(str(path), text_score=_RAPIDOCR_TEXT_SCORE)
         lines = _rapidocr_result_to_lines(result)
     except Exception as exc:
-        warnings.append(f"image_ocr_failed: {exc}")
-        lines = []
+        raise DocumentParseError(
+            f"OCR engine failed on {path.name}: {exc}"
+        ) from exc
 
+    # OCR 成功但无识别文本时，作为 low_quality 处理
     if lines:
         blocks.append(
             ParsedBlock(

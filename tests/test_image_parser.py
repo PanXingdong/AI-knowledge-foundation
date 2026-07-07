@@ -140,19 +140,18 @@ def test_parse_image_warns_when_no_text_extracted(tmp_path: Path):
 # parse_image — OCR runtime failure
 # ---------------------------------------------------------------------------
 
-def test_parse_image_warns_on_ocr_runtime_error(tmp_path: Path):
+def test_parse_image_raises_on_ocr_runtime_error(tmp_path: Path):
+    """P1: OCR 运行时失败应 raise DocumentParseError，不产生空 chunks 的坏产物。"""
     img_path = tmp_path / "corrupt.jpg"
     img_path.write_bytes(b"\xff\xd8\xff")
 
     with _mock_rapidocr(side_effect=RuntimeError("OCR engine crashed")):
-        result = parse_image(img_path)
-
-    assert result.blocks == []
-    assert any("image_ocr_failed" in w for w in result.warnings)
+        with pytest.raises(DocumentParseError, match="OCR engine failed"):
+            parse_image(img_path)
 
 
 # ---------------------------------------------------------------------------
-# parse_image — missing dependency
+# parse_image — missing dependency / init failure
 # ---------------------------------------------------------------------------
 
 def test_parse_image_raises_document_parse_error_when_rapidocr_missing(tmp_path: Path):
@@ -161,4 +160,19 @@ def test_parse_image_raises_document_parse_error_when_rapidocr_missing(tmp_path:
 
     with patch.dict("sys.modules", {"rapidocr": None}):
         with pytest.raises(DocumentParseError, match="rapidocr"):
+            parse_image(img_path)
+
+
+def test_parse_image_raises_on_rapidocr_init_failure(tmp_path: Path):
+    """P2: RapidOCR() 初始化失败（如 onnxruntime/模型缺失）应转换为 DocumentParseError。"""
+    img_path = tmp_path / "sample.png"
+    img_path.write_bytes(b"\x89PNG\r\n")
+
+    fake_rapidocr_module = MagicMock()
+    fake_rapidocr_module.RapidOCR = MagicMock(
+        side_effect=RuntimeError("onnxruntime model not found")
+    )
+
+    with patch.dict(sys.modules, {"rapidocr": fake_rapidocr_module}):
+        with pytest.raises(DocumentParseError, match="RapidOCR initialization failed"):
             parse_image(img_path)
