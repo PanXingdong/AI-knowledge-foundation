@@ -101,7 +101,17 @@ SUPPORTED_EXTENSIONS = {
     ".htm",
     ".pdf",
     ".docx",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".gif",
+    ".webp",
 }
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
 
 _MIN_TRUSTED_PDF_TEXT_CHARS = 40
 _MIN_CJK_CHARS_FOR_MOJIBAKE_CHECK = 20
@@ -129,6 +139,8 @@ def parse_document(path: Path) -> ParsedDocument:
         return parse_pdf(path)
     if suffix == ".docx":
         return parse_docx(path)
+    if suffix in _IMAGE_EXTENSIONS:
+        return parse_image(path)
     raise UnsupportedDocumentFormatError(
         f"Unsupported document format '{suffix}' for {path}. "
         f"Supported formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
@@ -615,6 +627,68 @@ def parse_docx(path: Path) -> ParsedDocument:
         quality_report=_build_generic_quality_report(
             blocks=blocks,
             source_format="docx",
+        ),
+    )
+
+
+def parse_image(path: Path) -> ParsedDocument:
+    """Parse an image file using RapidOCR to extract text content.
+
+    Supports PNG, JPG, JPEG, BMP, TIFF, GIF, WEBP formats.
+    Requires the optional dependencies in requirements-ocr.txt:
+      rapidocr, onnxruntime
+    """
+    try:
+        from rapidocr import RapidOCR
+    except ImportError as exc:
+        raise DocumentParseError(
+            "Image parsing requires optional dependencies 'rapidocr' and 'onnxruntime'. "
+            "Install them via: pip install -r requirements-ocr.txt"
+        ) from exc
+
+    # P2: RapidOCR() 初始化失败（如 onnxruntime/模型缺失）也转换为 DocumentParseError
+    try:
+        ocr = RapidOCR()
+    except Exception as exc:
+        raise DocumentParseError(
+            f"RapidOCR initialization failed (check onnxruntime and model files): {exc}"
+        ) from exc
+
+    blocks: list[ParsedBlock] = []
+    warnings: list[str] = []
+
+    # P1: OCR 运行时失败应 raise，不产生空 chunks 的坏产物
+    try:
+        result = ocr(str(path), text_score=_RAPIDOCR_TEXT_SCORE)
+        lines = _rapidocr_result_to_lines(result)
+    except Exception as exc:
+        raise DocumentParseError(
+            f"OCR engine failed on {path.name}: {exc}"
+        ) from exc
+
+    # OCR 成功但无识别文本时，作为 low_quality 处理
+    if lines:
+        blocks.append(
+            ParsedBlock(
+                block_type="paragraph",
+                text="\n".join(lines),
+                page_start=1,
+                page_end=1,
+                metadata={"ocr": True},
+            )
+        )
+    else:
+        warnings.append("no_ocr_text_extracted")
+
+    return ParsedDocument(
+        source_format="image",
+        parser_name="rapidocr",
+        page_count=1,
+        blocks=blocks,
+        warnings=warnings,
+        quality_report=_build_generic_quality_report(
+            blocks=blocks,
+            source_format="image",
         ),
     )
 
