@@ -58,6 +58,42 @@ def test_context_pack_api_returns_markdown_and_sections(tmp_path: Path):
     assert payload["sections"][0]["items"][0]["document_title"] == "架构"
 
 
+def test_remote_context_pack_api_returns_feishu_formatted_context(tmp_path: Path, monkeypatch):
+    processed_root = tmp_path / "processed"
+    source = tmp_path / "screen.md"
+    source.write_text(
+        "# Screen\n\nSCREEN_PROPERTY_FLAGS is used to read or set Screen object flags for QNX Screen.",
+        encoding="utf-8",
+    )
+    ingest_file(
+        file_path=source,
+        out_dir=processed_root,
+        title="Screen Guide",
+        source_type="guide",
+        owner="checker",
+        document_version="v1",
+    )
+    monkeypatch.setenv(
+        "KNOWLEDGE_BASES_JSON",
+        json.dumps({"knowledge_bases": {"qnx-main": {"processed_dir": str(processed_root)}}}),
+    )
+    monkeypatch.setenv("KNOWLEDGE_HUB_API_TOKEN", "local-dev-token")
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/api/knowledge-bases/qnx-main/context-pack",
+        json={"query": "SCREEN_PROPERTY_FLAGS 是什么？"},
+        headers={"Authorization": "Bearer local-dev-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["knowledge_base_id"] == "qnx-main"
+    assert payload["processed_dir"] == "knowledge-base:qnx-main"
+    assert payload["formatted_context"]
+    assert payload["markdown"].startswith("# Context Pack")
+
+
 def test_search_api_returns_ranked_results(tmp_path: Path):
     processed_root = tmp_path / "processed"
     architecture = tmp_path / "architecture.md"
