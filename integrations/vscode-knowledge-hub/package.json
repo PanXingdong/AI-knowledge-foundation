@@ -1,0 +1,103 @@
+{
+  "name": "vscode-knowledge-hub",
+  "displayName": "Knowledge Hub",
+  "description": "Ask a remote Knowledge Hub for Context Packs and synthesize answers with Copilot in VS Code.",
+  "version": "0.1.0",
+  "publisher": "agent-knowledge-hub",
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:knowledgeHub.ask",
+    "onCommand:knowledgeHub.traceEvidence",
+    "onCommand:knowledgeHub.selectModel"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "knowledgeHub.ask",
+        "title": "Ask Knowledge Hub"
+      },
+      {
+        "command": "knowledgeHub.traceEvidence",
+        "title": "Knowledge Hub: Trace Evidence"
+      },
+      {
+        "command": "knowledgeHub.selectModel",
+        "title": "Knowledge Hub: Select Copilot Model"
+      }
+    ],
+    "configuration": {
+      "title": "Knowledge Hub",
+      "properties": {
+        "knowledgeHub.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8787",
+          "description": "Base URL of the remote Knowledge Hub service."
+        },
+        "knowledgeHub.token": {
+          "type": "string",
+          "default": "",
+          "description": "Bearer token for remote Knowledge Hub endpoints when required."
+        },
+        "knowledgeHub.defaultKnowledgeBaseId": {
+          "type": "string",
+          "default": "qnx-main",
+          "description": "Default remote knowledge base id."
+        },
+        "knowledgeHub.defaultTaskType": {
+          "type": "string",
+          "default": "general_query",
+          "enum": [
+            "general_query",
+            "constraint_lookup",
+            "code_review",
+            "impact_analysis",
+            "test_design",
+            "api_usage"
+          ],
+          "description": "Default Context Pack task type."
+        },
+        "knowledgeHub.topK": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Number of chunks requested from Knowledge Hub."
+        },
+        "knowledgeHub.perDocumentLimit": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum chunks selected per document."
+        },
+        "knowledgeHub.showDebugInfo": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show remote API, model metadata, prompt token counts, and other request diagnostics in the Knowledge Hub output channel."
+        },
+        "knowledgeHub.showPromptPreview": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the prompt preview sent to Copilot when knowledgeHub.showDebugInfo is enabled."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "16.18.126",
+    "@types/vscode": "1.93.0",
+    "typescript": "4.9.5"
+  }
+}
