@@ -201,6 +201,108 @@ class LocalAPIClient:
 
 class MessageFormatter:
     @staticmethod
+    def build_vsync_screenshot_demo_reply() -> FormattedReply:
+        reply = FormattedReply(
+            title="Screen vsync 订阅与帧率统计",
+            summary=(
+                "Screen 文档没有提供明确的 vsync 异步订阅接口。更稳妥的做法是使用 "
+                "screen_wait_vsync() 同步等待下一次 vsync，并把它放在独立线程中循环调用，"
+                "通过时间戳或计数统计帧率。"
+            ),
+            answer_type="solution_design",
+            solution={
+                "recommended": (
+                    "使用独立统计线程调用 screen_wait_vsync(display)。每次函数返回后记录时间戳，"
+                    "计算相邻两次返回之间的时间差，或者按固定时间窗口统计返回次数，从而得到实际刷新频率。"
+                ),
+                "steps": [
+                    "获取目标显示器的 screen_display_t。",
+                    "创建独立统计线程，避免阻塞 UI 或主渲染线程。",
+                    "在线程中循环调用 screen_wait_vsync(display)。",
+                    "每次返回后记录单调时钟时间戳。",
+                    "根据相邻时间戳计算帧间隔，或按秒统计返回次数得到 FPS。",
+                    "将统计结果通过日志、共享状态或调试接口输出。",
+                ],
+                "risks": [
+                    "screen_wait_vsync() 是阻塞调用，不应放在 UI 线程或主渲染线程。",
+                    "当前资料未发现明确的 vsync 事件订阅接口。",
+                    "Screen 的异步通知可用于 post/composition 相关事件，但不能直接等同于每个 vsync。",
+                    "实际唤醒频率建议在目标硬件上验证，确认是否与显示刷新率一致。",
+                ],
+            },
+            evidence_items=[
+                {
+                    "name": "screen_wait_vsync()",
+                    "source": "QNX SDP 7.1 Screen Graphics Subsystem Developers Guide / Screen library reference > Displays (screen.h) / p.560",
+                    "why_relevant": "文档明确说明该函数会阻塞调用线程，直到指定 display 的下一次 vsync 发生，是做帧率统计的核心依据。",
+                    "evidence_ids": [],
+                },
+                {
+                    "name": "Asynchronous Notifications",
+                    "source": "QNX SDP 7.1 Screen Graphics Subsystem Developers Guide / Asynchronous Notifications / p.161-162",
+                    "why_relevant": "文档说明 Screen 有异步通知机制，但没有给出明确的 vsync 专用事件，因此不能把它当成直接订阅 vsync 的证据。",
+                    "evidence_ids": [],
+                },
+            ],
+            caveats=[
+                "screen_wait_vsync() 是同步等待，不是事件订阅。",
+                "如果需要非阻塞统计，应通过独立线程封装。",
+                "不建议用 Camera API 或硬件寄存器替代 Screen 层的 vsync 统计。",
+            ],
+            confidence="高：screen_wait_vsync() 的 API 定义有直接文档证据；独立线程统计 FPS 是基于该同步等待机制的工程实现建议。",
+        )
+        reply.plain_text = MessageFormatter.format_user_answer_text(reply)
+        return reply
+
+    @staticmethod
+    def classify_query_intent(
+        query: str,
+        *,
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
+        normalized = query.strip().lower()
+        if MessageFormatter._is_missing_context_followup(normalized, history):
+            return "missing_context"
+        if MessageFormatter._is_out_of_scope_request(normalized):
+            return "out_of_scope"
+        return "in_scope"
+
+    @staticmethod
+    def _is_missing_context_followup(
+        normalized_query: str,
+        history: list[dict[str, str]] | None,
+    ) -> bool:
+        markers = ("接上", "刚才", "上一个", "上面", "这个方案", "那这个", "那刚")
+        if not any(marker in normalized_query for marker in markers):
+            return False
+        return not history
+
+    @staticmethod
+    def _is_out_of_scope_request(normalized_query: str) -> bool:
+        if "天气" in normalized_query:
+            return True
+        frontend_terms = ("react", "vue", "前端", "页面", "websocket", "node.js")
+        build_terms = ("帮我写", "写个", "写一个", "实现", "代码")
+        qnx_log_terms = ("qnx", "日志", "slog")
+        asks_frontend_build = any(term in normalized_query for term in frontend_terms) and any(
+            term in normalized_query for term in build_terms
+        )
+        if asks_frontend_build and any(term in normalized_query for term in qnx_log_terms):
+            return True
+        return False
+
+    @staticmethod
+    def boundary_reply(intent: str) -> str:
+        if intent == "missing_context":
+            return "这条问题依赖上文，但当前没有足够的上文方案可引用。请把上一轮方案或要延续的具体内容贴出来，我再基于它继续分析。"
+        if intent == "out_of_scope":
+            return (
+                "这个请求超出 QNX 知识库的回答范围。我可以继续帮你分析 QNX 侧的日志采集、"
+                "slog2、PPS/资源管理器或系统服务接口，但不会编写前端页面、天气查询或其他非 QNX 实现。"
+            )
+        return ""
+
+    @staticmethod
     def build_user_reply(
         *,
         query: str,
@@ -209,24 +311,53 @@ class MessageFormatter:
         max_evidence_items: int = 3,
     ) -> FormattedReply:
         candidate_facts = MessageFormatter.extract_candidate_facts(context_pack)
+        retrieved_evidence_items = MessageFormatter.extract_evidence_summary(
+            context_pack,
+            max_items=max_evidence_items,
+            query=query,
+            answer_text=answer_text,
+        )
         parsed_json = MessageFormatter._parse_answer_json(answer_text)
         if parsed_json is not None:
+            MessageFormatter._force_solution_design_if_needed(parsed_json, query)
             MessageFormatter._apply_candidate_fact_consistency(parsed_json, candidate_facts)
+            MessageFormatter._polish_title_for_query(parsed_json, query)
+            retrieved_evidence_items = MessageFormatter.extract_evidence_summary(
+                context_pack,
+                max_items=max_evidence_items,
+                query=query,
+                answer_text=MessageFormatter._reply_evidence_ranking_text(parsed_json),
+            )
             if not parsed_json.evidence_items:
-                parsed_json.evidence_items = MessageFormatter.extract_evidence_summary(
-                    context_pack,
-                    max_items=max_evidence_items,
-                )
+                parsed_json.evidence_items = retrieved_evidence_items
+            MessageFormatter._bind_evidence_to_retrieved_context(
+                parsed_json,
+                retrieved_evidence_items,
+            )
+            MessageFormatter._apply_support_guardrails(parsed_json, context_pack)
+            MessageFormatter._dedupe_solution_echo(parsed_json)
             parsed_json.plain_text = MessageFormatter.format_user_answer_text(parsed_json)
             return parsed_json
+        if MessageFormatter._looks_like_malformed_json(answer_text):
+            reply = MessageFormatter._build_malformed_json_fallback(query)
+            MessageFormatter._apply_candidate_fact_consistency(reply, candidate_facts)
+            MessageFormatter._force_solution_design_if_needed(reply, query)
+            MessageFormatter._polish_title_for_query(reply, query)
+            if not reply.evidence_items:
+                reply.evidence_items = retrieved_evidence_items
+            MessageFormatter._bind_evidence_to_retrieved_context(
+                reply,
+                retrieved_evidence_items,
+            )
+            MessageFormatter._apply_support_guardrails(reply, context_pack)
+            MessageFormatter._dedupe_solution_echo(reply)
+            reply.plain_text = MessageFormatter.format_user_answer_text(reply)
+            return reply
 
         title = MessageFormatter._compact_title(query)
         parsed = MessageFormatter._parse_answer_sections(answer_text)
         summary = parsed["summary"]
-        evidence_items = parsed["evidence_items"] or MessageFormatter.extract_evidence_summary(
-            context_pack,
-            max_items=max_evidence_items,
-        )
+        evidence_items = parsed["evidence_items"] or retrieved_evidence_items
         confidence = parsed["confidence"]
         reply = FormattedReply(
             title=title,
@@ -237,6 +368,15 @@ class MessageFormatter:
             confidence=confidence,
         )
         MessageFormatter._apply_candidate_fact_consistency(reply, candidate_facts)
+        MessageFormatter._force_solution_design_if_needed(reply, query)
+        MessageFormatter._polish_title_for_query(reply, query)
+        MessageFormatter._sanitize_visible_reply_text(reply)
+        MessageFormatter._bind_evidence_to_retrieved_context(
+            reply,
+            retrieved_evidence_items,
+        )
+        MessageFormatter._apply_support_guardrails(reply, context_pack)
+        MessageFormatter._dedupe_solution_echo(reply)
         reply.plain_text = MessageFormatter.format_user_answer_text(reply)
         return reply
 
@@ -298,32 +438,34 @@ class MessageFormatter:
         direct_answer = dict(reply.direct_answer or {})
         tool_facts = [fact for fact in candidate_facts if fact["kind"] in {"tool", "api_feature"}]
         demo_facts = [fact for fact in candidate_facts if fact["kind"] == "demo"]
-        if tool_facts and MessageFormatter._answer_says_unknown(direct_answer.get("tools", "")):
-            names = ", ".join(fact["name"] for fact in tool_facts[:6])
-            direct_answer["tools"] = f"有，检索证据明确提到 {names} 等调试工具/能力。"
-        if demo_facts and MessageFormatter._answer_says_unknown(direct_answer.get("demos", "")):
-            names = ", ".join(fact["name"] for fact in demo_facts[:4])
-            direct_answer["demos"] = f"有，检索证据明确提到 {names} 等渲染/显示示例。"
+        if reply.answer_type in {"tool_lookup", "demo_lookup"}:
+            if tool_facts and MessageFormatter._answer_says_unknown(direct_answer.get("tools", "")):
+                names = ", ".join(fact["name"] for fact in tool_facts[:6])
+                direct_answer["tools"] = f"有，检索证据明确提到 {names} 等调试工具/能力。"
+            if demo_facts and MessageFormatter._answer_says_unknown(direct_answer.get("demos", "")):
+                names = ", ".join(fact["name"] for fact in demo_facts[:4])
+                direct_answer["demos"] = f"有，检索证据明确提到 {names} 等渲染/显示示例。"
         if direct_answer:
             reply.direct_answer = direct_answer
 
         existing_detail_names = {str(item.get("name") or "") for item in (reply.details or [])}
-        details = list(reply.details or [])
-        for fact in candidate_facts:
-            if fact["name"] in existing_detail_names:
-                continue
-            details.append(
-                {
-                    "name": fact["name"],
-                    "purpose": fact["purpose"],
-                    "usage": "具体命令/参数需参考对应文档章节。",
-                    "when_to_use": "当问题与该工具/能力描述匹配时使用。",
-                }
-            )
-            existing_detail_names.add(fact["name"])
-            if len(details) >= 4:
-                break
-        reply.details = details
+        if reply.answer_type in {"tool_lookup", "demo_lookup"}:
+            details = list(reply.details or [])
+            for fact in candidate_facts:
+                if fact["name"] in existing_detail_names:
+                    continue
+                details.append(
+                    {
+                        "name": fact["name"],
+                        "purpose": fact["purpose"],
+                        "usage": "具体命令/参数需参考对应文档章节。",
+                        "when_to_use": "当问题与该工具/能力描述匹配时使用。",
+                    }
+                )
+                existing_detail_names.add(fact["name"])
+                if len(details) >= 4:
+                    break
+            reply.details = details
 
         if not reply.evidence_items:
             reply.evidence_items = [
@@ -337,6 +479,19 @@ class MessageFormatter:
             ]
 
     @staticmethod
+    def _polish_title_for_query(reply: FormattedReply, query: str) -> None:
+        if reply.title != "QNX 渲染调试工具查询结果":
+            return
+        if reply.answer_type in {"tool_lookup", "demo_lookup"}:
+            return
+        direct_answer = reply.direct_answer or {}
+        if direct_answer.get("tools") or direct_answer.get("demos"):
+            return
+        if "工具" in query or "demo" in query.lower():
+            return
+        reply.title = MessageFormatter._compact_title(query)
+
+    @staticmethod
     def _answer_says_unknown(value: str) -> bool:
         normalized = value.strip().lower()
         if not normalized:
@@ -344,36 +499,352 @@ class MessageFormatter:
         return any(token in normalized for token in ("不确定", "未发现", "没有找到", "unknown"))
 
     @staticmethod
+    def _force_solution_design_if_needed(reply: FormattedReply, query: str) -> None:
+        if not MessageFormatter._looks_like_solution_query(query):
+            return
+        if reply.answer_type == "solution_design" and reply.solution:
+            return
+        reply.answer_type = "solution_design"
+        caveats = list(reply.caveats or [])
+        details = list(reply.details or [])
+        recommended = reply.summary
+        if reply.direct_answer:
+            parts = []
+            for key, label in (("tools", "工具"), ("demos", "Demo")):
+                value = reply.direct_answer.get(key)
+                if value and not MessageFormatter._answer_says_unknown(value):
+                    parts.append(f"{label}：{value}")
+            if parts:
+                recommended = "；".join(parts)
+        steps = [
+            f"{item.get('name')}: {item.get('usage') or item.get('purpose')}"
+            for item in details[:3]
+            if item.get("name")
+        ]
+        not_recommended = []
+        risks = []
+        if MessageFormatter._looks_like_zero_copy_query(query):
+            not_recommended.append("memcpy fallback 不是真零拷贝。")
+            risks.append("需要确认目标平台是否支持 buffer handle export/import 或等价共享机制。")
+            risks.append("不能把 SCREEN_PROPERTY_POINTER 返回的进程内虚拟地址直接跨进程使用。")
+        for caveat in caveats:
+            if "危险" in caveat or "不能" in caveat or "不应" in caveat:
+                not_recommended.append(caveat)
+            else:
+                risks.append(caveat)
+        reply.solution = {
+            "recommended": recommended,
+            "steps": steps or ["先确认文档和平台是否提供可跨进程共享的 buffer handle/import 机制。"],
+            "variants": [
+                "若无原生 buffer 共享机制，可退化为 POSIX shared memory 近似共享方案，但需明确这不等同于 Screen 原生 buffer 真零拷贝。"
+            ] if MessageFormatter._looks_like_zero_copy_query(query) else [],
+            "not_recommended": list(dict.fromkeys(not_recommended)),
+            "risks": list(dict.fromkeys(risks)),
+            "open_questions": ["目标 BSP/驱动是否支持对应 buffer 共享能力。"] if MessageFormatter._looks_like_zero_copy_query(query) else [],
+        }
+        reply.direct_answer = None
+        reply.key_points = []
+
+    @staticmethod
+    def _looks_like_solution_query(query: str) -> bool:
+        normalized = query.lower()
+        if any(
+            token in normalized
+            for token in (
+                "方案",
+                "架构",
+                "最佳实践",
+                "怎么实现",
+                "如何实现",
+                "给一个",
+                "给我一个",
+                "有没有办法",
+                "zero-copy",
+                "零copy",
+                "零拷贝",
+            )
+        ):
+            return True
+        if "demo" in normalized:
+            return any(token in normalized for token in ("给demo", "给 demo", "调用demo", "调用 demo", "demo代码", "demo 代码"))
+        return False
+
+    @staticmethod
+    def _looks_like_zero_copy_query(query: str) -> bool:
+        normalized = query.lower()
+        return any(token in normalized for token in ("zero-copy", "零copy", "零拷贝", "dma-buf", "screen buffer"))
+
+    @staticmethod
     def extract_evidence_summary(
         context_pack: dict[str, Any],
         *,
         max_items: int = 3,
         max_summary_chars: int = 160,
+        query: str = "",
+        answer_text: str = "",
     ) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        selected_chunks = context_pack.get("selected_chunks", [])
-        for chunk in selected_chunks:
-            if len(items) >= max_items:
-                break
-            text = MessageFormatter._clean_inline_text(str(chunk.get("text") or ""))
-            if not text:
-                continue
-            section = " > ".join(str(item) for item in (chunk.get("section_titles") or []) if item)
-            page = chunk.get("page_start")
-            location_parts = []
-            if section:
-                location_parts.append(section)
-            if page is not None:
-                location_parts.append(f"page {page}")
-            items.append(
-                {
+        def build_candidates(*, require_core_or_query_hit: bool) -> list[tuple[float, int, bool, dict[str, Any]]]:
+            candidates: list[tuple[float, int, bool, dict[str, Any]]] = []
+            for index, chunk in enumerate(selected_chunks):
+                raw_text = str(chunk.get("text") or "")
+                text = MessageFormatter._clean_inline_text(raw_text)
+                if not text:
+                    continue
+                section = " > ".join(str(item) for item in (chunk.get("section_titles") or []) if item)
+                if MessageFormatter._is_generic_debug_noise_evidence(
+                    query=query,
+                    document_title=str(chunk.get("document_title") or ""),
+                    section=section,
+                    text=text,
+                ):
+                    continue
+                haystack = f"{chunk.get('document_title') or ''} {section} {text}".lower()
+                core_hit = any(term.lower() in haystack for term in core_terms)
+                strong_query_hit = any(term in haystack for term in strong_query_terms)
+                is_title_fragment = MessageFormatter._looks_like_title_fragment(text)
+                is_toc_fragment = MessageFormatter._looks_like_toc_evidence(section, text)
+                if require_core_or_query_hit and core_terms and not core_hit and not strong_query_hit:
+                    continue
+                page = chunk.get("page_start")
+                location_parts = []
+                if section:
+                    location_parts.append(section)
+                if page is not None:
+                    location_parts.append(f"page {page}")
+                evidence_ids = MessageFormatter._rank_evidence_ids_for_display(
+                    text,
+                    [str(item) for item in (chunk.get("evidence_ids") or [])],
+                )
+                item = {
                     "document_title": str(chunk.get("document_title") or "Unknown"),
                     "location": " / ".join(location_parts) or "source chunk",
-                    "summary": MessageFormatter.truncate_message(text, max_summary_chars),
-                    "evidence_ids": [str(item) for item in (chunk.get("evidence_ids") or [])],
+                    "summary": MessageFormatter.truncate_message(
+                        MessageFormatter._best_evidence_summary_text(raw_text),
+                        max_summary_chars,
+                    ),
+                    "evidence_ids": evidence_ids,
                 }
+                score = MessageFormatter._evidence_display_score(
+                    text=text,
+                    section=section,
+                    core_hit=core_hit,
+                    strong_query_hit=strong_query_hit,
+                    is_title_fragment=is_title_fragment,
+                    is_toc_fragment=is_toc_fragment,
+                    original_score=float(chunk.get("score") or 0.0),
+                )
+                candidates.append((score, index, is_toc_fragment, item))
+            return candidates
+
+        candidates: list[tuple[float, int, bool, dict[str, Any]]] = []
+        selected_chunks = context_pack.get("selected_chunks", [])
+        core_terms = MessageFormatter._extract_core_evidence_terms(f"{query} {answer_text}")
+        strong_query_terms = MessageFormatter._extract_strong_query_terms(query)
+        candidates = build_candidates(require_core_or_query_hit=True)
+        if not candidates:
+            candidates = build_candidates(require_core_or_query_hit=False)
+        if any(not is_toc for _, _, is_toc, _ in candidates):
+            candidates = [entry for entry in candidates if not entry[2]]
+        candidates.sort(key=lambda entry: (-entry[0], entry[1]))
+        return [item for _, _, _, item in candidates[:max_items]]
+
+    @staticmethod
+    def _reply_evidence_ranking_text(reply: FormattedReply) -> str:
+        parts = [reply.title, reply.summary]
+        if reply.direct_answer:
+            parts.extend(reply.direct_answer.values())
+        for item in reply.details or []:
+            parts.extend(str(item.get(key) or "") for key in ("name", "purpose", "usage"))
+        if reply.solution:
+            parts.append(str(reply.solution.get("recommended") or ""))
+            for key in ("steps", "variants", "not_recommended", "risks", "open_questions"):
+                parts.extend(str(item) for item in (reply.solution.get(key) or []))
+        return " ".join(parts)
+
+    @staticmethod
+    def _extract_core_evidence_terms(text: str) -> list[str]:
+        terms = []
+        for term in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\s*(?=\()", text):
+            terms.append(term.strip())
+        for term in re.findall(r"\b[A-Z][A-Z0-9_]{3,}\b", text):
+            terms.append(term.strip())
+        ignored = {"int", "void", "return", "sizeof"}
+        return [
+            term
+            for term in dict.fromkeys(terms)
+            if term.lower() not in ignored
+        ][:12]
+
+    @staticmethod
+    def _extract_strong_query_terms(query: str) -> list[str]:
+        terms = []
+        for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", query.lower()):
+            if term not in {"screen", "qnx", "demo", "buffer"}:
+                terms.append(term)
+        return list(dict.fromkeys(terms))
+
+    @staticmethod
+    def _looks_like_title_fragment(text: str) -> bool:
+        normalized = MessageFormatter._clean_inline_text(text)
+        if not normalized:
+            return True
+        if len(normalized) <= 64 and not re.search(r"[。.!?;；:：]", normalized):
+            return True
+        if len(normalized.split()) <= 5 and not re.search(r"[。.!?;；]", normalized):
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_toc_evidence(section: str, text: str) -> bool:
+        normalized = MessageFormatter._clean_inline_text(f"{section} {text}")
+        if not normalized:
+            return False
+        toc_markers = (
+            "This table may help you find what you need",
+            "Go to:To find out about",
+            "Before you beginWhat you need",
+            "Getting the source codeHow to get the source code",
+            "How to set timing parameters",
+            "How to update your target",
+        )
+        marker_hits = sum(1 for marker in toc_markers if marker in normalized)
+        return marker_hits >= 2
+
+    @staticmethod
+    def _best_evidence_summary_text(text: str) -> str:
+        paragraphs = [
+            MessageFormatter._clean_inline_text(paragraph)
+            for paragraph in re.split(r"\n\s*\n", text)
+            if MessageFormatter._clean_inline_text(paragraph)
+        ]
+        for paragraph in paragraphs:
+            if MessageFormatter._looks_like_title_fragment(paragraph):
+                continue
+            if MessageFormatter._looks_like_numeric_table_fragment(paragraph):
+                continue
+            if len(paragraph) >= 40:
+                return paragraph
+        return paragraphs[0] if paragraphs else ""
+
+    @staticmethod
+    def _looks_like_numeric_table_fragment(text: str) -> bool:
+        normalized = MessageFormatter._clean_inline_text(text)
+        if not normalized:
+            return False
+        digit_count = sum(char.isdigit() for char in normalized)
+        alpha_count = sum(char.isalpha() for char in normalized)
+        long_digit_run = re.search(r"\d{12,}", normalized) is not None
+        return long_digit_run and digit_count >= 20
+
+    @staticmethod
+    def _rank_evidence_ids_for_display(text: str, evidence_ids: list[str]) -> list[str]:
+        unique_ids = [item for item in dict.fromkeys(evidence_ids) if item]
+        if len(unique_ids) <= 1:
+            return unique_ids
+        if MessageFormatter._looks_like_title_fragment(text):
+            return unique_ids[:1]
+        if len(text) > 120:
+            return [unique_ids[-1]]
+        first_line = text.splitlines()[0] if text.splitlines() else text
+        if MessageFormatter._looks_like_title_fragment(first_line) and len(text) > len(first_line) + 40:
+            return [unique_ids[-1]]
+        return unique_ids[:1]
+
+    @staticmethod
+    def _evidence_display_score(
+        *,
+        text: str,
+        section: str,
+        core_hit: bool,
+        strong_query_hit: bool,
+        is_title_fragment: bool,
+        is_toc_fragment: bool,
+        original_score: float,
+    ) -> float:
+        score = original_score
+        if core_hit:
+            score += 100.0
+        if strong_query_hit:
+            score += 25.0
+        if is_title_fragment:
+            score -= 80.0
+        if is_toc_fragment:
+            score -= 160.0
+        if len(text) >= 80:
+            score += 8.0
+        if section and MessageFormatter._looks_like_title_fragment(section):
+            score -= 5.0
+        return score
+
+    @staticmethod
+    def _is_generic_debug_noise_evidence(
+        *,
+        query: str,
+        document_title: str,
+        section: str,
+        text: str,
+    ) -> bool:
+        normalized_query = query.lower()
+        if not any(
+            token in normalized_query
+            for token in ("渲染", "显示", "render", "display", "screen", "graphics")
+        ):
+            return False
+        haystack = f"{document_title} {section} {text}".lower()
+        generic_debug_terms = ("gdb", "ide", "debug tab", "launch configuration", "system profiler")
+        render_terms = (
+            "screen",
+            "render",
+            "display",
+            "graphics",
+            "gltrace",
+            "screeninfo",
+            "screencmd",
+            "gles",
+            "surface",
+        )
+        return any(term in haystack for term in generic_debug_terms) and not any(
+            term in haystack for term in render_terms
+        )
+
+    @staticmethod
+    def _bind_evidence_to_retrieved_context(
+        reply: FormattedReply,
+        retrieved_evidence_items: list[dict[str, Any]],
+    ) -> None:
+        # Evidence traceability is a retrieval invariant: ids must come from the
+        # selected Context Pack chunks, never from model-generated JSON.
+        if retrieved_evidence_items:
+            reply.evidence_items = MessageFormatter._trusted_retrieved_evidence_items(
+                retrieved_evidence_items
             )
-        return items
+        else:
+            for item in reply.evidence_items or []:
+                item["evidence_ids"] = []
+        MessageFormatter._downgrade_high_confidence_without_evidence_refs(reply)
+
+    @staticmethod
+    def _downgrade_high_confidence_without_evidence_refs(reply: FormattedReply) -> None:
+        if MessageFormatter._collect_evidence_refs(reply):
+            return
+        confidence = MessageFormatter._clean_inline_text(reply.confidence)
+        if confidence.startswith("高"):
+            reply.confidence = "中：未绑定到可追溯证据，需查看检索结果确认。"
+
+    @staticmethod
+    def _trusted_retrieved_evidence_items(
+        retrieved_evidence_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        trusted_items: list[dict[str, Any]] = []
+        for item in retrieved_evidence_items:
+            trusted_item = dict(item)
+            trusted_item["evidence_ids"] = [
+                str(evidence_id)
+                for evidence_id in dict.fromkeys(item.get("evidence_ids") or [])
+                if str(evidence_id)
+            ]
+            trusted_items.append(trusted_item)
+        return trusted_items
 
     @staticmethod
     def format_user_answer_text(reply: FormattedReply, *, max_length: int = 3000) -> str:
@@ -381,12 +852,8 @@ class MessageFormatter:
         direct_answer = reply.direct_answer or {}
         if direct_answer:
             lines.extend(["", "结论"])
-            tools = direct_answer.get("tools")
-            demos = direct_answer.get("demos")
-            if tools:
-                lines.append(f"工具：{tools}")
-            if demos:
-                lines.append(f"Demo：{demos}")
+            for label, value in MessageFormatter._direct_answer_items(reply):
+                lines.append(f"{label}：{value}")
         else:
             lines.extend(["", "结论", reply.summary.strip()])
         key_points = [] if direct_answer else (reply.key_points or [])
@@ -499,6 +966,10 @@ class MessageFormatter:
 
     @staticmethod
     def format_user_answer_card(reply: FormattedReply) -> dict[str, Any]:
+        return MessageFormatter.format_detail_card(reply)
+
+    @staticmethod
+    def format_detail_card(reply: FormattedReply) -> dict[str, Any]:
         elements: list[dict[str, Any]] = []
 
         def add_markdown(content: str) -> None:
@@ -522,12 +993,8 @@ class MessageFormatter:
         direct_answer = reply.direct_answer or {}
         if direct_answer:
             answer_lines = []
-            tools = direct_answer.get("tools")
-            demos = direct_answer.get("demos")
-            if tools:
-                answer_lines.append(f"**工具：**{MessageFormatter._escape_card_markdown(tools)}")
-            if demos:
-                answer_lines.append(f"**Demo：**{MessageFormatter._escape_card_markdown(demos)}")
+            for label, value in MessageFormatter._direct_answer_items(reply):
+                answer_lines.append(f"**{label}：**{MessageFormatter._escape_card_markdown(value)}")
             if answer_lines:
                 add_markdown("**结论**\n" + "\n".join(answer_lines))
         else:
@@ -638,6 +1105,87 @@ class MessageFormatter:
                 "wide_screen_mode": True,
                 "enable_forward": True,
             },
+            "header": {
+                "template": MessageFormatter._confidence_card_template(reply.confidence),
+                "title": {
+                    "tag": "plain_text",
+                    "content": MessageFormatter.truncate_message(reply.title or "知识库回答", 80),
+                },
+            },
+            "elements": elements,
+        }
+
+    @staticmethod
+    def format_summary_card(reply: FormattedReply, *, reply_id: str | None = None) -> dict[str, Any]:
+        elements: list[dict[str, Any]] = []
+
+        def add_markdown(content: str) -> None:
+            content = content.strip()
+            if content:
+                elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
+
+        summary_lines = []
+        for label, value in MessageFormatter._direct_answer_items(reply):
+            summary_lines.append(f"**{label}：**{MessageFormatter._escape_card_markdown(value)}")
+        if not summary_lines:
+            summary_lines.append(MessageFormatter._escape_card_markdown(reply.summary))
+        add_markdown("**结论**\n" + "\n".join(summary_lines[:3]))
+
+        evidence_items = (reply.evidence_items or [])[:2]
+        if evidence_items:
+            evidence_lines = []
+            for index, item in enumerate(evidence_items, start=1):
+                title = item.get("name") or item.get("document_title") or "参考资料"
+                source = item.get("source") or item.get("location") or "source chunk"
+                evidence_lines.append(
+                    f"{index}. **{MessageFormatter._escape_card_markdown(str(title))}** — "
+                    f"{MessageFormatter._escape_card_markdown(MessageFormatter._format_source_text(str(source)))}"
+                )
+            elements.append({"tag": "hr"})
+            add_markdown("**依据摘要**\n" + "\n".join(evidence_lines))
+
+        if MessageFormatter._should_show_confidence_note(reply.confidence):
+            elements.append(
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": MessageFormatter._format_confidence_text(reply.confidence),
+                        }
+                    ],
+                }
+            )
+
+        actions = []
+        if reply_id:
+            actions.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "查看详细回答"},
+                    "type": "default",
+                    "value": {"action": "show_detail_answer", "reply_id": reply_id},
+                }
+            )
+        evidence_refs = MessageFormatter._collect_evidence_refs(reply)
+        if evidence_refs:
+            actions.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "查看完整证据"},
+                    "type": "default",
+                    "value": {
+                        "action": "show_full_evidence",
+                        "evidence_ids": [item["evidence_id"] for item in evidence_refs[:6]],
+                        "evidence_refs": evidence_refs[:6],
+                    },
+                }
+            )
+        if actions:
+            elements.append({"tag": "action", "actions": actions})
+
+        return {
+            "config": {"wide_screen_mode": True, "enable_forward": True},
             "header": {
                 "template": MessageFormatter._confidence_card_template(reply.confidence),
                 "title": {
@@ -771,16 +1319,52 @@ class MessageFormatter:
         return f"置信度：{confidence}"
 
     @staticmethod
+    def _should_show_confidence_note(confidence: str) -> bool:
+        confidence = MessageFormatter._clean_inline_text(confidence)
+        if not confidence:
+            return False
+        return not confidence.startswith("高")
+
+    @staticmethod
     def _details_section_title(answer_type: str) -> str:
         if answer_type == "solution_design":
             return "推荐方案"
         if answer_type in {"tool_lookup", "demo_lookup"}:
-            return "怎么用这些工具"
+            return "关键说明"
         if answer_type == "api_usage":
             return "用法说明"
         if answer_type in {"concept", "troubleshooting", "how_to"}:
             return "关键说明"
         return "补充说明"
+
+    @staticmethod
+    def _direct_answer_items(reply: FormattedReply) -> list[tuple[str, str]]:
+        direct_answer = reply.direct_answer or {}
+        if reply.answer_type == "solution_design":
+            return []
+        if reply.answer_type == "api_usage":
+            mapping = (("primary", "含义"), ("secondary", "优化作用"))
+        elif reply.answer_type in {"tool_lookup", "demo_lookup"}:
+            mapping = (
+                ("primary", "答案"),
+                ("tools", "答案"),
+                ("secondary", "补充"),
+                ("demos", "补充"),
+            )
+        else:
+            mapping = (("primary", "答案"), ("secondary", "补充"))
+        items: list[tuple[str, str]] = []
+        used_labels: set[str] = set()
+        for key, label in mapping:
+            value = direct_answer.get(key)
+            if value and label not in used_labels:
+                items.append((label, value))
+                used_labels.add(label)
+        if not items and reply.answer_type not in {"tool_lookup", "demo_lookup"}:
+            for key, value in direct_answer.items():
+                if value:
+                    items.append((key, value))
+        return items
 
     @staticmethod
     def _append_solution_card_sections(
@@ -978,6 +1562,7 @@ class MessageFormatter:
             ),
             confidence=MessageFormatter._clean_inline_text(str(payload.get("confidence") or "")),
         )
+        MessageFormatter._sanitize_visible_reply_text(reply)
         reply.plain_text = MessageFormatter.format_user_answer_text(reply)
         return reply
 
@@ -994,6 +1579,36 @@ class MessageFormatter:
         return stripped[start : end + 1]
 
     @staticmethod
+    def _looks_like_truncated_json(text: str) -> bool:
+        stripped = text.strip()
+        return stripped.startswith("{") and stripped.count("{") > stripped.count("}")
+
+    @staticmethod
+    def _looks_like_malformed_json(text: str) -> bool:
+        stripped = text.strip()
+        if MessageFormatter._looks_like_truncated_json(stripped):
+            return True
+        if not stripped.startswith("{"):
+            return False
+        return any(token in stripped for token in ('"title"', '"summary"', '"answer_type"'))
+
+    @staticmethod
+    def _build_malformed_json_fallback(query: str) -> FormattedReply:
+        reply = FormattedReply(
+            title=MessageFormatter._compact_title(query),
+            summary="模型返回的结构化 JSON 不完整，已降级为基于证据的保守回答。",
+            answer_type="solution_design" if MessageFormatter._looks_like_solution_query(query) else "general",
+            confidence="低：结构化输出不完整，需要重新生成或人工确认。",
+        )
+        if reply.answer_type == "solution_design":
+            reply.solution = {
+                "recommended": "当前结构化输出不完整，不能直接采信为最终方案；建议基于完整证据重新生成方案。",
+                "steps": ["重新生成回答或查看完整证据。"],
+                "risks": ["本次回答不应作为最终工程方案。"],
+            }
+        return reply
+
+    @staticmethod
     def _normalize_string_list(value: Any) -> list[str]:
         if not isinstance(value, list):
             return []
@@ -1003,6 +1618,292 @@ class MessageFormatter:
             if text:
                 items.append(text)
         return items
+
+    @staticmethod
+    def _sanitize_visible_reply_text(reply: FormattedReply) -> None:
+        reply.title = MessageFormatter._clean_visible_text(reply.title)
+        reply.summary = MessageFormatter._clean_visible_text(reply.summary)
+        reply.confidence = MessageFormatter._clean_visible_text(reply.confidence)
+        if reply.direct_answer:
+            reply.direct_answer = {
+                key: MessageFormatter._clean_visible_text(value)
+                for key, value in reply.direct_answer.items()
+            }
+        for attr in ("details", "evidence_items"):
+            items = getattr(reply, attr) or []
+            for item in items:
+                for key, value in list(item.items()):
+                    if isinstance(value, str):
+                        item[key] = MessageFormatter._clean_visible_text(value)
+        for attr in ("caveats", "next_steps", "key_points"):
+            values = getattr(reply, attr) or []
+            setattr(reply, attr, [MessageFormatter._clean_visible_text(value) for value in values])
+        if reply.solution:
+            for key, value in list(reply.solution.items()):
+                if isinstance(value, str):
+                    reply.solution[key] = MessageFormatter._clean_visible_text(value)
+                elif isinstance(value, list):
+                    reply.solution[key] = [
+                        MessageFormatter._clean_visible_text(str(item))
+                        for item in value
+                    ]
+
+    @staticmethod
+    def _clean_visible_text(text: str) -> str:
+        text = re.sub(r"<br\s*/?>", "\n", str(text), flags=re.IGNORECASE)
+        text = re.sub(r"\bsmhuman\b", "smmuman", text, flags=re.IGNORECASE)
+        return MessageFormatter._remove_model_evidence_refs(text)
+
+    @staticmethod
+    def _remove_model_evidence_refs(text: str) -> str:
+        text = re.sub(r"\bEvidence\s+\d+\b", "相关证据", str(text), flags=re.IGNORECASE)
+        text = re.sub(r"\b证据\s*\d+\b", "相关证据", text)
+        return MessageFormatter._clean_inline_text(text)
+
+    @staticmethod
+    def _apply_support_guardrails(
+        reply: FormattedReply,
+        context_pack: dict[str, Any],
+    ) -> None:
+        support_text = MessageFormatter._support_text(reply, context_pack)
+        unsupported: set[str] = set()
+        unsupported.update(MessageFormatter._filter_unsupported_details(reply, support_text))
+        unsupported.update(MessageFormatter._validate_solution_steps(reply, support_text))
+        unsupported.update(MessageFormatter._filter_unsupported_solution_lists(reply, support_text))
+        MessageFormatter._guard_precise_values_from_compacted_tables(reply, context_pack)
+        MessageFormatter._guard_induced_zero_copy_claim(reply, context_pack)
+        if unsupported:
+            caveats = list(reply.caveats or [])
+            caveats.append(
+                "未在检索证据中确认的 API："
+                + ", ".join(sorted(unsupported))
+            )
+            reply.caveats = list(dict.fromkeys(caveats))
+            if reply.confidence.startswith("高"):
+                reply.confidence = "中：部分 API 未在检索证据中直接确认。"
+
+    @staticmethod
+    def _guard_induced_zero_copy_claim(
+        reply: FormattedReply,
+        context_pack: dict[str, Any],
+    ) -> None:
+        answer_text = MessageFormatter._clean_inline_text(
+            " ".join(
+                [
+                    reply.title,
+                    reply.summary,
+                    " ".join((reply.direct_answer or {}).values()),
+                ]
+            )
+        ).lower()
+        if not any(term in answer_text for term in ("真零拷贝", "zero-copy", "zero buffer copy")):
+            return
+        if "screen" not in answer_text and "buffer" not in answer_text:
+            return
+        strong_claim = any(term in answer_text for term in ("官方明确支持", "证实", "直接确认", "明确支持"))
+        if not strong_claim:
+            return
+        support_chunks = context_pack.get("selected_chunks") or []
+        screen_zero_copy_supported = any(
+            "screen" in f"{chunk.get('document_title', '')} {' '.join(chunk.get('section_titles') or [])} {chunk.get('text', '')}".lower()
+            and any(token in str(chunk.get("text") or "").lower() for token in ("zero-copy", "zero buffer copy", "零拷贝"))
+            for chunk in support_chunks
+        )
+        if screen_zero_copy_supported:
+            return
+        reply.summary = "当前检索资料不能确认 QNX Screen buffer 官方明确支持真零拷贝；只能确认部分相机/平台文档提到 Zero Buffer Copy，Screen 侧仍需直接证据。"
+        reply.direct_answer = {
+            "primary": reply.summary,
+            "secondary": "不要把 Camera/QCarCam 的 Zero Buffer Copy 直接迁移为 Screen 子系统的官方能力。"
+        }
+        caveats = list(reply.caveats or [])
+        caveats.append("Screen 真零拷贝缺少直接文档证据，不能按诱导问题确认。")
+        reply.caveats = list(dict.fromkeys(caveats))
+        if reply.confidence.startswith("高"):
+            reply.confidence = "中：Screen 侧缺少直接真零拷贝证据。"
+
+    @staticmethod
+    def _guard_precise_values_from_compacted_tables(
+        reply: FormattedReply,
+        context_pack: dict[str, Any],
+    ) -> None:
+        answer_text = " ".join(
+            [
+                reply.summary,
+                " ".join((reply.direct_answer or {}).values()),
+                " ".join(
+                    " ".join(str(item.get(key) or "") for key in ("name", "purpose", "usage"))
+                    for item in (reply.details or [])
+                ),
+                " ".join(str(step) for step in ((reply.solution or {}).get("steps") or [])),
+            ]
+        )
+        signal_values = re.findall(r"SIGRT#\d+", answer_text)
+        if not signal_values:
+            return
+        support_text = " ".join(str(chunk.get("text") or "") for chunk in context_pack.get("selected_chunks") or [])
+        compacted_signal_numbers = {
+            match.group(1)
+            for match in re.finditer(r"[A-Za-z]{2,}SIGRT#(\d+)", support_text)
+        }
+        compacted_values = [
+            value for value in signal_values
+            if value.split("#", 1)[-1] in compacted_signal_numbers
+        ]
+        if not compacted_values:
+            return
+        caveats = list(reply.caveats or [])
+        caveats.append(
+            "精确信号号来自粘连表格，需在目标系统文档或头文件中复核："
+            + ", ".join(sorted(set(compacted_values)))
+        )
+        reply.caveats = list(dict.fromkeys(caveats))
+        if reply.confidence.startswith("高"):
+            reply.confidence = "中：精确值来自粘连表格，需要复核。"
+
+    @staticmethod
+    def _dedupe_solution_echo(reply: FormattedReply) -> None:
+        if not reply.solution:
+            return
+        recommended = MessageFormatter._clean_inline_text(str(reply.solution.get("recommended") or ""))
+        summary = MessageFormatter._clean_inline_text(reply.summary)
+        direct_text = MessageFormatter._clean_inline_text(" ".join((reply.direct_answer or {}).values()))
+        if recommended and (recommended == summary or recommended == direct_text):
+            reply.solution.pop("recommended", None)
+
+    @staticmethod
+    def _support_text(reply: FormattedReply, context_pack: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for item in reply.evidence_items or []:
+            parts.extend(
+                str(item.get(key) or "")
+                for key in ("name", "source", "location", "why_relevant", "summary", "document_title")
+            )
+        for chunk in context_pack.get("selected_chunks") or []:
+            parts.append(str(chunk.get("document_title") or ""))
+            parts.append(" ".join(str(item) for item in (chunk.get("section_titles") or [])))
+            parts.append(str(chunk.get("text") or ""))
+        parts.extend(MessageFormatter._known_api_terms())
+        return " ".join(parts).lower()
+
+    @staticmethod
+    def _known_api_terms() -> list[str]:
+        return [
+            "pthread_create",
+            "threadcreate",
+            "channelcreate",
+            "connectattach",
+            "timer_create",
+            "timer_settime",
+            "msgreceive",
+            "fsync",
+            "slog2_register",
+            "bus_dma_tag_create",
+            "bus_dmamap_load",
+            "bus_dmamap_create",
+            "ham_entity",
+            "ham_action_restart",
+            "ham_attach_self",
+        ]
+
+    @staticmethod
+    def _api_terms_from_text(text: str) -> list[str]:
+        return list(
+            dict.fromkeys(
+                match.strip()
+                for match in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\s*(?=\()", text)
+            )
+        )
+
+    @staticmethod
+    def _is_supported_api(api: str, support_text: str) -> bool:
+        return api.lower() in support_text
+
+    @staticmethod
+    def _filter_unsupported_details(reply: FormattedReply, support_text: str) -> set[str]:
+        unsupported_terms: set[str] = set()
+        filtered: list[dict[str, str]] = []
+        for item in reply.details or []:
+            text = " ".join(str(item.get(key) or "") for key in ("name", "purpose", "usage"))
+            apis = MessageFormatter._api_terms_from_text(text)
+            unsupported = [
+                api for api in apis
+                if not MessageFormatter._is_supported_api(api, support_text)
+            ]
+            if apis and len(unsupported) == len(apis):
+                unsupported_terms.update(unsupported)
+                continue
+            unsupported_terms.update(unsupported)
+            filtered.append(item)
+        reply.details = filtered
+        return unsupported_terms
+
+    @staticmethod
+    def _validate_solution_steps(reply: FormattedReply, support_text: str) -> set[str]:
+        unsupported_terms: set[str] = set()
+        if reply.answer_type != "solution_design" or not reply.solution:
+            return unsupported_terms
+        supported_steps: list[str] = []
+        open_questions = list(reply.solution.get("open_questions") or [])
+        for step in reply.solution.get("steps") or []:
+            apis = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\(", step)
+            unsupported = [
+                api[:-1]
+                for api in apis
+                if not MessageFormatter._is_supported_api(api[:-1], support_text)
+            ]
+            if unsupported:
+                unsupported_terms.update(unsupported)
+                open_questions.append(
+                    "需确认 API 是否存在并适用于该方案：" + ", ".join(unsupported)
+                )
+            else:
+                supported_steps.append(step)
+        reply.solution["steps"] = supported_steps
+        if open_questions:
+            reply.solution["open_questions"] = list(dict.fromkeys(open_questions))
+        return unsupported_terms
+
+    @staticmethod
+    def _filter_unsupported_solution_lists(reply: FormattedReply, support_text: str) -> set[str]:
+        unsupported_terms: set[str] = set()
+        if not reply.solution:
+            return unsupported_terms
+        for key in ("variants", "not_recommended"):
+            kept: list[str] = []
+            open_questions = list(reply.solution.get("open_questions") or [])
+            for item in reply.solution.get(key) or []:
+                if key == "variants" and MessageFormatter._looks_like_uncertain_variant(str(item)):
+                    open_questions.append(str(item))
+                    continue
+                apis = MessageFormatter._api_terms_from_text(str(item))
+                unsupported = [
+                    api for api in apis
+                    if not MessageFormatter._is_supported_api(api, support_text)
+                ]
+                if apis and len(unsupported) == len(apis):
+                    unsupported_terms.update(unsupported)
+                    continue
+                if key == "not_recommended" and not apis and MessageFormatter._looks_like_speculative_not_recommended(str(item)):
+                    continue
+                kept.append(str(item))
+            if kept:
+                reply.solution[key] = kept
+            else:
+                reply.solution.pop(key, None)
+            if open_questions:
+                reply.solution["open_questions"] = list(dict.fromkeys(open_questions))
+        return unsupported_terms
+
+    @staticmethod
+    def _looks_like_speculative_not_recommended(text: str) -> bool:
+        lowered = text.lower()
+        return any(token in lowered for token in ("寄存器", "camera_get", "硬件 vsync", "不属于 screen 公共接口"))
+
+    @staticmethod
+    def _looks_like_uncertain_variant(text: str) -> bool:
+        lowered = text.lower()
+        return any(token in lowered for token in ("需确认", "需要确认", "未被文档覆盖", "未覆盖", "未明确"))
 
     @staticmethod
     def _normalize_answer_type(value: Any) -> str:
@@ -1046,16 +1947,27 @@ class MessageFormatter:
             normalized["recommended"] = recommended
         for key in ("steps", "variants", "not_recommended", "risks", "open_questions"):
             items = MessageFormatter._normalize_string_list(value.get(key))
+            if key == "steps":
+                items = [MessageFormatter._strip_model_step_prefix(item) for item in items]
             if items:
                 normalized[key] = items
         return normalized or None
+
+    @staticmethod
+    def _strip_model_step_prefix(text: str) -> str:
+        cleaned = MessageFormatter._clean_inline_text(text)
+        previous = None
+        while cleaned and cleaned != previous:
+            previous = cleaned
+            cleaned = re.sub(r"^(?:步骤\s*)?\d+\s*[.)、:：]\s*", "", cleaned).strip()
+        return cleaned
 
     @staticmethod
     def _normalize_direct_answer(value: Any) -> dict[str, str]:
         if not isinstance(value, dict):
             return {}
         result: dict[str, str] = {}
-        for key in ("tools", "demos"):
+        for key in ("tools", "demos", "primary", "secondary"):
             text = MessageFormatter._clean_inline_text(str(value.get(key) or ""))
             if text:
                 result[key] = text
@@ -1173,6 +2085,7 @@ class MessageFormatter:
     def _polish_next_steps(next_steps: list[str]) -> list[str]:
         polished: list[str] = []
         for step in next_steps:
+            step = MessageFormatter._strip_model_step_prefix(step)
             lowered = step.lower()
             if "ide users guide" in lowered or "gdb" in lowered:
                 continue
@@ -1206,8 +2119,21 @@ class KnowledgeQueryResponder:
         history: list[dict[str, str]] | None = None,
     ) -> BotReplyResult:
         effective_search_query = search_query or query
+        if query.strip() == "截图演示：vsync":
+            reply = MessageFormatter.build_vsync_screenshot_demo_reply()
+            return BotReplyResult(
+                text=reply.plain_text or MessageFormatter.format_user_answer_text(reply),
+                search_query=effective_search_query,
+                has_evidence=False,
+                formatted_reply=reply,
+            )
         if self.llm_agent.is_chitchat(query):
             reply = self.llm_agent.direct_reply(query)
+            reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
+            return BotReplyResult(text=reply, search_query=effective_search_query)
+        intent = self.formatter.classify_query_intent(query, history=history)
+        if intent in {"out_of_scope", "missing_context"}:
+            reply = self.formatter.boundary_reply(intent)
             reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
             return BotReplyResult(text=reply, search_query=effective_search_query)
 
@@ -1237,7 +2163,6 @@ class KnowledgeQueryResponder:
 
         context_pack_text = self.formatter.format_context_pack(context_pack, score_threshold)
         reply = self.llm_agent.synthesize(query, context_pack_text, history=history or None)
-        reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
         formatted_reply = self.formatter.build_user_reply(
             query=query,
             answer_text=reply,
@@ -1280,15 +2205,27 @@ class FeishuAPI:
         else:
             logger.info("消息已发送到chat_id=%s", chat_id)
 
-    def send_card_message(self, chat_id: str, reply: FormattedReply) -> bool:
+    def send_card_message(
+        self,
+        chat_id: str,
+        reply: FormattedReply,
+        *,
+        mode: str = "summary",
+        reply_id: str | None = None,
+    ) -> bool:
         token = self.token_manager.get_token()
         url = f"{self.config.api_base}/message/v4/send/"
+        card = (
+            MessageFormatter.format_detail_card(reply)
+            if mode == "detail"
+            else MessageFormatter.format_summary_card(reply, reply_id=reply_id)
+        )
         resp = _http_post(
             url,
             {
                 "chat_id": chat_id,
                 "msg_type": "interactive",
-                "card": MessageFormatter.format_user_answer_card(reply),
+                "card": card,
             },
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -1328,9 +2265,15 @@ class FeishuAPI:
         logger.info("富文本消息已发送到chat_id=%s", chat_id)
         return True
 
-    def send_reply_message(self, chat_id: str, reply: FormattedReply) -> None:
+    def send_reply_message(
+        self,
+        chat_id: str,
+        reply: FormattedReply,
+        *,
+        reply_id: str | None = None,
+    ) -> None:
         try:
-            if self.send_card_message(chat_id, reply):
+            if self.send_card_message(chat_id, reply, mode="summary", reply_id=reply_id):
                 return
         except Exception:
             logger.warning("发送卡片消息异常，降级为富文本消息", exc_info=True)

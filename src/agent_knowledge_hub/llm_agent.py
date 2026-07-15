@@ -173,8 +173,10 @@ class LLMAgent:
             "{\n"
             '  "title": "问题简短标题",\n'
             '  "direct_answer": {\n'
-            '    "tools": "有/没有/不确定 + 一句话说明",\n'
-            '    "demos": "有/没有/不确定 + 一句话说明"\n'
+            '    "primary": "通用问题主答案；非工具/demo问题优先填写",\n'
+            '    "secondary": "通用问题补充答案；例如优化作用/限制",\n'
+            '    "tools": "仅工具查询时填写：有/没有/不确定 + 一句话说明",\n'
+            '    "demos": "仅 demo 查询时填写：有/没有/不确定 + 一句话说明"\n'
             "  },\n"
             '  "summary": "2-4行直接结论",\n'
             '  "answer_type": "tool_lookup | demo_lookup | how_to | concept | troubleshooting | api_usage | solution_design | general",\n'
@@ -200,7 +202,7 @@ class LLMAgent:
             '      "name": "工具/概念名，例如 Display Surface Dumps",\n'
             '      "source": "文档名 / 章节 / 页码",\n'
             '      "why_relevant": "为什么这条证据能回答用户问题",\n'
-            '      "evidence_ids": ["span_xxx"]\n'
+            '      "evidence_ids": []\n'
             "    }\n"
             "  ],\n"
             '  "caveats": ["可选：限制或缺口"],\n'
@@ -208,17 +210,17 @@ class LLMAgent:
             '  "confidence": "高/中/低：简短理由"\n'
             "}\n"
             "要求：\n"
-            "1. 先拆解用户问题。如果用户同时问工具和 demo，必须分别填写 direct_answer.tools 和 direct_answer.demos。\n"
+            "1. 先拆解用户问题。工具/demo 查询才填写 direct_answer.tools/demos；属性、API、概念、方案类问题使用 primary/secondary，不要硬套工具/Demo。\n"
             "2. title 用中性短标题，渲染显示调试类问题优先用“QNX 渲染调试工具查询结果”。\n"
             "3. summary 只写总览，不重复 direct_answer，不提 IDE/GDB/System Profiler 这类通用调试噪声。\n"
             "4. 根据问题选择 answer_type。工具/demo 查询用 tool_lookup/demo_lookup；概念解释用 concept；排障用 troubleshooting；API 用法用 api_usage。\n"
             "5. 当用户问方案、架构、最佳实践、怎么实现、给 demo、有没有办法时，优先选择 solution_design。\n"
-            "6. solution_design 要基于证据组合方案；如果文档没有现成方案，也要说明哪些是直接证据、哪些是推导。\n"
+            "6. solution_design 要填写 solution 字段；不要只回答“没有现成方案”。如果文档没有现成方案，也要基于 API、机制、限制和证据组合推荐方案，并说明哪些是直接证据、哪些是推导。\n"
             "7. zero-copy/dma-buf/screen buffer 方案必须区分：真零拷贝、共享内存/PMEM 近似方案、memcpy fallback；不要把 fallback 说成真零拷贝。\n"
             "8. details 是通用细节列表：工具问题写工具作用/用法/适用场景；概念问题写概念拆解；API 问题写 API/参数/注意事项。不要只列名字。\n"
             "9. key_points 最多 2 条；不要重复 evidence_items 或 details 中已经展示的内容。\n"
             "10. evidence_items 最多 2 条，只放强相关证据；不要把 IDE/GDB 通用调试配置作为渲染显示问题的主依据。\n"
-            "11. 不要在 summary 或 caveats 中展示 span id；span id 只放在 evidence_ids 字段。\n"
+            "11. 不要填写、猜测或复述 evidence_id；evidence_ids 必须始终写空数组 []，系统会从检索结果自动绑定真实可追溯 id。\n"
             "12. next_steps 必须和用户问题直接相关，不要推荐无关文档。\n"
             "13. 如果资料不足，如实说明缺口。\n"
             "14. confidence 必须填写。"
@@ -238,8 +240,11 @@ class LLMAgent:
                 temperature=self.synthesis_temperature,
             )
         except Exception:
-            logger.exception("LLM synthesis failed, falling back to raw evidence")
-            return context_pack_text  # show raw evidence if LLM fails
+            logger.exception("LLM synthesis failed, using safe fallback")
+            return (
+                "抱歉，本次模型生成失败。系统已检索到相关资料，"
+                "但未能安全生成结构化回答。请稍后重试，或查看完整证据。"
+            )
 
     def plan_query(self, query: str, intent: str = "") -> dict:
         """Optional LLM-backed query planning hook.
