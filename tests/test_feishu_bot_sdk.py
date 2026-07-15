@@ -173,6 +173,32 @@ class TestHandleMessageEvent:
 
 
 class TestHandleCardAction:
+    def test_show_detail_answer_action_uses_reply_cache(self, bot):
+        reply = FormattedReply(
+            title="详细回答",
+            summary="摘要",
+            answer_type="solution_design",
+            solution={"recommended": "推荐方案"},
+        )
+        bot._reply_cache["reply_1"] = (time.time(), reply)
+        event = SimpleNamespace(
+            chat_id="oc_chat",
+            action=SimpleNamespace(
+                value={
+                    "action": "show_detail_answer",
+                    "reply_id": "reply_1",
+                }
+            ),
+        )
+
+        bot._handle_card_action_event(event)
+
+        bot.feishu_api.send_card_message.assert_called_once_with(
+            "oc_chat",
+            reply,
+            mode="detail",
+        )
+
     def test_show_full_evidence_action_replies_with_trace_text(self, bot):
         event = SimpleNamespace(
             open_id="ou_user",
@@ -241,6 +267,34 @@ class TestHandleCardAction:
         assert "支撑：Screen 调试工具集 - 说明图形调试章节提供工具和方法" in text
         assert "Debugging graphics isn't easy" in text
         assert "证据 1" in text
+
+    def test_evidence_trace_formatter_filters_figure_fragments_and_dedupes_location(self, bot):
+        text = bot._format_evidence_traces(
+            [
+                {
+                    "document_title": "QNX Screen Guide",
+                    "page": 95,
+                    "section_titles": ["Resource Sharing", "Cloning", "Streams"],
+                    "text": "Figure 27: Stream sharing buffers",
+                },
+                {
+                    "document_title": "QNX Screen Guide",
+                    "page": 95,
+                    "section_titles": ["Resource Sharing", "Cloning", "Streams"],
+                    "text": "Figure 27: Stream sharing buffers",
+                },
+                {
+                    "document_title": "QNX Screen Guide",
+                    "page": 95,
+                    "section_titles": ["Resource Sharing", "Cloning", "Streams"],
+                    "text": "The producer can pass buffers to consumers through the stream.",
+                },
+            ]
+        )
+
+        assert "Figure 27" not in text
+        assert text.count("证据") == 2  # title + 1 evidence item
+        assert "producer can pass buffers" in text
 
     def test_ignores_unknown_card_action(self, bot):
         event = SimpleNamespace(

@@ -18,6 +18,7 @@ from typing import Any
 from agent_knowledge_hub.feishu_bot import (
     FeishuAPI,
     FeishuConfig,
+    FormattedReply,
     KnowledgeQueryResponder,
     LocalAPIClient,
     MessageFormatter,
@@ -41,6 +42,7 @@ class FeishuBotSDK:
     _MAX_HISTORY_TURNS = 3
     _MAX_MEMORY_KEYS = 1000
     _MEMORY_TTL_SECONDS = 6 * 60 * 60
+    _REPLY_CACHE_TTL_SECONDS = 6 * 60 * 60
 
     def __init__(self, config: FeishuConfig | None = None) -> None:
         self.config = config or FeishuConfig.from_env()
@@ -62,6 +64,7 @@ class FeishuBotSDK:
         self._last_query: dict[str, str] = {}
         self._last_seen: dict[str, float] = {}
         self._memory_lock = threading.Lock()
+        self._reply_cache: dict[str, tuple[float, FormattedReply]] = {}
 
     def run(self) -> None:
         try:
@@ -119,6 +122,9 @@ class FeishuBotSDK:
     def _handle_card_action_event(self, event: Any) -> None:
         try:
             value = self._extract_action_value(event)
+            if value.get("action") == "show_detail_answer":
+                self._handle_show_detail_answer(event, value)
+                return
             if value.get("action") != "show_full_evidence":
                 return
             evidence_refs = self._extract_evidence_refs(value)[:6]
@@ -146,6 +152,20 @@ class FeishuBotSDK:
             self.feishu_api.send_text_message(chat_id, self._format_evidence_traces(traces))
         except Exception:
             logger.exception("处理卡片按钮事件失败")
+
+    def _handle_show_detail_answer(self, event: Any, value: dict[str, Any]) -> None:
+        reply_id = str(value.get("reply_id") or "").strip()
+        if not reply_id:
+            return
+        chat_id = self._extract_action_chat_id(event)
+        if not chat_id:
+            logger.warning("详情回调缺少 chat_id，无法发送详细回答")
+            return
+        reply = self._get_cached_reply(reply_id)
+        if reply is None:
+            self.feishu_api.send_text_message(chat_id, "详细回答已过期，请重新提问。")
+            return
+        self.feishu_api.send_card_message(chat_id, reply, mode="detail")
 
     @staticmethod
     def _extract_action_value(event: Any) -> dict[str, Any]:
@@ -214,6 +234,19 @@ class FeishuBotSDK:
         ]
         if not useful_traces:
             useful_traces = traces
+        deduped_traces: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, object, str]] = set()
+        for trace in useful_traces:
+            key = (
+                str(trace.get("document_title") or ""),
+                trace.get("page"),
+                " > ".join(str(item) for item in (trace.get("section_titles") or []) if item),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped_traces.append(trace)
+        useful_traces = deduped_traces or useful_traces
         for index, trace in enumerate(useful_traces, start=1):
             title = str(trace.get("document_title") or "Unknown")
             evidence_ref = trace.get("_evidence_ref")
@@ -246,6 +279,8 @@ class FeishuBotSDK:
         if not normalized:
             return True
         if len(normalized) <= 30 and re.fullmatch(r"(?i)(chapter|section|part)\s+\d+", normalized):
+            return True
+        if re.fullmatch(r"(?i)(figure|fig\.|table)\s+\d+[:：].*", normalized):
             return True
         if len(normalized) <= 20 and not any(char in normalized for char in ".。,:：;；"):
             return True
@@ -355,7 +390,8 @@ class FeishuBotSDK:
             logger.info("步骤耗时: shared_pipeline=%.2fs", t2 - t1)
 
             if result.formatted_reply is not None:
-                self.feishu_api.send_reply_message(chat_id, result.formatted_reply)
+                reply_id = self._cache_reply(result.formatted_reply)
+                self.feishu_api.send_reply_message(chat_id, result.formatted_reply, reply_id=reply_id)
             else:
                 self.feishu_api.send_text_message(chat_id, result.text)
             self._update_history(memory_key, query, result.text)
@@ -371,6 +407,30 @@ class FeishuBotSDK:
             self._cleanup_memory_locked(now=time.time())
             self._last_seen[memory_key] = time.time()
             return list(self._history.get(memory_key, [])), self._last_query.get(memory_key)
+
+    def _cache_reply(self, reply: FormattedReply) -> str:
+        now = time.time()
+        self._cleanup_reply_cache(now=now)
+        raw = f"{reply.title}\n{reply.summary}\n{now}\n{id(reply)}"
+        import hashlib
+        reply_id = "reply_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+        self._reply_cache[reply_id] = (now, reply)
+        return reply_id
+
+    def _get_cached_reply(self, reply_id: str) -> FormattedReply | None:
+        now = time.time()
+        self._cleanup_reply_cache(now=now)
+        item = self._reply_cache.get(reply_id)
+        return item[1] if item else None
+
+    def _cleanup_reply_cache(self, *, now: float) -> None:
+        expired = [
+            key
+            for key, (created_at, _) in self._reply_cache.items()
+            if now - created_at > self._REPLY_CACHE_TTL_SECONDS
+        ]
+        for key in expired:
+            self._reply_cache.pop(key, None)
 
     def _set_last_query(self, memory_key: str, search_query: str) -> None:
         with self._memory_lock:
