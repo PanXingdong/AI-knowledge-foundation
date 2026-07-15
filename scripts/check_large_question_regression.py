@@ -28,7 +28,7 @@ def check_records(records: list[dict[str, Any]]) -> list[dict[str, str]]:
             violations.append(_violation(case_id, "traceability_failure", "evidence trace output contains a known failure marker"))
         if _has_double_numbered_step(combined_text):
             violations.append(_violation(case_id, "double_numbered_step", "solution steps contain model-generated numbering"))
-        if _title_fragment_ratio(record) > 0.5:
+        if _title_fragment_ratio(record) >= 0.5:
             violations.append(_violation(case_id, "title_fragment_evidence", "most evidence summaries look like title fragments"))
         if (record.get("parsed") or {}).get("answer_type") == "api_usage":
             for api in _core_api_terms_from_record(record):
@@ -61,11 +61,15 @@ def _looks_like_title_fragment(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
         return True
-    if len(normalized) > 80:
-        return False
     if re.search(r"[。.!?;；]", normalized):
         return False
-    return len(normalized.split()) <= 8
+    if len(normalized) > 48:
+        return False
+    if re.fullmatch(r"[A-Z0-9_./() -]{1,48}", normalized):
+        return True
+    if re.search(r"[\u4e00-\u9fff]", normalized):
+        return len(normalized) <= 12
+    return len(normalized.split()) <= 4
 
 
 def _core_api_terms_from_record(record: dict[str, Any]) -> list[str]:
@@ -80,11 +84,18 @@ def _core_api_terms(text: str) -> list[str]:
     terms = []
     terms.extend(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\s*(?=\()", text))
     terms.extend(re.findall(r"\b[A-Z][A-Z0-9_]{3,}\b", text))
-    ignored = {"int", "void", "return", "sizeof", "Demo", "main", "NULL"}
+    ignored = {
+        item.lower()
+        for item in (
+            "bool", "char", "const", "demo", "false", "int", "main", "null",
+            "return", "sizeof", "struct", "true", "uint32_t", "uint64_t", "void",
+            "clock_gettime",
+        )
+    }
     return [
         term
         for term in dict.fromkeys(term.strip() for term in terms)
-        if term and term not in ignored and term.lower() not in {"clock_gettime"}
+        if term and term.lower() not in ignored
     ][:20]
 
 
@@ -98,9 +109,16 @@ def _evidence_mentions_api(record: dict[str, Any], api: str) -> bool:
             for key in ("name", "source", "location", "why_relevant", "summary", "document_title")
         )
     haystack = "\n".join(haystack_parts).lower()
-    if api.upper().startswith("CACHE_") and "cache_*" in haystack:
+    if _wildcard_family_mentions(api, haystack):
         return True
     return api.lower() in haystack
+
+
+def _wildcard_family_mentions(api: str, haystack: str) -> bool:
+    if "_" not in api:
+        return False
+    family = api.split("_", 1)[0].lower()
+    return f"{family}_*" in haystack
 
 
 def _context_mentions_api(record: dict[str, Any], api: str) -> bool:
@@ -121,7 +139,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Check large-question regression output for known evidence quality failures.")
     parser.add_argument("json_path", type=Path)
     args = parser.parse_args(argv)
-    records = json.loads(args.json_path.read_text(encoding="utf-8"))
+    try:
+        records = json.loads(args.json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(json.dumps({"passed": False, "error": str(exc)}, ensure_ascii=False, indent=2))
+        return 2
     violations = check_records(records)
     if violations:
         print(json.dumps({"passed": False, "violations": violations}, ensure_ascii=False, indent=2))

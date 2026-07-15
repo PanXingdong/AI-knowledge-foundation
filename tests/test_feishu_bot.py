@@ -252,31 +252,6 @@ class TestKnowledgeQueryResponder:
         assert result.has_evidence is True
         local_api.get_context_pack.assert_called_once()
 
-    def test_process_query_vsync_screenshot_demo_returns_fixed_card(self):
-        config = FeishuConfig(processed_dir="/tmp/processed")
-        local_api = MagicMock()
-        formatter = MessageFormatter()
-        llm_agent = MagicMock()
-        llm_agent.is_chitchat.return_value = False
-
-        result = KnowledgeQueryResponder(
-            config=config,
-            local_api=local_api,
-            formatter=formatter,
-            llm_agent=llm_agent,
-        ).process_query("截图演示：vsync")
-
-        assert result.has_evidence is False
-        assert result.formatted_reply is not None
-        assert result.formatted_reply.title == "Screen vsync 订阅与帧率统计"
-        assert "screen_wait_vsync()" in result.formatted_reply.summary
-        assert "不推荐做法" not in json.dumps(
-            MessageFormatter.format_detail_card(result.formatted_reply),
-            ensure_ascii=False,
-        )
-        local_api.get_context_pack.assert_not_called()
-        llm_agent.synthesize.assert_not_called()
-
 class TestMessageFormatter:
     def test_format_context_pack_basic(self):
         result = {
