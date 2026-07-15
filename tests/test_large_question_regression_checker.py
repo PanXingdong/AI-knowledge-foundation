@@ -98,3 +98,65 @@ def test_checker_accepts_core_api_evidence_and_body_text():
     ]
 
     assert checker.check_records(records) == []
+
+
+def test_checker_flags_half_title_fragment_ratio():
+    checker = _load_checker_module()
+    records = [
+        {
+            "case_id": "A3",
+            "parsed": {
+                "evidence_items": [
+                    {"summary": "Window types"},
+                    {"summary": "This function creates a window object and returns a handle."},
+                ]
+            },
+        }
+    ]
+
+    violations = checker.check_records(records)
+
+    assert any(item["code"] == "title_fragment_evidence" for item in violations)
+
+
+def test_checker_does_not_treat_short_sentence_as_title_fragment():
+    checker = _load_checker_module()
+
+    assert checker._looks_like_title_fragment("Screen completes composition.") is False
+
+
+def test_checker_ignores_common_c_types_and_supports_wildcard_families():
+    checker = _load_checker_module()
+    record = {
+        "case_id": "B4",
+        "detail_card": "CACHE_FLUSH() and uint32_t are mentioned.",
+        "evidence": "证据 1: QNX Guide\n原文: CACHE_* macros control cache behavior.",
+        "parsed": {
+            "answer_type": "api_usage",
+            "details": [
+                {"name": "CACHE_FLUSH()"},
+                {"name": "uint32_t"},
+            ],
+            "evidence_items": [
+                {"summary": "CACHE_* macros control cache behavior."}
+            ],
+        },
+        "selected_chunks": [
+            {"text": "CACHE_* macros control cache behavior."}
+        ],
+    }
+
+    violations = checker.check_records([record])
+
+    assert violations == []
+
+
+def test_checker_main_handles_missing_file(capsys):
+    checker = _load_checker_module()
+
+    exit_code = checker.main(["missing-regression-file.json"])
+    output = capsys.readouterr().out
+
+    assert exit_code == 2
+    assert '"passed": false' in output
+    assert "missing-regression-file.json" in output

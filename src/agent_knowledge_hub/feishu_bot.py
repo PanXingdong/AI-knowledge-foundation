@@ -201,60 +201,6 @@ class LocalAPIClient:
 
 class MessageFormatter:
     @staticmethod
-    def build_vsync_screenshot_demo_reply() -> FormattedReply:
-        reply = FormattedReply(
-            title="Screen vsync 订阅与帧率统计",
-            summary=(
-                "Screen 文档没有提供明确的 vsync 异步订阅接口。更稳妥的做法是使用 "
-                "screen_wait_vsync() 同步等待下一次 vsync，并把它放在独立线程中循环调用，"
-                "通过时间戳或计数统计帧率。"
-            ),
-            answer_type="solution_design",
-            solution={
-                "recommended": (
-                    "使用独立统计线程调用 screen_wait_vsync(display)。每次函数返回后记录时间戳，"
-                    "计算相邻两次返回之间的时间差，或者按固定时间窗口统计返回次数，从而得到实际刷新频率。"
-                ),
-                "steps": [
-                    "获取目标显示器的 screen_display_t。",
-                    "创建独立统计线程，避免阻塞 UI 或主渲染线程。",
-                    "在线程中循环调用 screen_wait_vsync(display)。",
-                    "每次返回后记录单调时钟时间戳。",
-                    "根据相邻时间戳计算帧间隔，或按秒统计返回次数得到 FPS。",
-                    "将统计结果通过日志、共享状态或调试接口输出。",
-                ],
-                "risks": [
-                    "screen_wait_vsync() 是阻塞调用，不应放在 UI 线程或主渲染线程。",
-                    "当前资料未发现明确的 vsync 事件订阅接口。",
-                    "Screen 的异步通知可用于 post/composition 相关事件，但不能直接等同于每个 vsync。",
-                    "实际唤醒频率建议在目标硬件上验证，确认是否与显示刷新率一致。",
-                ],
-            },
-            evidence_items=[
-                {
-                    "name": "screen_wait_vsync()",
-                    "source": "QNX SDP 7.1 Screen Graphics Subsystem Developers Guide / Screen library reference > Displays (screen.h) / p.560",
-                    "why_relevant": "文档明确说明该函数会阻塞调用线程，直到指定 display 的下一次 vsync 发生，是做帧率统计的核心依据。",
-                    "evidence_ids": [],
-                },
-                {
-                    "name": "Asynchronous Notifications",
-                    "source": "QNX SDP 7.1 Screen Graphics Subsystem Developers Guide / Asynchronous Notifications / p.161-162",
-                    "why_relevant": "文档说明 Screen 有异步通知机制，但没有给出明确的 vsync 专用事件，因此不能把它当成直接订阅 vsync 的证据。",
-                    "evidence_ids": [],
-                },
-            ],
-            caveats=[
-                "screen_wait_vsync() 是同步等待，不是事件订阅。",
-                "如果需要非阻塞统计，应通过独立线程封装。",
-                "不建议用 Camera API 或硬件寄存器替代 Screen 层的 vsync 统计。",
-            ],
-            confidence="高：screen_wait_vsync() 的 API 定义有直接文档证据；独立线程统计 FPS 是基于该同步等待机制的工程实现建议。",
-        )
-        reply.plain_text = MessageFormatter.format_user_answer_text(reply)
-        return reply
-
-    @staticmethod
     def classify_query_intent(
         query: str,
         *,
@@ -2119,14 +2065,6 @@ class KnowledgeQueryResponder:
         history: list[dict[str, str]] | None = None,
     ) -> BotReplyResult:
         effective_search_query = search_query or query
-        if query.strip() == "截图演示：vsync":
-            reply = MessageFormatter.build_vsync_screenshot_demo_reply()
-            return BotReplyResult(
-                text=reply.plain_text or MessageFormatter.format_user_answer_text(reply),
-                search_query=effective_search_query,
-                has_evidence=False,
-                formatted_reply=reply,
-            )
         if self.llm_agent.is_chitchat(query):
             reply = self.llm_agent.direct_reply(query)
             reply = self.formatter.truncate_message(reply, self.config.max_reply_length)
