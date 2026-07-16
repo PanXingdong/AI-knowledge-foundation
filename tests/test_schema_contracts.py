@@ -122,3 +122,8 @@ def test_knowledge_release_schemas_match_supported_versions():
     assert manifest["properties"]["schema_version"]["const"] == (
         RELEASE_MANIFEST_SCHEMA_VERSION
     )
+    document_schema = manifest["$defs"]["document"]
+    assert "processing_record_sha256" in document_schema["required"]
+    assert document_schema["properties"]["processing_record_path"]["type"] == "string"
+    vector_schema = manifest["$defs"]["vector_index"]["properties"]
+    assert {"metadata_path", "metadata_sha256"} <= set(vector_schema)

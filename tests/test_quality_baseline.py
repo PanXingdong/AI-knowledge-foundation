@@ -2,6 +2,10 @@ import json
 from pathlib import Path
 
 from agent_knowledge_hub.pipeline import ingest_file
+from agent_knowledge_hub.processing_record import (
+    build_processing_record,
+    write_processing_record,
+)
 from agent_knowledge_hub.quality_baseline import build_quality_baseline
 from agent_knowledge_hub.release_manifest import create_candidate_release
 from agent_knowledge_hub.utils import file_sha256, write_json
@@ -77,11 +81,23 @@ def test_baseline_counts_chunk_only_when_all_evidence_references_exist(
         ),
         encoding="utf-8",
     )
-    manifest_payload = json.loads(
-        release.manifest_path.read_text(encoding="utf-8")
+    canonical_path = chunks_path.with_name("canonical-document.json")
+    canonical = json.loads(canonical_path.read_text(encoding="utf-8"))
+    processing_path = chunks_path.with_name("processing-record.json")
+    write_processing_record(
+        processing_path,
+        build_processing_record(
+            document_version_id=document.document_version_id,
+            source_file_hash=canonical["document_version"]["file_hash"],
+            parser_name=canonical["parse_report"]["parser_name"],
+            canonical_path=canonical_path,
+            chunks_path=chunks_path,
+        ),
     )
-    manifest_payload["documents"][0]["chunks_sha256"] = file_sha256(chunks_path)
-    write_json(release.manifest_path, manifest_payload)
+    release = create_candidate_release(
+        Path(release.processed_dir),
+        tmp_path / "mutated-releases",
+    )
 
     baseline = build_quality_baseline(release.manifest_path)
 

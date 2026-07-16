@@ -39,15 +39,12 @@ def build_processing_record(
 ) -> ProcessingRecord:
     canonical_sha256 = file_sha256(canonical_path)
     chunks_sha256 = file_sha256(chunks_path)
-    run_id = stable_id(
-        "run",
-        document_version_id,
-        source_file_hash,
-        parser_name,
-        CHUNKER_VERSION,
-        QUALITY_RULES_VERSION,
-        canonical_sha256,
-        chunks_sha256,
+    run_id = processing_run_id(
+        document_version_id=document_version_id,
+        source_file_hash=source_file_hash,
+        parser_name=parser_name,
+        canonical_sha256=canonical_sha256,
+        chunks_sha256=chunks_sha256,
     )
     return ProcessingRecord(
         schema_version=PROCESSING_RECORD_SCHEMA_VERSION,
@@ -63,6 +60,28 @@ def build_processing_record(
     )
 
 
+def processing_run_id(
+    *,
+    document_version_id: str,
+    source_file_hash: str,
+    parser_name: str,
+    canonical_sha256: str,
+    chunks_sha256: str,
+    chunker_version: str = CHUNKER_VERSION,
+    quality_rules_version: str = QUALITY_RULES_VERSION,
+) -> str:
+    return stable_id(
+        "run",
+        document_version_id,
+        source_file_hash,
+        parser_name,
+        chunker_version,
+        quality_rules_version,
+        canonical_sha256,
+        chunks_sha256,
+    )
+
+
 def load_or_infer_processing_record(version_dir: Path) -> ProcessingRecord:
     record_path = version_dir / "processing-record.json"
     canonical_path = version_dir / "canonical-document.json"
@@ -73,6 +92,37 @@ def load_or_infer_processing_record(version_dir: Path) -> ProcessingRecord:
             raise ValueError(f"canonical_hash_mismatch:{record.document_version_id}")
         if file_sha256(chunks_path) != record.chunks_sha256:
             raise ValueError(f"chunks_hash_mismatch:{record.document_version_id}")
+        payload = json.loads(canonical_path.read_text(encoding="utf-8"))
+        actual_document_version_id = str(
+            (payload.get("document_version") or {}).get("document_version_id") or ""
+        )
+        if record.schema_version != PROCESSING_RECORD_SCHEMA_VERSION:
+            raise ValueError(
+                f"processing_record_schema_mismatch:{record.document_version_id}"
+            )
+        if record.document_version_id != actual_document_version_id:
+            raise ValueError(
+                "processing_record_document_version_mismatch:"
+                f"{actual_document_version_id}"
+            )
+        if record.quality_rules_version != QUALITY_RULES_VERSION:
+            raise ValueError(
+                "processing_record_quality_rules_mismatch:"
+                f"{record.document_version_id}"
+            )
+        expected_run_id = processing_run_id(
+            document_version_id=record.document_version_id,
+            source_file_hash=record.source_file_hash,
+            parser_name=record.parser_name,
+            chunker_version=record.chunker_version,
+            quality_rules_version=record.quality_rules_version,
+            canonical_sha256=record.canonical_sha256,
+            chunks_sha256=record.chunks_sha256,
+        )
+        if record.processing_run_id != expected_run_id:
+            raise ValueError(
+                f"processing_record_run_id_mismatch:{record.document_version_id}"
+            )
         return record
     payload = json.loads(canonical_path.read_text(encoding="utf-8"))
     version = payload.get("document_version") or {}

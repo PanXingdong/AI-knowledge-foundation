@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from agent_knowledge_hub.processing_record import (
+    PROCESSING_RECORD_SCHEMA_VERSION,
     QUALITY_RULES_VERSION,
     load_or_infer_processing_record,
+    processing_run_id,
 )
 from agent_knowledge_hub.quality_contracts import build_quality_record
 from agent_knowledge_hub.utils import (
@@ -29,11 +31,12 @@ class ReleaseDocument:
     document_version_id: str
     canonical_path: str
     chunks_path: str
-    processing_record_path: str | None
+    processing_record_path: str
     quality_record_path: str
     canonical_sha256: str
     chunks_sha256: str
     quality_record_sha256: str
+    processing_record_sha256: str
     processing_run_id: str
     quality_status: str
     quality_score: float | None
@@ -95,16 +98,7 @@ def create_candidate_release(
         raise ValueError("Cannot create a release without documents")
 
     documents = tuple(item[0] for item in drafts)
-    release_id = stable_id(
-        "release",
-        RELEASE_MANIFEST_SCHEMA_VERSION,
-        QUALITY_RULES_VERSION,
-        *[
-            f"{item.document_version_id}:{item.canonical_sha256}:"
-            f"{item.chunks_sha256}:{item.quality_record_sha256}"
-            for item in documents
-        ],
-    )
+    release_id = _compute_release_id(documents, QUALITY_RULES_VERSION)
     manifest_path = releases_root / release_id / "release-manifest.json"
     if manifest_path.exists():
         return _load_matching_existing_release(
@@ -113,11 +107,16 @@ def create_candidate_release(
             documents,
         )
 
-    for document, derived_quality in drafts:
+    for document, derived_quality, derived_processing in drafts:
         if derived_quality is not None:
             write_json(
                 manifest_path.parent / document.quality_record_path,
                 derived_quality,
+            )
+        if derived_processing is not None:
+            write_json(
+                manifest_path.parent / document.processing_record_path,
+                derived_processing,
             )
 
     manifest = ReleaseManifest(
@@ -161,6 +160,15 @@ def finalize_release(
     baseline_path: Path,
 ) -> ReleaseManifest:
     manifest = load_release_manifest(manifest_path)
+    if manifest.status == "ready":
+        return _finalize_ready_idempotently(
+            manifest,
+            fts_index_path=fts_index_path,
+            vector_index_path=vector_index_path,
+            baseline_path=baseline_path,
+        )
+    if manifest.status != "candidate":
+        raise ValueError("release_not_candidate")
     errors = validate_release_artifacts(manifest.manifest_path)
     if errors:
         raise ValueError(";".join(errors))
@@ -200,6 +208,27 @@ def finalize_release(
     if baseline_payload.get("release_id") != manifest.release_id:
         raise ValueError("baseline_release_mismatch")
 
+    vector_binding = {
+        "path": vector_relative,
+        "sha256": file_sha256(vector_path),
+    }
+    if vector_path.suffix.lower() == ".npz":
+        from agent_knowledge_hub.vector_index import bge_metadata_path
+
+        metadata_path, metadata_relative = _release_relative_artifact(
+            release_root,
+            bge_metadata_path(vector_path),
+            "vector_metadata",
+        )
+        if not metadata_path.is_file():
+            raise ValueError("vector_metadata_artifact_missing")
+        vector_binding.update(
+            {
+                "metadata_path": metadata_relative,
+                "metadata_sha256": file_sha256(metadata_path),
+            }
+        )
+
     ready = replace(
         manifest,
         status="ready",
@@ -208,10 +237,7 @@ def finalize_release(
                 "path": fts_relative,
                 "sha256": file_sha256(fts_path),
             },
-            "vector": {
-                "path": vector_relative,
-                "sha256": file_sha256(vector_path),
-            },
+            "vector": vector_binding,
         },
         baseline={
             "path": baseline_relative,
@@ -309,34 +335,41 @@ def validate_release_artifacts(manifest_path: Path) -> list[str]:
     release_root = manifest.manifest_path.parent.resolve()
     errors: list[str] = []
     for document in manifest.documents:
-        if document.processing_record_path is not None:
-            try:
-                processing_path = _resolve_relative(
-                    processed_root,
-                    document.processing_record_path,
-                    "processing_record_path_outside_processed_dir",
-                    document.document_version_id,
+        processing_is_derived = _is_derived_processing_path(
+            document.processing_record_path,
+            document.document_version_id,
+        )
+        try:
+            processing_path = _resolve_relative(
+                release_root if processing_is_derived else processed_root,
+                document.processing_record_path,
+                "processing_record_path_outside_"
+                + ("release_dir" if processing_is_derived else "processed_dir"),
+                document.document_version_id,
+            )
+        except ValueError as error:
+            errors.append(str(error))
+        else:
+            if not processing_path.is_file():
+                errors.append(
+                    "processing_record_artifact_missing:"
+                    f"{document.document_version_id}"
                 )
-            except ValueError as error:
-                errors.append(str(error))
+            elif file_sha256(processing_path) != document.processing_record_sha256:
+                errors.append(
+                    f"processing_record_hash_mismatch:{document.document_version_id}"
+                )
             else:
-                if not processing_path.is_file():
-                    errors.append(
-                        "processing_record_artifact_missing:"
-                        f"{document.document_version_id}"
-                    )
-                else:
-                    processing_payload = json.loads(
-                        processing_path.read_text(encoding="utf-8")
-                    )
-                    if (
-                        str(processing_payload.get("document_version_id") or "")
-                        != document.document_version_id
-                    ):
-                        errors.append(
-                            "processing_record_document_version_mismatch:"
-                            f"{document.document_version_id}"
-                        )
+                processing_payload = json.loads(
+                    processing_path.read_text(encoding="utf-8")
+                )
+                processing_error = _validate_processing_payload(
+                    processing_payload,
+                    document,
+                    manifest.quality_rules_version,
+                )
+                if processing_error:
+                    errors.append(processing_error)
         quality_is_derived = _is_derived_quality_path(
             document.quality_record_path,
             document.document_version_id,
@@ -405,6 +438,12 @@ def validate_release_artifacts(manifest_path: Path) -> list[str]:
                         "quality_record_document_version_mismatch:"
                         f"{document.document_version_id}"
                     )
+    if (
+        not errors
+        and _compute_release_id(manifest.documents, manifest.quality_rules_version)
+        != manifest.release_id
+    ):
+        errors.append("release_id_mismatch")
     return errors
 
 
@@ -412,7 +451,7 @@ def _release_document(
     processed_root: Path,
     chunks_path: Path,
     canonical: dict[str, Any],
-) -> tuple[ReleaseDocument, dict[str, Any] | None]:
+) -> tuple[ReleaseDocument, dict[str, Any] | None, dict[str, Any] | None]:
     version_dir = chunks_path.parent
     canonical_path = version_dir / "canonical-document.json"
     document_version_id = _canonical_document_version_id(canonical)
@@ -458,26 +497,34 @@ def _release_document(
         else None
     )
     processing_path = version_dir / "processing-record.json"
+    derived_processing: dict[str, Any] | None = None
+    if processing_path.exists():
+        processing_record_path = processing_path.relative_to(processed_root).as_posix()
+        processing_record_hash = file_sha256(processing_path)
+    else:
+        derived_processing = processing_record.to_dict()
+        processing_record_path = (
+            f"derived-processing/{processing_record.document_version_id}.json"
+        )
+        processing_record_hash = sha256_bytes(_json_content(derived_processing))
     return (
         ReleaseDocument(
             document_id=str(document.get("document_id") or ""),
             document_version_id=document_version_id,
             canonical_path=canonical_path.relative_to(processed_root).as_posix(),
             chunks_path=chunks_path.relative_to(processed_root).as_posix(),
-            processing_record_path=(
-                processing_path.relative_to(processed_root).as_posix()
-                if processing_path.exists()
-                else None
-            ),
+            processing_record_path=processing_record_path,
             quality_record_path=quality_record_path,
             canonical_sha256=processing_record.canonical_sha256,
             chunks_sha256=processing_record.chunks_sha256,
             quality_record_sha256=quality_hash,
+            processing_record_sha256=processing_record_hash,
             processing_run_id=processing_record.processing_run_id,
             quality_status=str(status),
             quality_score=quality_score,
         ),
         derived_quality,
+        derived_processing,
     )
 
 
@@ -604,6 +651,19 @@ def _validate_bound_release(manifest: ReleaseManifest) -> None:
         if file_sha256(path) != binding.get("sha256"):
             raise ValueError(f"{name}_hash_mismatch")
 
+    vector_binding = manifest.indexes["vector"]
+    if vector_path.suffix.lower() == ".npz":
+        try:
+            metadata_path = _resolve_release_binding_path(
+                manifest, vector_binding["metadata_path"], "vector_metadata"
+            )
+        except KeyError as error:
+            raise ValueError("release_artifact_binding_missing") from error
+        if not metadata_path.is_file():
+            raise ValueError("vector_metadata_artifact_missing")
+        if file_sha256(metadata_path) != vector_binding.get("metadata_sha256"):
+            raise ValueError("vector_metadata_hash_mismatch")
+
     from agent_knowledge_hub.fts_index import read_fts_release_id
     from agent_knowledge_hub.vector_index import read_vector_release_id
 
@@ -632,6 +692,86 @@ def _is_derived_quality_path(path: str, document_version_id: str) -> bool:
     )
 
 
+def _is_derived_processing_path(path: str, document_version_id: str) -> bool:
+    return Path(path).parts == (
+        "derived-processing",
+        f"{document_version_id}.json",
+    )
+
+
+def _validate_processing_payload(
+    payload: dict[str, Any],
+    document: ReleaseDocument,
+    quality_rules_version: str,
+) -> str | None:
+    document_version_id = document.document_version_id
+    checks = (
+        ("schema", payload.get("schema_version"), PROCESSING_RECORD_SCHEMA_VERSION),
+        ("document_version", payload.get("document_version_id"), document_version_id),
+        ("run_id", payload.get("processing_run_id"), document.processing_run_id),
+        ("quality_rules", payload.get("quality_rules_version"), quality_rules_version),
+        ("canonical", payload.get("canonical_sha256"), document.canonical_sha256),
+        ("chunks", payload.get("chunks_sha256"), document.chunks_sha256),
+    )
+    for name, actual, expected in checks:
+        if str(actual or "") != expected:
+            return f"processing_record_{name}_mismatch:{document_version_id}"
+    expected_run_id = processing_run_id(
+        document_version_id=str(payload.get("document_version_id") or ""),
+        source_file_hash=str(payload.get("source_file_hash") or ""),
+        parser_name=str(payload.get("parser_name") or ""),
+        chunker_version=str(payload.get("chunker_version") or ""),
+        quality_rules_version=str(payload.get("quality_rules_version") or ""),
+        canonical_sha256=str(payload.get("canonical_sha256") or ""),
+        chunks_sha256=str(payload.get("chunks_sha256") or ""),
+    )
+    if expected_run_id != document.processing_run_id:
+        return f"processing_record_run_id_mismatch:{document_version_id}"
+    return None
+
+
+def _resolve_release_binding_path(
+    manifest: ReleaseManifest,
+    relative_path: str,
+    name: str,
+) -> Path:
+    resolved, _ = _release_relative_artifact(
+        manifest.manifest_path.parent.resolve(),
+        manifest.manifest_path.parent / relative_path,
+        name,
+    )
+    return resolved
+
+
+def _finalize_ready_idempotently(
+    manifest: ReleaseManifest,
+    *,
+    fts_index_path: Path,
+    vector_index_path: Path,
+    baseline_path: Path,
+) -> ReleaseManifest:
+    try:
+        expected_paths = (
+            manifest.resolve_artifact("fts"),
+            manifest.resolve_artifact("vector"),
+            _resolve_release_binding_path(
+                manifest, (manifest.baseline or {})["path"], "baseline"
+            ),
+        )
+        requested_paths = tuple(
+            Path(path).resolve()
+            for path in (fts_index_path, vector_index_path, baseline_path)
+        )
+        if requested_paths != expected_paths:
+            raise ValueError("release_already_ready")
+        _validate_bound_release(manifest)
+    except ValueError as error:
+        if str(error) == "release_already_ready":
+            raise
+        raise ValueError("release_already_ready") from error
+    return manifest
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [
         json.loads(line)
@@ -654,3 +794,20 @@ def _json_content(payload: dict[str, Any]) -> bytes:
         sort_keys=True,
     )
     return text.replace("\n", os.linesep).encode("utf-8")
+
+
+def _compute_release_id(
+    documents: tuple[ReleaseDocument, ...],
+    quality_rules_version: str,
+) -> str:
+    return stable_id(
+        "release",
+        RELEASE_MANIFEST_SCHEMA_VERSION,
+        quality_rules_version,
+        *[
+            f"{item.document_version_id}:{item.canonical_sha256}:"
+            f"{item.chunks_sha256}:{item.quality_record_sha256}:"
+            f"{item.processing_run_id}:{item.processing_record_sha256}"
+            for item in documents
+        ],
+    )

@@ -331,6 +331,7 @@ def build_bge_m3_vector_index_resumable(
     manifest_path = resolved_work_dir / "manifest.json"
     manifest = {
         "schema_version": "bge-m3-vector-parts.v1",
+        "embedding_strategy": BGE_M3_EMBEDDING_STRATEGY,
         "processed_dir": str(processed_root),
         "index_path": str(resolved_index_path),
         "model_path": str(resolved_model_path),
@@ -340,21 +341,39 @@ def build_bge_m3_vector_index_resumable(
         "release_id": release_id,
         "input_fingerprint": input_fingerprint,
     }
+    expected_part_dimension: int | None = None
     if manifest_path.exists():
         try:
             existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, TypeError, json.JSONDecodeError) as error:
             raise VectorIndexError("resumable_work_dir_input_mismatch") from error
-        if (
-            existing_manifest.get("release_id") != release_id
-            or existing_manifest.get("input_fingerprint") != input_fingerprint
+        identity_fields = (
+            "embedding_strategy",
+            "model_path",
+            "max_length",
+            "batch_size",
+            "release_id",
+            "input_fingerprint",
+        )
+        if any(
+            existing_manifest.get(field) != manifest.get(field)
+            for field in identity_fields
         ):
             raise VectorIndexError("resumable_work_dir_input_mismatch")
+        raw_dimension = existing_manifest.get("dimension")
+        expected_part_dimension = int(raw_dimension) if raw_dimension is not None else None
     else:
         write_json(manifest_path, manifest)
 
-    model = _load_bge_m3_model(resolved_model_path)
     total = len(texts)
+    _validate_resumable_parts(
+        work_dir=resolved_work_dir,
+        total=total,
+        batch_size=batch_size,
+        require_all=False,
+        expected_dimension=expected_part_dimension,
+    )
+    model = _load_bge_m3_model(resolved_model_path)
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
         part_path = resolved_work_dir / f"part_{start:08d}_{end:08d}.npy"
@@ -377,13 +396,16 @@ def build_bge_m3_vector_index_resumable(
         if progress_callback is not None:
             progress_callback(end, total, skipped)
 
-    parts = []
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        part_path = resolved_work_dir / f"part_{start:08d}_{end:08d}.npy"
-        if not part_path.exists():
-            raise FileNotFoundError(f"Missing BGE-M3 vector part: {part_path}")
-        parts.append(np.load(part_path).astype("float32", copy=False))
+    parts = _validate_resumable_parts(
+        work_dir=resolved_work_dir,
+        total=total,
+        batch_size=batch_size,
+        require_all=True,
+        expected_dimension=expected_part_dimension,
+    )
+    actual_dimension = int(parts[0].shape[1])
+    if expected_part_dimension is None:
+        write_json(manifest_path, {**manifest, "dimension": actual_dimension})
     vectors = np.vstack(parts).astype("float32", copy=False)
 
     resolved_index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -418,6 +440,43 @@ def build_bge_m3_vector_index_resumable(
     return summary
 
 
+def _validate_resumable_parts(
+    *,
+    work_dir: Path,
+    total: int,
+    batch_size: int,
+    require_all: bool,
+    expected_dimension: int | None = None,
+) -> list[Any]:
+    import numpy as np
+
+    parts = []
+    resolved_dimension = expected_dimension
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        part_path = work_dir / f"part_{start:08d}_{end:08d}.npy"
+        if not part_path.exists():
+            if require_all:
+                raise VectorIndexError("resumable_part_invalid")
+            continue
+        try:
+            part = np.load(part_path).astype("float32", copy=False)
+        except (OSError, TypeError, ValueError) as error:
+            raise VectorIndexError("resumable_part_invalid") from error
+        if (
+            part.ndim != 2
+            or int(part.shape[0]) != end - start
+            or int(part.shape[1]) <= 0
+        ):
+            raise VectorIndexError("resumable_part_invalid")
+        if resolved_dimension is None:
+            resolved_dimension = int(part.shape[1])
+        elif int(part.shape[1]) != resolved_dimension:
+            raise VectorIndexError("resumable_part_invalid")
+        parts.append(part)
+    return parts
+
+
 def read_vector_release_id(index_path: Path | str) -> str | None:
     resolved = Path(index_path).resolve()
     payload_path = (
@@ -428,6 +487,11 @@ def read_vector_release_id(index_path: Path | str) -> str | None:
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
     value = payload.get("release_id")
     return str(value) if value else None
+
+
+def bge_metadata_path(index_path: Path | str) -> Path:
+    """Return the canonical metadata sidecar path for a BGE matrix."""
+    return _bge_metadata_path(Path(index_path).resolve())
 
 
 def query_vector_index(

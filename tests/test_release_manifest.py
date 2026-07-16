@@ -17,7 +17,10 @@ from agent_knowledge_hub.release_manifest import (
     validate_release_artifacts,
 )
 from agent_knowledge_hub.utils import file_sha256, write_json
-from agent_knowledge_hub.vector_index import build_vector_index
+from agent_knowledge_hub.vector_index import (
+    build_bge_m3_vector_index,
+    build_vector_index,
+)
 
 
 def _ingest_version(root: Path, source: Path, version: str, text: str):
@@ -164,6 +167,22 @@ def test_candidate_release_rejects_processing_record_from_other_version(
         create_candidate_release(processed, tmp_path / "releases")
 
 
+def test_candidate_release_rejects_invalid_processing_run_identity(tmp_path: Path):
+    processed = tmp_path / "processed"
+    result = _ingest_version(
+        processed, tmp_path / "demo.md", "v1", "# V1\n\noriginal"
+    )
+    processing = json.loads(result.processing_record_path.read_text(encoding="utf-8"))
+    processing["processing_run_id"] = "run_tampered"
+    write_json(result.processing_record_path, processing)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"^processing_record_run_id_mismatch:{result.document_version_id}$",
+    ):
+        create_candidate_release(processed, tmp_path / "releases")
+
+
 def test_release_validation_rejects_rehashed_canonical_from_other_version(
     tmp_path: Path,
 ):
@@ -182,6 +201,7 @@ def test_release_validation_rejects_rehashed_canonical_from_other_version(
     _write_json(manifest.manifest_path, payload)
 
     assert validate_release_artifacts(manifest.manifest_path) == [
+        f"processing_record_canonical_mismatch:{result.document_version_id}",
         f"canonical_document_version_mismatch:{result.document_version_id}"
     ]
 
@@ -199,7 +219,7 @@ def test_release_validation_rejects_processing_record_from_other_version(
     _write_json(result.processing_record_path, processing)
 
     assert validate_release_artifacts(manifest.manifest_path) == [
-        f"processing_record_document_version_mismatch:{result.document_version_id}"
+        f"processing_record_hash_mismatch:{result.document_version_id}"
     ]
 
 
@@ -358,7 +378,14 @@ def test_legacy_release_derives_quality_without_mutating_version_dir(tmp_path: P
     document = manifest.documents[0]
     derived = manifest.manifest_path.parent / document.quality_record_path
     assert before == after
-    assert document.processing_record_path is None
+    assert document.processing_record_path == (
+        f"derived-processing/{result.document_version_id}.json"
+    )
+    derived_processing = (
+        manifest.manifest_path.parent / document.processing_record_path
+    )
+    assert derived_processing.is_file()
+    assert file_sha256(derived_processing) == document.processing_record_sha256
     assert document.quality_record_path == (
         f"derived-quality/{result.document_version_id}.json"
     )
@@ -563,6 +590,140 @@ def test_finalize_binds_relative_paths_and_hashes_then_activates_atomically(
 
     assert load_active_release(pointer) == ready
     assert not pointer.with_suffix(pointer.suffix + ".tmp").exists()
+
+
+def test_ready_release_rejects_different_same_id_artifacts_without_mutation(
+    tmp_path: Path,
+):
+    release, fts_path, vector_path, baseline_path = _build_release_artifacts(tmp_path)
+    ready = finalize_release(
+        release.manifest_path,
+        fts_index_path=fts_path,
+        vector_index_path=vector_path,
+        baseline_path=baseline_path,
+    )
+    pointer = tmp_path / "active-release.json"
+    activate_release(ready.manifest_path, pointer)
+    manifest_before = ready.manifest_path.read_bytes()
+    pointer_before = pointer.read_bytes()
+
+    alternate_fts = ready.manifest_path.parent / "indexes" / "alternate.db"
+    alternate_vector = ready.manifest_path.parent / "indexes" / "alternate.json"
+    alternate_baseline = ready.manifest_path.parent / "alternate-baseline.json"
+    build_fts_index(
+        processed_dir=ready.processed_dir,
+        index_path=alternate_fts,
+        release_manifest_path=ready.manifest_path,
+    )
+    build_vector_index(
+        processed_dir=ready.processed_dir,
+        index_path=alternate_vector,
+        release_manifest_path=ready.manifest_path,
+    )
+    write_json(
+        alternate_baseline,
+        build_quality_baseline(ready.manifest_path).to_dict(),
+    )
+
+    with pytest.raises(ValueError, match="^release_already_ready$"):
+        finalize_release(
+            ready.manifest_path,
+            fts_index_path=alternate_fts,
+            vector_index_path=alternate_vector,
+            baseline_path=alternate_baseline,
+        )
+
+    assert ready.manifest_path.read_bytes() == manifest_before
+    assert pointer.read_bytes() == pointer_before
+    assert load_active_release(pointer).resolve_artifact("fts") == fts_path.resolve()
+
+
+def test_ready_release_finalize_is_idempotent_only_for_bound_artifacts(tmp_path: Path):
+    release, fts_path, vector_path, baseline_path = _build_release_artifacts(tmp_path)
+    ready = finalize_release(
+        release.manifest_path,
+        fts_index_path=fts_path,
+        vector_index_path=vector_path,
+        baseline_path=baseline_path,
+    )
+    before = ready.manifest_path.read_bytes()
+
+    repeated = finalize_release(
+        ready.manifest_path,
+        fts_index_path=fts_path,
+        vector_index_path=vector_path,
+        baseline_path=baseline_path,
+    )
+
+    assert repeated == ready
+    assert ready.manifest_path.read_bytes() == before
+
+
+def test_finalize_binds_bge_matrix_and_metadata_and_activation_checks_both(
+    tmp_path: Path,
+    monkeypatch,
+):
+    release, fts_path, _, baseline_path = _build_release_artifacts(tmp_path)
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+
+    class FakeModel:
+        def encode(self, texts, **_kwargs):
+            import numpy as np
+
+            return {"dense_vecs": np.ones((len(texts), 2), dtype="float32")}
+
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: FakeModel(),
+    )
+    vector_path = release.manifest_path.parent / "indexes" / "chunks.npz"
+    build_bge_m3_vector_index(
+        processed_dir=release.processed_dir,
+        index_path=vector_path,
+        model_path=model_path,
+        release_manifest_path=release.manifest_path,
+    )
+
+    ready = finalize_release(
+        release.manifest_path,
+        fts_index_path=fts_path,
+        vector_index_path=vector_path,
+        baseline_path=baseline_path,
+    )
+    metadata_path = Path(str(vector_path) + ".metadata.json")
+    assert ready.indexes["vector"]["metadata_path"] == (
+        "indexes/chunks.npz.metadata.json"
+    )
+    assert ready.indexes["vector"]["metadata_sha256"] == file_sha256(metadata_path)
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["model_name"] = "tampered-but-same-release"
+    write_json(metadata_path, metadata)
+    with pytest.raises(ValueError, match="^vector_metadata_hash_mismatch$"):
+        activate_release(ready.manifest_path, tmp_path / "active.json")
+
+
+def test_release_validation_rejects_rehashed_processing_record_semantic_tamper(
+    tmp_path: Path,
+):
+    processed = tmp_path / "processed"
+    result = _ingest_version(
+        processed, tmp_path / "demo.md", "v1", "# V1\n\noriginal"
+    )
+    release = create_candidate_release(processed, tmp_path / "releases")
+    processing = json.loads(result.processing_record_path.read_text(encoding="utf-8"))
+    processing["quality_rules_version"] = "tampered-rules"
+    write_json(result.processing_record_path, processing)
+    payload = json.loads(release.manifest_path.read_text(encoding="utf-8"))
+    payload["documents"][0]["processing_record_sha256"] = file_sha256(
+        result.processing_record_path
+    )
+    write_json(release.manifest_path, payload)
+
+    assert validate_release_artifacts(release.manifest_path) == [
+        f"processing_record_quality_rules_mismatch:{result.document_version_id}"
+    ]
 
 
 @pytest.mark.parametrize(

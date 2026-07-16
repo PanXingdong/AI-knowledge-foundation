@@ -26,7 +26,14 @@
       "minItems": 1,
       "items": {"$ref": "#/$defs/document"}
     },
-    "indexes": {"type": "object"},
+    "indexes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fts": {"$ref": "#/$defs/index"},
+        "vector": {"$ref": "#/$defs/vector_index"}
+      }
+    },
     "baseline": {"type": ["object", "null"]}
   },
   "$defs": {
@@ -43,6 +50,7 @@
         "canonical_sha256",
         "chunks_sha256",
         "quality_record_sha256",
+        "processing_record_sha256",
         "processing_run_id",
         "quality_status",
         "quality_score"
@@ -52,7 +60,7 @@
         "document_version_id": {"type": "string", "minLength": 1},
         "canonical_path": {"type": "string", "minLength": 1},
         "chunks_path": {"type": "string", "minLength": 1},
-        "processing_record_path": {"type": ["string", "null"]},
+        "processing_record_path": {"type": "string", "minLength": 1},
         "quality_record_path": {"type": "string", "minLength": 1},
         "canonical_sha256": {
           "type": "string",
@@ -69,9 +77,34 @@
           "minLength": 64,
           "maxLength": 64
         },
+        "processing_record_sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
         "processing_run_id": {"type": "string", "minLength": 1},
         "quality_status": {"type": "string", "minLength": 1},
         "quality_score": {"type": ["number", "null"]}
+      }
+    },
+    "index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "minLength": 64, "maxLength": 64}
+      }
+    },
+    "vector_index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "minLength": 64, "maxLength": 64},
+        "metadata_path": {"type": "string", "minLength": 1},
+        "metadata_sha256": {"type": "string", "minLength": 64, "maxLength": 64}
       }
     }
   }

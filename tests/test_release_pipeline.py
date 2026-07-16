@@ -182,7 +182,7 @@ def test_context_pack_cli_rejects_mismatched_release_indexes(
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "ERROR: fts_release_mismatch:" in captured.err
+    assert "ERROR: ready_fts_path_mismatch" in captured.err
 
 
 def test_index_failure_preserves_candidate_diagnostics_without_activation(

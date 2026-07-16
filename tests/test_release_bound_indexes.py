@@ -276,3 +276,102 @@ def test_resumable_rejects_changed_legacy_text_before_loading_model(
         )
 
     assert manifest_path.read_bytes() == manifest_before
+
+
+@pytest.mark.parametrize(
+    ("changed_argument", "changed_value"),
+    [
+        ("model_path", "other-model"),
+        ("max_length", 128),
+        ("batch_size", 1),
+    ],
+)
+def test_resumable_rejects_changed_build_identity_before_loading_model(
+    tmp_path: Path,
+    monkeypatch,
+    changed_argument: str,
+    changed_value,
+):
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "legacy.md", "Legacy", "alpha beta")
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    work_dir = tmp_path / "work"
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: _FakeBgeModel(),
+    )
+    build_bge_m3_vector_index_resumable(
+        processed_dir=processed,
+        index_path=tmp_path / "first.npz",
+        model_path=model_path,
+        work_dir=work_dir,
+        batch_size=2,
+        max_length=256,
+    )
+    kwargs = {
+        "processed_dir": processed,
+        "index_path": tmp_path / "second.npz",
+        "model_path": model_path,
+        "work_dir": work_dir,
+        "batch_size": 2,
+        "max_length": 256,
+    }
+    if changed_argument == "model_path":
+        other_model = tmp_path / str(changed_value)
+        other_model.mkdir()
+        kwargs[changed_argument] = other_model
+    else:
+        kwargs[changed_argument] = changed_value
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: pytest.fail("model must not load for mismatched work_dir"),
+    )
+
+    with pytest.raises(
+        vector_index.VectorIndexError,
+        match="^resumable_work_dir_input_mismatch$",
+    ):
+        build_bge_m3_vector_index_resumable(**kwargs)
+
+
+@pytest.mark.parametrize("corruption", ["rows", "dimension"])
+def test_resumable_rejects_corrupt_part_shape(tmp_path: Path, monkeypatch, corruption: str):
+    import numpy as np
+
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "legacy.md", "Legacy", "alpha beta")
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    work_dir = tmp_path / "work"
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: _FakeBgeModel(),
+    )
+    build_bge_m3_vector_index_resumable(
+        processed_dir=processed,
+        index_path=tmp_path / "first.npz",
+        model_path=model_path,
+        work_dir=work_dir,
+        batch_size=1,
+    )
+    parts = sorted(work_dir.glob("part_*.npy"))
+    assert parts
+    matrix = np.load(parts[0])
+    if corruption == "rows":
+        matrix = np.vstack([matrix, matrix])
+    else:
+        matrix = np.pad(matrix, ((0, 0), (0, 1)))
+    np.save(parts[0], matrix)
+
+    with pytest.raises(
+        vector_index.VectorIndexError,
+        match="^resumable_part_invalid$",
+    ):
+        build_bge_m3_vector_index_resumable(
+            processed_dir=processed,
+            index_path=tmp_path / "second.npz",
+            model_path=model_path,
+            work_dir=work_dir,
+            batch_size=1,
+        )

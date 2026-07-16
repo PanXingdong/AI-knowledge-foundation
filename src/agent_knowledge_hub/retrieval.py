@@ -15,6 +15,7 @@ from typing import Iterable
 from agent_knowledge_hub.fts_index import query_fts_index, read_fts_release_id
 from agent_knowledge_hub.release_manifest import (
     ReleaseManifest,
+    _validate_bound_release,
     iter_release_documents,
     load_release_manifest,
 )
@@ -1633,6 +1634,11 @@ def build_context_pack_for_processed_dir(
     )
     if manifest is not None and Path(manifest.processed_dir).resolve() != processed_root:
         raise ValueError("release_processed_dir_mismatch")
+    fts_index_path, vector_index_path = _resolve_release_indexes(
+        manifest=manifest,
+        fts_index_path=fts_index_path,
+        vector_index_path=vector_index_path,
+    )
     _assert_release_index_compatibility(
         release_id=manifest.release_id if manifest else None,
         fts_index_path=fts_index_path,
@@ -1771,6 +1777,7 @@ def build_context_pack_for_processed_dir(
         fts_bonus_by_chunk_id=fts_bonus_by_chunk_id,
         vector_bonus_by_chunk_id=vector_bonus_by_chunk_id,
         bm25_context=cached_bm25_context,
+        cache_namespace=manifest.release_id if manifest else "legacy-latest",
     )
     # _select_candidates is O(pool_size²). Candidates are already sorted by
     # score, so capping the pool here gives ample diversity room while avoiding
@@ -2201,9 +2208,9 @@ def write_gap_report_bundle(
 _CHUNK_CACHE: dict[str, list["_LoadedChunk"]] = {}  # processed_dir|release_id → chunks
 _BM25_CONTEXT_CACHE: dict[str, "_Bm25Context"] = {}  # processed_dir|release_id → context
 # chunk_id → (topic_scores, topic_subfacets, coherence, structure, ev_quality, thin_penalty)
-_CHUNK_STATIC_SCORE_CACHE: dict[str, tuple] = {}
+_CHUNK_STATIC_SCORE_CACHE: dict[tuple[str, str], tuple] = {}
 # chunk_id → (chunk_tokens, title_normalized, section_text, leaf_section_text)
-_CHUNK_TOKEN_CACHE: dict[str, tuple] = {}
+_CHUNK_TOKEN_CACHE: dict[tuple[str, str], tuple] = {}
 
 # Hard cap on per-chunk caches. Each of the ~65k corpus chunks stores a small
 # fixed-size tuple; at 250k entries we evict the oldest half to stay within a
@@ -2369,6 +2376,29 @@ def _assert_release_index_compatibility(
             raise ValueError(
                 f"vector_release_mismatch:expected={release_id}:actual={actual}"
             )
+
+
+def _resolve_release_indexes(
+    *,
+    manifest: ReleaseManifest | None,
+    fts_index_path: Path | str | None,
+    vector_index_path: Path | str | None,
+) -> tuple[Path | str | None, Path | str | None]:
+    if manifest is None or manifest.status == "candidate":
+        return fts_index_path, vector_index_path
+    if manifest.status != "ready":
+        raise ValueError("release_status_invalid")
+
+    _validate_bound_release(manifest)
+    bound_fts = manifest.resolve_artifact("fts")
+    bound_vector = manifest.resolve_artifact("vector")
+    for name, requested, bound in (
+        ("fts", fts_index_path, bound_fts),
+        ("vector", vector_index_path, bound_vector),
+    ):
+        if requested is not None and Path(requested).resolve() != bound:
+            raise ValueError(f"ready_{name}_path_mismatch")
+    return bound_fts, bound_vector
 
 
 def _load_processed_chunks(
@@ -3093,6 +3123,7 @@ def _build_candidate_scores(
     fts_bonus_by_chunk_id: dict[str, float] | None = None,
     vector_bonus_by_chunk_id: dict[str, float] | None = None,
     bm25_context: _Bm25Context | None = None,
+    cache_namespace: str = "legacy-latest",
 ) -> list[_CandidateScore]:
     chunk_list = list(chunks)
     if bm25_context is None:
@@ -3102,7 +3133,7 @@ def _build_candidate_scores(
     candidates: list[_CandidateScore] = []
     for chunk in chunk_list:
         # Restore query-independent per-chunk scores from cache when available.
-        static_key = chunk.chunk_id
+        static_key = (cache_namespace, chunk.chunk_id)
         if static_key in _CHUNK_STATIC_SCORE_CACHE:
             (
                 topic_scores,
@@ -3145,7 +3176,9 @@ def _build_candidate_scores(
             )
         # Use cached token data to avoid re-tokenising the same chunk text on
         # every request (tokenisation is query-independent).
-        _chunk_tokens, _title_text, _section_text, _leaf_section_text = _get_chunk_token_data(chunk)
+        _chunk_tokens, _title_text, _section_text, _leaf_section_text = (
+            _get_chunk_token_data(chunk, cache_namespace=cache_namespace)
+        )
         overall_score = _score_tokens_from_cached(
             chunk_tokens=_chunk_tokens,
             title_text=_title_text,
@@ -3543,9 +3576,13 @@ def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
     return intersection / max(1, min(len(left), len(right)))
 
 
-def _get_chunk_token_data(chunk: _LoadedChunk) -> tuple[Counter[str], str, str, str]:
-    """Return pre-tokenised chunk data, using a module-level cache keyed by chunk_id."""
-    cache_key = chunk.chunk_id
+def _get_chunk_token_data(
+    chunk: _LoadedChunk,
+    *,
+    cache_namespace: str = "legacy-latest",
+) -> tuple[Counter[str], str, str, str]:
+    """Return pre-tokenised chunk data, isolated by release namespace."""
+    cache_key = (cache_namespace, chunk.chunk_id)
     if cache_key in _CHUNK_TOKEN_CACHE:
         return _CHUNK_TOKEN_CACHE[cache_key]  # type: narrowed via _evict guard
     chunk_text_normalized = normalize_space(chunk.text).lower()

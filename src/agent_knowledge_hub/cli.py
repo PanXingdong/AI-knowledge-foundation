@@ -171,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             result = trace_evidence_in_processed_dir(
                 processed_dir=args.processed_dir,
                 evidence_id=args.evidence_id,
+                release_manifest_path=args.release_manifest_path,
             )
             payload = result.to_dict()
             if args.output_path:
@@ -453,6 +454,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     trace_parser.add_argument("--processed-dir", required=True, type=Path)
     trace_parser.add_argument("--evidence-id", required=True)
+    trace_parser.add_argument("--release-manifest-path", type=Path)
     trace_parser.add_argument("--output-path", type=Path)
 
     quality_parser = subparsers.add_parser(
