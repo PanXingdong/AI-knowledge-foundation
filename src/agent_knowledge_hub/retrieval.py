@@ -2944,7 +2944,11 @@ def _load_vector_bonus_by_chunk_id(
         _merge_hits(hits, weight=1.0)
     except FileNotFoundError:
         return {}, "vector_index_unavailable:not_found:lexical_only"
-    except (OSError, VectorIndexError):
+    except VectorIndexError as error:
+        if str(error) == "bge_model_fingerprint_mismatch":
+            raise
+        return {}, "vector_index_unavailable:query_failed:lexical_only"
+    except OSError:
         return {}, "vector_index_unavailable:query_failed:lexical_only"
 
     expanded = _llm_expand_query(query)

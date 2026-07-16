@@ -21,8 +21,10 @@ from agent_knowledge_hub.retrieval import (
 )
 from agent_knowledge_hub.utils import write_json
 from agent_knowledge_hub.vector_index import (
+    VectorIndexError,
     build_bge_m3_vector_index,
     build_vector_index,
+    clear_vector_index_cache,
 )
 
 
@@ -377,6 +379,68 @@ def test_ready_retrieval_rejects_tampered_bge_metadata_with_same_release_id(
     write_json(metadata_path, metadata)
 
     with pytest.raises(ValueError, match="^vector_metadata_hash_mismatch$"):
+        build_context_pack_for_processed_dir(
+            processed_dir=processed,
+            release_manifest_path=ready.manifest_path,
+            query="alpha",
+        )
+
+
+def test_ready_retrieval_rejects_replaced_bge_model_content(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import numpy as np
+
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "bge.md", "BGE", "alpha")
+    release = create_candidate_release(processed, tmp_path / "releases")
+    release_root = release.manifest_path.parent
+    fts_path = release_root / "indexes" / "chunks.db"
+    vector_path = release_root / "indexes" / "chunks.npz"
+    baseline_path = release_root / "quality-baseline.json"
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    weights_path = model_path / "weights.bin"
+    weights_path.write_bytes(b"model-v1")
+
+    class FakeModel:
+        def encode(self, texts, **_kwargs):
+            return {"dense_vecs": np.ones((len(texts), 2), dtype="float32")}
+
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: FakeModel(),
+    )
+    build_fts_index(
+        processed_dir=processed,
+        index_path=fts_path,
+        release_manifest_path=release.manifest_path,
+    )
+    build_bge_m3_vector_index(
+        processed_dir=processed,
+        index_path=vector_path,
+        model_path=model_path,
+        release_manifest_path=release.manifest_path,
+    )
+    write_json(
+        baseline_path,
+        build_quality_baseline(release.manifest_path).to_dict(),
+    )
+    ready = finalize_release(
+        release.manifest_path,
+        fts_index_path=fts_path,
+        vector_index_path=vector_path,
+        baseline_path=baseline_path,
+    )
+    clear_vector_index_cache()
+    weights_path.write_bytes(b"model-v2")
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: pytest.fail("fingerprint mismatch must precede model use"),
+    )
+
+    with pytest.raises(VectorIndexError, match="^bge_model_fingerprint_mismatch$"):
         build_context_pack_for_processed_dir(
             processed_dir=processed,
             release_manifest_path=ready.manifest_path,

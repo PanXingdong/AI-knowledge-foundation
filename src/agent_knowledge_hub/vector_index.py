@@ -26,13 +26,14 @@ class VectorIndexError(Exception):
 # Eliminates repeated JSON disk reads, IDF computation, and per-chunk vector weighting.
 _VECTOR_INDEX_CACHE: dict[str, tuple] = {}
 _BGE_VECTOR_INDEX_CACHE: dict[str, tuple] = {}
-_BGE_MODEL_CACHE: dict[str, Any] = {}
+_BGE_MODEL_CACHE: dict[tuple[str, str | None], Any] = {}
 
 
 def clear_vector_index_cache() -> None:
     """Invalidate the vector index cache (call after re-building the index)."""
     _VECTOR_INDEX_CACHE.clear()
     _BGE_VECTOR_INDEX_CACHE.clear()
+    _BGE_MODEL_CACHE.clear()
 
 
 def model_content_fingerprint(model_path: Path | str) -> str:
@@ -248,7 +249,10 @@ def build_bge_m3_vector_index(
 ) -> VectorIndexBuildSummary:
     processed_root = Path(processed_dir).resolve()
     resolved_index_path = Path(index_path).resolve()
-    resolved_model_path = Path(model_path).resolve()
+    raw_model_path = Path(model_path)
+    if raw_model_path.is_symlink():
+        raise VectorIndexError("model_path_symlink_unsupported")
+    resolved_model_path = raw_model_path.resolve()
     if not processed_root.exists():
         raise FileNotFoundError(f"Processed directory does not exist: {processed_root}")
     if not resolved_model_path.exists():
@@ -336,7 +340,10 @@ def build_bge_m3_vector_index_resumable(
 ) -> VectorIndexBuildSummary:
     processed_root = Path(processed_dir).resolve()
     resolved_index_path = Path(index_path).resolve()
-    resolved_model_path = Path(model_path).resolve()
+    raw_model_path = Path(model_path)
+    if raw_model_path.is_symlink():
+        raise VectorIndexError("model_path_symlink_unsupported")
+    resolved_model_path = raw_model_path.resolve()
     resolved_work_dir = (
         Path(work_dir).resolve()
         if work_dir is not None
@@ -652,7 +659,17 @@ def _query_bge_m3_vector_index(
 
     vectors, rows, metadata = _BGE_VECTOR_INDEX_CACHE[cache_key]
     model_path = Path(str(metadata.get("model_path") or BGE_M3_DEFAULT_MODEL_PATH)).resolve()
-    model = _load_bge_m3_model(model_path)
+    expected_fingerprint = metadata.get("model_fingerprint")
+    if expected_fingerprint is not None:
+        actual_fingerprint = model_content_fingerprint(model_path)
+        if actual_fingerprint != str(expected_fingerprint):
+            raise VectorIndexError("bge_model_fingerprint_mismatch")
+    model = _load_bge_m3_model(
+        model_path,
+        expected_fingerprint=(
+            str(expected_fingerprint) if expected_fingerprint is not None else None
+        ),
+    )
     encoded = model.encode(
         [query],
         batch_size=1,
@@ -774,8 +791,17 @@ def _resolve_processed_versions(
     return iter_release_documents(manifest.manifest_path), manifest.release_id
 
 
-def _load_bge_m3_model(model_path: Path):
-    cache_key = str(model_path.resolve())
+def _load_bge_m3_model(
+    model_path: Path,
+    *,
+    expected_fingerprint: str | None = None,
+):
+    resolved_path = model_path.resolve()
+    if expected_fingerprint is not None:
+        actual_fingerprint = model_content_fingerprint(resolved_path)
+        if actual_fingerprint != expected_fingerprint:
+            raise VectorIndexError("bge_model_fingerprint_mismatch")
+    cache_key = (str(resolved_path), expected_fingerprint)
     if cache_key not in _BGE_MODEL_CACHE:
         try:
             from FlagEmbedding import BGEM3FlagModel
@@ -786,7 +812,7 @@ def _load_bge_m3_model(model_path: Path):
             ) from exc
         device = _select_bge_m3_device()
         _BGE_MODEL_CACHE[cache_key] = BGEM3FlagModel(
-            str(model_path),
+            str(resolved_path),
             use_fp16=device.startswith("cuda"),
             device=device,
         )

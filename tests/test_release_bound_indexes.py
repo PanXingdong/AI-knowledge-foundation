@@ -240,6 +240,112 @@ def test_standard_bge_metadata_records_model_content_fingerprint(
     )
 
 
+def test_bge_query_rejects_replaced_model_content_before_model_use(
+    tmp_path: Path,
+    monkeypatch,
+):
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "legacy.md", "Legacy", "alpha")
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    weights_path = model_path / "weights.bin"
+    weights_path.write_bytes(b"model-v1")
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: _FakeBgeModel(),
+    )
+    index_path = tmp_path / "query.npz"
+    build_bge_m3_vector_index(
+        processed_dir=processed,
+        index_path=index_path,
+        model_path=model_path,
+    )
+    vector_index.clear_vector_index_cache()
+    vector_index._BGE_MODEL_CACHE.clear()
+    weights_path.write_bytes(b"model-v2")
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: pytest.fail("fingerprint mismatch must precede model use"),
+    )
+
+    with pytest.raises(
+        vector_index.VectorIndexError,
+        match="^bge_model_fingerprint_mismatch$",
+    ):
+        vector_index.query_vector_index(
+            index_path=index_path,
+            query="alpha",
+        )
+
+
+def test_bge_query_keeps_legacy_metadata_without_model_fingerprint_compatible(
+    tmp_path: Path,
+    monkeypatch,
+):
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "legacy.md", "Legacy", "alpha")
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: _FakeBgeModel(),
+    )
+    index_path = tmp_path / "legacy-query.npz"
+    build_bge_m3_vector_index(
+        processed_dir=processed,
+        index_path=index_path,
+        model_path=model_path,
+    )
+    metadata_path = Path(str(index_path) + ".metadata.json")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("model_fingerprint")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    vector_index.clear_vector_index_cache()
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path, **_kwargs: _FakeBgeModel(),
+    )
+
+    hits = vector_index.query_vector_index(index_path=index_path, query="alpha")
+
+    assert hits
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [build_bge_m3_vector_index, build_bge_m3_vector_index_resumable],
+)
+def test_bge_builders_reject_root_model_symlink_before_resolve(
+    tmp_path: Path,
+    monkeypatch,
+    builder,
+):
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "legacy.md", "Legacy", "alpha")
+    target = tmp_path / "model-target"
+    target.mkdir()
+    (target / "weights.bin").write_bytes(b"model")
+    model_link = tmp_path / "model-link"
+    try:
+        model_link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: pytest.fail("root symlink must fail before model loading"),
+    )
+
+    with pytest.raises(
+        vector_index.VectorIndexError,
+        match="^model_path_symlink_unsupported$",
+    ):
+        builder(
+            processed_dir=processed,
+            index_path=tmp_path / f"{builder.__name__}.npz",
+            model_path=model_link,
+        )
+
+
 def test_resumable_rejects_same_model_path_content_replacement_before_reuse(
     tmp_path: Path,
     monkeypatch,
