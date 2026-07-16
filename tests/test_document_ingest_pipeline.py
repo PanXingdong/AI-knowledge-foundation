@@ -64,6 +64,9 @@ def test_ingest_markdown_builds_canonical_document_and_chunks(tmp_path: Path):
     assert chunks
     assert all(chunk["evidence_ids"] for chunk in chunks)
     assert "dependency services" in " ".join(chunk["text"] for chunk in chunks)
+    summary = result.to_summary_dict()
+    assert summary["processing_record_path"] == str(result.processing_record_path)
+    assert summary["quality_record_path"] == str(result.quality_record_path)
 
 
 def test_ingest_html_removes_markup_and_preserves_heading_sections(tmp_path: Path):

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-knowledge-foundation.local/schemas/knowledge-release.v1/quality-record.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "document_version_id", "evaluator_version", "profile", "signals"],
+  "properties": {
+    "schema_version": {"const": "knowledge-quality-record.v1"},
+    "document_version_id": {"type": "string", "minLength": 1},
+    "evaluator_version": {"type": "string", "minLength": 1},
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_format", "page_count", "block_count", "chunk_count", "table_count", "text_character_count"],
+      "properties": {
+        "source_format": {"type": "string"},
+        "page_count": {"type": ["integer", "null"]},
+        "block_count": {"type": "integer", "minimum": 0},
+        "chunk_count": {"type": "integer", "minimum": 0},
+        "table_count": {"type": "integer", "minimum": 0},
+        "text_character_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "signals": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "value", "reason_codes"],
+        "properties": {
+          "status": {"enum": ["observed", "unavailable"]},
+          "value": {"type": ["number", "integer", "string", "boolean", "null"]},
+          "reason_codes": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

@@ -114,6 +114,8 @@ class IngestResult:
     output_dir: Path
     document_json_path: Path
     chunks_jsonl_path: Path
+    processing_record_path: Path
+    quality_record_path: Path
     chunk_count: int
     warning_count: int
 
@@ -127,6 +129,8 @@ class IngestResult:
             "output_dir": str(self.output_dir),
             "document_json_path": str(self.document_json_path),
             "chunks_jsonl_path": str(self.chunks_jsonl_path),
+            "processing_record_path": str(self.processing_record_path),
+            "quality_record_path": str(self.quality_record_path),
             "chunk_count": self.chunk_count,
             "warning_count": self.warning_count,
         }
