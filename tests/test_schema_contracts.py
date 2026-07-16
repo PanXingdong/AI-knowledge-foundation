@@ -2,14 +2,22 @@ import json
 from pathlib import Path
 
 from agent_knowledge_hub.models import CANONICAL_DOCUMENT_SCHEMA_VERSION
+from agent_knowledge_hub.processing_record import PROCESSING_RECORD_SCHEMA_VERSION
+from agent_knowledge_hub.quality_contracts import QUALITY_RECORD_SCHEMA_VERSION
+from agent_knowledge_hub.release_manifest import RELEASE_MANIFEST_SCHEMA_VERSION
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_DIR = REPO_ROOT / "schemas" / CANONICAL_DOCUMENT_SCHEMA_VERSION
+RELEASE_SCHEMA_DIR = REPO_ROOT / "schemas" / RELEASE_MANIFEST_SCHEMA_VERSION
 
 
 def _read_schema(name: str) -> dict[str, object]:
     return json.loads((SCHEMA_DIR / name).read_text(encoding="utf-8"))
+
+
+def _read_release_schema(name: str) -> dict[str, object]:
+    return json.loads((RELEASE_SCHEMA_DIR / name).read_text(encoding="utf-8"))
 
 
 def test_layer1_processed_schema_files_exist():
@@ -91,3 +99,26 @@ def test_chunk_schema_keeps_layer2_required_fields():
         "document_title",
         "source_type",
     ]
+
+
+def test_knowledge_release_schema_files_exist():
+    assert (RELEASE_SCHEMA_DIR / "README.md").exists()
+    assert (RELEASE_SCHEMA_DIR / "processing-record.schema.json").exists()
+    assert (RELEASE_SCHEMA_DIR / "quality-record.schema.json").exists()
+    assert (RELEASE_SCHEMA_DIR / "release-manifest.schema.json").exists()
+
+
+def test_knowledge_release_schemas_match_supported_versions():
+    processing = _read_release_schema("processing-record.schema.json")
+    quality = _read_release_schema("quality-record.schema.json")
+    manifest = _read_release_schema("release-manifest.schema.json")
+
+    assert processing["properties"]["schema_version"]["const"] == (
+        PROCESSING_RECORD_SCHEMA_VERSION
+    )
+    assert quality["properties"]["schema_version"]["const"] == (
+        QUALITY_RECORD_SCHEMA_VERSION
+    )
+    assert manifest["properties"]["schema_version"]["const"] == (
+        RELEASE_MANIFEST_SCHEMA_VERSION
+    )

@@ -1,0 +1,405 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from agent_knowledge_hub.processing_record import (
+    QUALITY_RULES_VERSION,
+    load_or_infer_processing_record,
+)
+from agent_knowledge_hub.quality_contracts import build_quality_record
+from agent_knowledge_hub.utils import (
+    file_sha256,
+    normalize_space,
+    sha256_bytes,
+    stable_id,
+    utc_now_iso,
+    write_json,
+)
+
+RELEASE_MANIFEST_SCHEMA_VERSION = "knowledge-release.v1"
+
+
+@dataclass(frozen=True)
+class ReleaseDocument:
+    document_id: str
+    document_version_id: str
+    canonical_path: str
+    chunks_path: str
+    processing_record_path: str | None
+    quality_record_path: str
+    canonical_sha256: str
+    chunks_sha256: str
+    quality_record_sha256: str
+    processing_run_id: str
+    quality_status: str
+    quality_score: float | None
+
+
+@dataclass(frozen=True)
+class ReleaseManifest:
+    schema_version: str
+    release_id: str
+    status: str
+    created_at: str
+    processed_dir: str
+    quality_rules_version: str
+    documents: tuple[ReleaseDocument, ...]
+    indexes: dict[str, dict[str, str]]
+    baseline: dict[str, str] | None
+    manifest_path: Path
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "release_id": self.release_id,
+            "status": self.status,
+            "created_at": self.created_at,
+            "processed_dir": self.processed_dir,
+            "quality_rules_version": self.quality_rules_version,
+            "documents": [asdict(item) for item in self.documents],
+            "indexes": self.indexes,
+            "baseline": self.baseline,
+        }
+
+    def resolve_artifact(self, name: str) -> Path:
+        relative_path = self.indexes[name]["path"]
+        return (self.manifest_path.parent / relative_path).resolve()
+
+
+def create_candidate_release(
+    processed_dir: Path,
+    releases_dir: Path,
+) -> ReleaseManifest:
+    processed_root = processed_dir.resolve()
+    releases_root = releases_dir.resolve()
+    selected = _select_latest_processed_versions(processed_root)
+    drafts = [
+        _release_document(processed_root, chunks_path, canonical)
+        for chunks_path, canonical in selected
+    ]
+    drafts.sort(key=lambda item: (item[0].document_id, item[0].document_version_id))
+    if not drafts:
+        raise ValueError("Cannot create a release without documents")
+
+    documents = tuple(item[0] for item in drafts)
+    release_id = stable_id(
+        "release",
+        RELEASE_MANIFEST_SCHEMA_VERSION,
+        QUALITY_RULES_VERSION,
+        *[
+            f"{item.document_version_id}:{item.canonical_sha256}:"
+            f"{item.chunks_sha256}:{item.quality_record_sha256}"
+            for item in documents
+        ],
+    )
+    manifest_path = releases_root / release_id / "release-manifest.json"
+    for document, derived_quality in drafts:
+        if derived_quality is not None:
+            write_json(
+                manifest_path.parent / document.quality_record_path,
+                derived_quality,
+            )
+
+    manifest = ReleaseManifest(
+        schema_version=RELEASE_MANIFEST_SCHEMA_VERSION,
+        release_id=release_id,
+        status="candidate",
+        created_at=utc_now_iso(),
+        processed_dir=str(processed_root),
+        quality_rules_version=QUALITY_RULES_VERSION,
+        documents=documents,
+        indexes={},
+        baseline=None,
+        manifest_path=manifest_path,
+    )
+    write_json(manifest_path, manifest.to_dict())
+    return manifest
+
+
+def load_release_manifest(path: Path) -> ReleaseManifest:
+    manifest_path = path.resolve()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    documents = tuple(ReleaseDocument(**item) for item in payload["documents"])
+    return ReleaseManifest(
+        schema_version=payload["schema_version"],
+        release_id=payload["release_id"],
+        status=payload["status"],
+        created_at=payload["created_at"],
+        processed_dir=payload["processed_dir"],
+        quality_rules_version=payload["quality_rules_version"],
+        documents=documents,
+        indexes=payload["indexes"],
+        baseline=payload["baseline"],
+        manifest_path=manifest_path,
+    )
+
+
+def iter_release_documents(
+    manifest_path: Path,
+) -> list[tuple[Path, dict[str, Any]]]:
+    errors = validate_release_artifacts(manifest_path)
+    if errors:
+        raise ValueError(errors[0])
+
+    manifest = load_release_manifest(manifest_path)
+    processed_root = Path(manifest.processed_dir).resolve()
+    selected: list[tuple[Path, dict[str, Any]]] = []
+    for document in manifest.documents:
+        canonical_path = _resolve_relative(
+            processed_root,
+            document.canonical_path,
+            "canonical_path_outside_processed_dir",
+            document.document_version_id,
+        )
+        chunks_path = _resolve_relative(
+            processed_root,
+            document.chunks_path,
+            "chunks_path_outside_processed_dir",
+            document.document_version_id,
+        )
+        selected.append(
+            (
+                chunks_path,
+                json.loads(canonical_path.read_text(encoding="utf-8")),
+            )
+        )
+    return selected
+
+
+def validate_release_artifacts(manifest_path: Path) -> list[str]:
+    manifest = load_release_manifest(manifest_path)
+    processed_root = Path(manifest.processed_dir).resolve()
+    release_root = manifest.manifest_path.parent.resolve()
+    errors: list[str] = []
+    for document in manifest.documents:
+        if document.processing_record_path is not None:
+            try:
+                processing_path = _resolve_relative(
+                    processed_root,
+                    document.processing_record_path,
+                    "processing_record_path_outside_processed_dir",
+                    document.document_version_id,
+                )
+            except ValueError as error:
+                errors.append(str(error))
+            else:
+                if not processing_path.is_file():
+                    errors.append(
+                        "processing_record_artifact_missing:"
+                        f"{document.document_version_id}"
+                    )
+        quality_is_derived = _is_derived_quality_path(
+            document.quality_record_path,
+            document.document_version_id,
+        )
+        artifact_specs = (
+            (
+                "canonical",
+                processed_root,
+                document.canonical_path,
+                document.canonical_sha256,
+                "processed_dir",
+            ),
+            (
+                "chunks",
+                processed_root,
+                document.chunks_path,
+                document.chunks_sha256,
+                "processed_dir",
+            ),
+            (
+                "quality_record",
+                release_root if quality_is_derived else processed_root,
+                document.quality_record_path,
+                document.quality_record_sha256,
+                "release_dir" if quality_is_derived else "processed_dir",
+            ),
+        )
+        for name, root, relative_path, expected_hash, root_name in artifact_specs:
+            try:
+                artifact_path = _resolve_relative(
+                    root,
+                    relative_path,
+                    f"{name}_path_outside_{root_name}",
+                    document.document_version_id,
+                )
+            except ValueError as error:
+                errors.append(str(error))
+                continue
+            if not artifact_path.is_file():
+                errors.append(
+                    f"{name}_artifact_missing:{document.document_version_id}"
+                )
+            elif file_sha256(artifact_path) != expected_hash:
+                errors.append(f"{name}_hash_mismatch:{document.document_version_id}")
+    return errors
+
+
+def _release_document(
+    processed_root: Path,
+    chunks_path: Path,
+    canonical: dict[str, Any],
+) -> tuple[ReleaseDocument, dict[str, Any] | None]:
+    version_dir = chunks_path.parent
+    canonical_path = version_dir / "canonical-document.json"
+    processing_record = load_or_infer_processing_record(version_dir)
+    quality_path = version_dir / "quality-record.json"
+    derived_quality: dict[str, Any] | None = None
+    if quality_path.exists():
+        quality_payload = json.loads(quality_path.read_text(encoding="utf-8"))
+        quality_record_path = quality_path.relative_to(processed_root).as_posix()
+        quality_hash = file_sha256(quality_path)
+    else:
+        chunks = _read_jsonl(chunks_path)
+        derived_quality = build_quality_record(canonical, chunks).to_dict()
+        quality_record_path = (
+            f"derived-quality/{processing_record.document_version_id}.json"
+        )
+        quality_hash = sha256_bytes(_json_content(derived_quality))
+
+    document = canonical.get("document") or {}
+    signals = (
+        quality_payload["signals"]
+        if quality_path.exists()
+        else derived_quality["signals"]
+    )
+    status = signals["parse_quality_status"]["value"]
+    raw_score = signals["parse_quality_score"]["value"]
+    quality_score = (
+        float(raw_score)
+        if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool)
+        else None
+    )
+    processing_path = version_dir / "processing-record.json"
+    return (
+        ReleaseDocument(
+            document_id=str(document.get("document_id") or ""),
+            document_version_id=processing_record.document_version_id,
+            canonical_path=canonical_path.relative_to(processed_root).as_posix(),
+            chunks_path=chunks_path.relative_to(processed_root).as_posix(),
+            processing_record_path=(
+                processing_path.relative_to(processed_root).as_posix()
+                if processing_path.exists()
+                else None
+            ),
+            quality_record_path=quality_record_path,
+            canonical_sha256=processing_record.canonical_sha256,
+            chunks_sha256=processing_record.chunks_sha256,
+            quality_record_sha256=quality_hash,
+            processing_run_id=processing_record.processing_run_id,
+            quality_status=str(status),
+            quality_score=quality_score,
+        ),
+        derived_quality,
+    )
+
+
+def _select_latest_processed_versions(
+    processed_dir: Path,
+) -> list[tuple[Path, dict[str, Any]]]:
+    latest_by_document: dict[
+        str, tuple[tuple[int, str, int, str], Path, dict[str, Any]]
+    ] = {}
+    for chunks_path in sorted(processed_dir.rglob("chunks.jsonl")):
+        canonical_path = chunks_path.with_name("canonical-document.json")
+        canonical = (
+            json.loads(canonical_path.read_text(encoding="utf-8"))
+            if canonical_path.exists()
+            else {}
+        )
+        document_key = _processed_document_key(chunks_path, canonical)
+        version_key = _processed_version_sort_key(chunks_path, canonical)
+        current = latest_by_document.get(document_key)
+        if current is None or version_key > current[0]:
+            latest_by_document[document_key] = (version_key, chunks_path, canonical)
+    return sorted(
+        (
+            (chunks_path, canonical)
+            for _, chunks_path, canonical in latest_by_document.values()
+        ),
+        key=lambda item: str(item[0]),
+    )
+
+
+def _processed_document_key(
+    chunks_path: Path,
+    canonical: dict[str, Any],
+) -> str:
+    file_path = normalize_space(
+        str((canonical.get("document_version") or {}).get("file_path") or "")
+    )
+    if file_path:
+        return file_path.lower()
+    document_id = normalize_space(
+        str((canonical.get("document") or {}).get("document_id") or "")
+    )
+    if document_id:
+        return document_id
+    return str(chunks_path.parent.parent)
+
+
+def _processed_version_sort_key(
+    chunks_path: Path,
+    canonical: dict[str, Any],
+) -> tuple[int, str, int, str]:
+    version = canonical.get("document_version") or {}
+    created_at = normalize_space(str(version.get("created_at") or ""))
+    document_version_id = normalize_space(
+        str(version.get("document_version_id") or chunks_path.parent.name)
+    )
+    try:
+        modified_ns = chunks_path.stat().st_mtime_ns
+    except OSError:
+        modified_ns = 0
+    return (
+        1 if created_at else 0,
+        created_at,
+        modified_ns,
+        document_version_id,
+    )
+
+
+def _resolve_relative(
+    root: Path,
+    relative_path: str,
+    error_code: str,
+    document_version_id: str,
+) -> Path:
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError(f"{error_code}:{document_version_id}")
+    resolved = (root / candidate).resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError as error:
+        raise ValueError(f"{error_code}:{document_version_id}") from error
+    return resolved
+
+
+def _is_derived_quality_path(path: str, document_version_id: str) -> bool:
+    return Path(path).parts == (
+        "derived-quality",
+        f"{document_version_id}.json",
+    )
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _json_content(payload: dict[str, Any]) -> bytes:
+    text = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    return text.replace("\n", os.linesep).encode("utf-8")
