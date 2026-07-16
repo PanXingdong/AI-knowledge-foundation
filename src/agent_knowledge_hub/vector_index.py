@@ -9,6 +9,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from agent_knowledge_hub.release_manifest import (
+    iter_release_documents,
+    load_release_manifest,
+)
 from agent_knowledge_hub.utils import normalize_space, write_json
 
 
@@ -84,6 +88,7 @@ class VectorIndexBuildSummary:
     indexed_chunk_count: int
     indexed_document_count: int
     embedding_strategy: str
+    release_id: str | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -92,6 +97,7 @@ class VectorIndexBuildSummary:
             "indexed_chunk_count": self.indexed_chunk_count,
             "indexed_document_count": self.indexed_document_count,
             "embedding_strategy": self.embedding_strategy,
+            "release_id": self.release_id,
         }
 
 
@@ -114,17 +120,22 @@ def build_vector_index(
     *,
     processed_dir: Path | str,
     index_path: Path | str,
+    release_manifest_path: Path | str | None = None,
 ) -> VectorIndexBuildSummary:
     processed_root = Path(processed_dir).resolve()
     resolved_index_path = Path(index_path).resolve()
     if not processed_root.exists():
         raise FileNotFoundError(f"Processed directory does not exist: {processed_root}")
 
+    processed_versions, release_id = _resolve_processed_versions(
+        processed_root,
+        release_manifest_path,
+    )
     rows: list[dict[str, object]] = []
     document_version_ids: set[str] = set()
     document_frequency: Counter[str] = Counter()
 
-    for chunks_path, document_payload in _iter_latest_processed_versions(processed_root):
+    for chunks_path, document_payload in processed_versions:
         document_info = document_payload.get("document") or {}
         version_info = document_payload.get("document_version") or {}
         document_title = normalize_space(str(document_info.get("title") or "unknown"))
@@ -171,6 +182,7 @@ def build_vector_index(
         "schema_version": "vector-index.v1",
         "embedding_strategy": EMBEDDING_STRATEGY,
         "processed_dir": str(processed_root),
+        "release_id": release_id,
         "document_count": len(document_version_ids),
         "chunk_count": len(rows),
         "document_frequency": dict(sorted(document_frequency.items())),
@@ -184,6 +196,7 @@ def build_vector_index(
         indexed_chunk_count=len(rows),
         indexed_document_count=len(document_version_ids),
         embedding_strategy=EMBEDDING_STRATEGY,
+        release_id=release_id,
     )
     write_json(resolved_index_path.with_suffix(".summary.json"), summary.to_dict())
     return summary
@@ -197,6 +210,7 @@ def build_bge_m3_vector_index(
     batch_size: int = 8,
     max_length: int = 1024,
     progress_callback: Callable[[int, int], None] | None = None,
+    release_manifest_path: Path | str | None = None,
 ) -> VectorIndexBuildSummary:
     processed_root = Path(processed_dir).resolve()
     resolved_index_path = Path(index_path).resolve()
@@ -210,7 +224,11 @@ def build_bge_m3_vector_index(
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
 
-    rows, texts, document_version_ids = _collect_dense_index_rows(processed_root)
+    processed_versions, release_id = _resolve_processed_versions(
+        processed_root,
+        release_manifest_path,
+    )
+    rows, texts, document_version_ids = _collect_dense_index_rows(processed_versions)
     if not rows:
         raise ValueError(f"No chunks found under processed directory: {processed_root}")
 
@@ -245,6 +263,7 @@ def build_bge_m3_vector_index(
         "schema_version": "vector-index.v2",
         "embedding_strategy": BGE_M3_EMBEDDING_STRATEGY,
         "processed_dir": str(processed_root),
+        "release_id": release_id,
         "model_path": str(resolved_model_path),
         "model_name": "BAAI/bge-m3",
         "dimension": int(vectors.shape[1]),
@@ -261,6 +280,7 @@ def build_bge_m3_vector_index(
         indexed_chunk_count=len(rows),
         indexed_document_count=len(document_version_ids),
         embedding_strategy=BGE_M3_EMBEDDING_STRATEGY,
+        release_id=release_id,
     )
     write_json(resolved_index_path.with_suffix(".summary.json"), summary.to_dict())
     clear_vector_index_cache()
@@ -276,6 +296,7 @@ def build_bge_m3_vector_index_resumable(
     max_length: int = 512,
     work_dir: Path | str | None = None,
     progress_callback: Callable[[int, int, bool], None] | None = None,
+    release_manifest_path: Path | str | None = None,
 ) -> VectorIndexBuildSummary:
     processed_root = Path(processed_dir).resolve()
     resolved_index_path = Path(index_path).resolve()
@@ -294,7 +315,11 @@ def build_bge_m3_vector_index_resumable(
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
 
-    rows, texts, document_version_ids = _collect_dense_index_rows(processed_root)
+    processed_versions, release_id = _resolve_processed_versions(
+        processed_root,
+        release_manifest_path,
+    )
+    rows, texts, document_version_ids = _collect_dense_index_rows(processed_versions)
     if not rows:
         raise ValueError(f"No chunks found under processed directory: {processed_root}")
 
@@ -353,6 +378,7 @@ def build_bge_m3_vector_index_resumable(
         "schema_version": "vector-index.v2",
         "embedding_strategy": BGE_M3_EMBEDDING_STRATEGY,
         "processed_dir": str(processed_root),
+        "release_id": release_id,
         "model_path": str(resolved_model_path),
         "model_name": "BAAI/bge-m3",
         "dimension": int(vectors.shape[1]),
@@ -369,10 +395,23 @@ def build_bge_m3_vector_index_resumable(
         indexed_chunk_count=len(rows),
         indexed_document_count=len(document_version_ids),
         embedding_strategy=BGE_M3_EMBEDDING_STRATEGY,
+        release_id=release_id,
     )
     write_json(resolved_index_path.with_suffix(".summary.json"), summary.to_dict())
     clear_vector_index_cache()
     return summary
+
+
+def read_vector_release_id(index_path: Path | str) -> str | None:
+    resolved = Path(index_path).resolve()
+    payload_path = (
+        _existing_bge_metadata_path(resolved)
+        if resolved.suffix == ".npz"
+        else resolved
+    )
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    value = payload.get("release_id")
+    return str(value) if value else None
 
 
 def query_vector_index(
@@ -470,7 +509,7 @@ def _query_bge_m3_vector_index(
     query: str,
     limit: int,
 ) -> list[VectorSearchHit]:
-    metadata_path = _bge_metadata_path(index_path)
+    metadata_path = _existing_bge_metadata_path(index_path)
     if not metadata_path.exists():
         raise FileNotFoundError(f"BGE-M3 vector metadata does not exist: {metadata_path}")
 
@@ -537,12 +576,14 @@ def _query_bge_m3_vector_index(
     return hits
 
 
-def _collect_dense_index_rows(processed_root: Path) -> tuple[list[dict[str, str]], list[str], set[str]]:
+def _collect_dense_index_rows(
+    processed_versions: list[tuple[Path, dict[str, Any]]],
+) -> tuple[list[dict[str, str]], list[str], set[str]]:
     rows: list[dict[str, str]] = []
     texts: list[str] = []
     document_version_ids: set[str] = set()
 
-    for chunks_path, document_payload in _iter_latest_processed_versions(processed_root):
+    for chunks_path, document_payload in processed_versions:
         document_info = document_payload.get("document") or {}
         version_info = document_payload.get("document_version") or {}
         document_title = normalize_space(str(document_info.get("title") or "unknown"))
@@ -581,6 +622,19 @@ def _collect_dense_index_rows(processed_root: Path) -> tuple[list[dict[str, str]
     return rows, texts, document_version_ids
 
 
+def _resolve_processed_versions(
+    processed_root: Path,
+    release_manifest_path: Path | str | None,
+) -> tuple[list[tuple[Path, dict[str, Any]]], str | None]:
+    if release_manifest_path is None:
+        return _iter_latest_processed_versions(processed_root), None
+
+    manifest = load_release_manifest(Path(release_manifest_path))
+    if Path(manifest.processed_dir).resolve() != processed_root:
+        raise ValueError("release_processed_dir_mismatch")
+    return iter_release_documents(manifest.manifest_path), manifest.release_id
+
+
 def _load_bge_m3_model(model_path: Path):
     cache_key = str(model_path.resolve())
     if cache_key not in _BGE_MODEL_CACHE:
@@ -612,7 +666,15 @@ def _select_bge_m3_device() -> str:
 
 
 def _bge_metadata_path(index_path: Path) -> Path:
-    return index_path.with_suffix(index_path.suffix + ".metadata.json")
+    return index_path.with_suffix(".metadata.json")
+
+
+def _existing_bge_metadata_path(index_path: Path) -> Path:
+    metadata_path = _bge_metadata_path(index_path)
+    legacy_path = index_path.with_suffix(index_path.suffix + ".metadata.json")
+    if not metadata_path.exists() and legacy_path.exists():
+        return legacy_path
+    return metadata_path
 
 
 def _build_sparse_vector(text: str) -> Counter[str]:
