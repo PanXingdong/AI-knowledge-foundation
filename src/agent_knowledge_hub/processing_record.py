@@ -65,10 +65,15 @@ def build_processing_record(
 
 def load_or_infer_processing_record(version_dir: Path) -> ProcessingRecord:
     record_path = version_dir / "processing-record.json"
-    if record_path.exists():
-        return ProcessingRecord(**json.loads(record_path.read_text(encoding="utf-8")))
     canonical_path = version_dir / "canonical-document.json"
     chunks_path = version_dir / "chunks.jsonl"
+    if record_path.exists():
+        record = ProcessingRecord(**json.loads(record_path.read_text(encoding="utf-8")))
+        if file_sha256(canonical_path) != record.canonical_sha256:
+            raise ValueError(f"canonical_hash_mismatch:{record.document_version_id}")
+        if file_sha256(chunks_path) != record.chunks_sha256:
+            raise ValueError(f"chunks_hash_mismatch:{record.document_version_id}")
+        return record
     payload = json.loads(canonical_path.read_text(encoding="utf-8"))
     version = payload.get("document_version") or {}
     report = payload.get("parse_report") or {}

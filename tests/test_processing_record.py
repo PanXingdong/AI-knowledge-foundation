@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from agent_knowledge_hub.pipeline import ingest_file
 from agent_knowledge_hub.processing_record import (
     PROCESSING_RECORD_SCHEMA_VERSION,
@@ -46,3 +48,29 @@ def test_legacy_processing_record_is_inferred_without_mutating_files(tmp_path: P
     assert record.document_version_id == "docver_1"
     assert record.record_origin == "legacy_inferred"
     assert not (version_dir / "processing-record.json").exists()
+
+
+def test_existing_processing_record_rejects_tampered_canonical(tmp_path: Path):
+    source = tmp_path / "spec.md"
+    source.write_text("# API\n\nMsgSend() sends a message.", encoding="utf-8")
+    result = ingest_file(file_path=source, out_dir=tmp_path / "processed")
+    result.document_json_path.write_text('{"tampered":true}', encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=rf"^canonical_hash_mismatch:{result.document_version_id}$",
+    ):
+        load_or_infer_processing_record(result.output_dir)
+
+
+def test_existing_processing_record_rejects_tampered_chunks(tmp_path: Path):
+    source = tmp_path / "spec.md"
+    source.write_text("# API\n\nMsgSend() sends a message.", encoding="utf-8")
+    result = ingest_file(file_path=source, out_dir=tmp_path / "processed")
+    result.chunks_jsonl_path.write_text('{"tampered":true}\n', encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=rf"^chunks_hash_mismatch:{result.document_version_id}$",
+    ):
+        load_or_infer_processing_record(result.output_dir)
