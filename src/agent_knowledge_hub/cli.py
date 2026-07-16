@@ -131,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
                 fts_index_path=args.fts_index_path,
                 vector_index_path=args.vector_index_path,
                 token_budget=args.token_budget,
+                release_manifest_path=args.release_manifest_path,
             )
             if args.output_dir:
                 bundle_paths = write_context_pack_bundle(
@@ -434,6 +435,7 @@ def _build_parser() -> argparse.ArgumentParser:
     context_pack_parser.add_argument("--document-version", action="append")
     context_pack_parser.add_argument("--fts-index-path", type=Path)
     context_pack_parser.add_argument("--vector-index-path", type=Path)
+    context_pack_parser.add_argument("--release-manifest-path", type=Path)
     context_pack_parser.add_argument("--output-dir", type=Path)
     context_pack_parser.add_argument("--output-path", type=Path)
 

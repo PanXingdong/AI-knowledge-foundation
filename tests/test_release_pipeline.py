@@ -91,6 +91,100 @@ def test_build_and_activate_release_cli_requires_explicit_activation(
     )
 
 
+def test_context_pack_cli_uses_ready_release_manifest_and_bound_indexes(
+    tmp_path: Path,
+    capsys,
+):
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "one.md", "One", "alpha API " * 20)
+    releases = tmp_path / "releases"
+    assert main(
+        [
+            "build-release",
+            "--processed-dir",
+            str(processed),
+            "--releases-dir",
+            str(releases),
+        ]
+    ) == 0
+    build_payload = json.loads(capsys.readouterr().out)
+    ready = load_release_manifest(Path(build_payload["manifest_path"]))
+
+    assert main(
+        [
+            "context-pack",
+            "--processed-dir",
+            str(processed),
+            "--release-manifest-path",
+            str(ready.manifest_path),
+            "--fts-index-path",
+            str(ready.resolve_artifact("fts")),
+            "--vector-index-path",
+            str(ready.resolve_artifact("vector")),
+            "--query",
+            "alpha",
+            "--output-dir",
+            str(tmp_path / "context-pack"),
+        ]
+    ) == 0
+
+    context_payload = json.loads(capsys.readouterr().out)
+    assert context_payload["release_id"] == ready.release_id
+
+
+def test_context_pack_cli_rejects_mismatched_release_indexes(
+    tmp_path: Path,
+    capsys,
+):
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "one.md", "One", "alpha API " * 20)
+    releases = tmp_path / "releases"
+    assert main(
+        [
+            "build-release",
+            "--processed-dir",
+            str(processed),
+            "--releases-dir",
+            str(releases),
+        ]
+    ) == 0
+    first_payload = json.loads(capsys.readouterr().out)
+    first = load_release_manifest(Path(first_payload["manifest_path"]))
+    _ingest(processed, tmp_path / "two.md", "Two", "beta API " * 20)
+    assert main(
+        [
+            "build-release",
+            "--processed-dir",
+            str(processed),
+            "--releases-dir",
+            str(releases),
+        ]
+    ) == 0
+    second_payload = json.loads(capsys.readouterr().out)
+
+    assert main(
+        [
+            "context-pack",
+            "--processed-dir",
+            str(processed),
+            "--release-manifest-path",
+            second_payload["manifest_path"],
+            "--fts-index-path",
+            str(first.resolve_artifact("fts")),
+            "--vector-index-path",
+            str(first.resolve_artifact("vector")),
+            "--query",
+            "alpha",
+            "--output-dir",
+            str(tmp_path / "mismatched-context-pack"),
+        ]
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ERROR: fts_release_mismatch:" in captured.err
+
+
 def test_index_failure_preserves_candidate_diagnostics_without_activation(
     tmp_path: Path,
     monkeypatch,
