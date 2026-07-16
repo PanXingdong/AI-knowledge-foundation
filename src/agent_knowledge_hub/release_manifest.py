@@ -67,7 +67,16 @@ class ReleaseManifest:
 
     def resolve_artifact(self, name: str) -> Path:
         relative_path = self.indexes[name]["path"]
-        return (self.manifest_path.parent / relative_path).resolve()
+        release_root = self.manifest_path.parent.resolve()
+        candidate = Path(relative_path)
+        if candidate.is_absolute():
+            raise ValueError(f"release_artifact_path_escape:{name}")
+        resolved = (release_root / candidate).resolve()
+        try:
+            resolved.relative_to(release_root)
+        except ValueError as error:
+            raise ValueError(f"release_artifact_path_escape:{name}") from error
+        return resolved
 
 
 def create_candidate_release(
@@ -97,6 +106,13 @@ def create_candidate_release(
         ],
     )
     manifest_path = releases_root / release_id / "release-manifest.json"
+    if manifest_path.exists():
+        return _load_matching_existing_release(
+            manifest_path,
+            release_id,
+            documents,
+        )
+
     for document, derived_quality in drafts:
         if derived_quality is not None:
             write_json(
@@ -136,6 +152,25 @@ def load_release_manifest(path: Path) -> ReleaseManifest:
         baseline=payload["baseline"],
         manifest_path=manifest_path,
     )
+
+
+def _load_matching_existing_release(
+    manifest_path: Path,
+    release_id: str,
+    documents: tuple[ReleaseDocument, ...],
+) -> ReleaseManifest:
+    error_message = f"existing_release_manifest_mismatch:{release_id}"
+    try:
+        existing = load_release_manifest(manifest_path)
+        if (
+            existing.release_id != release_id
+            or existing.documents != documents
+            or validate_release_artifacts(manifest_path)
+        ):
+            raise ValueError(error_message)
+    except (KeyError, OSError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError(error_message) from error
+    return existing
 
 
 def iter_release_documents(
@@ -192,6 +227,18 @@ def validate_release_artifacts(manifest_path: Path) -> list[str]:
                         "processing_record_artifact_missing:"
                         f"{document.document_version_id}"
                     )
+                else:
+                    processing_payload = json.loads(
+                        processing_path.read_text(encoding="utf-8")
+                    )
+                    if (
+                        str(processing_payload.get("document_version_id") or "")
+                        != document.document_version_id
+                    ):
+                        errors.append(
+                            "processing_record_document_version_mismatch:"
+                            f"{document.document_version_id}"
+                        )
         quality_is_derived = _is_derived_quality_path(
             document.quality_record_path,
             document.document_version_id,
@@ -236,6 +283,30 @@ def validate_release_artifacts(manifest_path: Path) -> list[str]:
                 )
             elif file_sha256(artifact_path) != expected_hash:
                 errors.append(f"{name}_hash_mismatch:{document.document_version_id}")
+            elif name == "canonical":
+                canonical_payload = json.loads(
+                    artifact_path.read_text(encoding="utf-8")
+                )
+                if (
+                    _canonical_document_version_id(canonical_payload)
+                    != document.document_version_id
+                ):
+                    errors.append(
+                        "canonical_document_version_mismatch:"
+                        f"{document.document_version_id}"
+                    )
+            elif name == "quality_record":
+                quality_payload = json.loads(
+                    artifact_path.read_text(encoding="utf-8")
+                )
+                if (
+                    str(quality_payload.get("document_version_id") or "")
+                    != document.document_version_id
+                ):
+                    errors.append(
+                        "quality_record_document_version_mismatch:"
+                        f"{document.document_version_id}"
+                    )
     return errors
 
 
@@ -246,11 +317,25 @@ def _release_document(
 ) -> tuple[ReleaseDocument, dict[str, Any] | None]:
     version_dir = chunks_path.parent
     canonical_path = version_dir / "canonical-document.json"
+    document_version_id = _canonical_document_version_id(canonical)
     processing_record = load_or_infer_processing_record(version_dir)
+    if processing_record.document_version_id != document_version_id:
+        raise ValueError(
+            "processing_record_document_version_mismatch:"
+            f"{document_version_id}"
+        )
     quality_path = version_dir / "quality-record.json"
     derived_quality: dict[str, Any] | None = None
     if quality_path.exists():
         quality_payload = json.loads(quality_path.read_text(encoding="utf-8"))
+        if (
+            str(quality_payload.get("document_version_id") or "")
+            != document_version_id
+        ):
+            raise ValueError(
+                "quality_record_document_version_mismatch:"
+                f"{document_version_id}"
+            )
         quality_record_path = quality_path.relative_to(processed_root).as_posix()
         quality_hash = file_sha256(quality_path)
     else:
@@ -278,7 +363,7 @@ def _release_document(
     return (
         ReleaseDocument(
             document_id=str(document.get("document_id") or ""),
-            document_version_id=processing_record.document_version_id,
+            document_version_id=document_version_id,
             canonical_path=canonical_path.relative_to(processed_root).as_posix(),
             chunks_path=chunks_path.relative_to(processed_root).as_posix(),
             processing_record_path=(
@@ -393,6 +478,12 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _canonical_document_version_id(payload: dict[str, Any]) -> str:
+    return str(
+        (payload.get("document_version") or {}).get("document_version_id") or ""
+    )
 
 
 def _json_content(payload: dict[str, Any]) -> bytes:

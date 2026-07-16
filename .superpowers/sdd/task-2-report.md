@@ -173,3 +173,129 @@ git diff --check
 
 - `load_release_manifest()` 按 dataclass 字段加载 manifest，但不会在运行时执行 JSON Schema 校验；简报要求提供严格 schema 且禁止增加运行时依赖，因此本任务未引入 `jsonschema`。
 - latest-version 排序逻辑按现有实现局部复用，以避免提前改动索引/检索模块；未来若统一该排序规则，应将各处重复实现收敛到共享模块。
+
+## 审查修复：manifest 完整性加固
+
+### 修复内容
+
+- `ReleaseManifest.resolve_artifact()` 拒绝绝对路径，以及解析后逃逸
+  `manifest_path.parent` 的相对路径，稳定错误为
+  `release_artifact_path_escape:<name>`。
+- 候选创建以 canonical 的 `document_version_id` 为权威值，要求 processing
+  record 与 quality record 的版本 ID 相同。
+- `validate_release_artifacts()` 在路径、存在性和对应哈希通过后，继续验证
+  canonical、processing record、quality record 的版本 ID 与 manifest item 一致。
+- 同 release ID 的 manifest 已存在时，在任何写入前核对 release ID、完整文档
+  条目与实际产物；一致则直接返回已有 manifest，不改变
+  `created_at/status/indexes/baseline` 或文件字节，不一致则抛出
+  `existing_release_manifest_mismatch:<release_id>`。
+- 未增加索引、检索、finalize API 或运行时依赖。
+
+### TDD 证据
+
+#### RED 5：release artifact 路径逃逸
+
+```powershell
+python -m pytest tests/test_release_manifest.py -q -k "resolve_artifact"
+```
+
+结果：exit 1；绝对路径与 `../../outside.db` 均未抛错：
+
+```text
+2 failed, 11 deselected in 0.19s
+```
+
+#### GREEN 5
+
+同一命令结果：
+
+```text
+2 passed, 11 deselected in 0.11s
+```
+
+#### RED 6：跨产物版本一致性
+
+```powershell
+python -m pytest tests/test_release_manifest.py -q -k "other_version"
+```
+
+结果：exit 1；创建阶段的 quality/processing 错配，以及落盘后重算哈希的
+canonical/quality 错配和 processing 错配均未被阻断：
+
+```text
+5 failed, 13 deselected in 0.35s
+```
+
+#### GREEN 6
+
+同一命令结果：
+
+```text
+5 passed, 13 deselected in 0.25s
+```
+
+#### RED 7：同 release ID 重复创建
+
+```powershell
+python -m pytest tests/test_release_manifest.py -q -k "repeated"
+```
+
+结果：exit 1；重复调用刷新 `created_at`、覆盖 ready 状态，且未拒绝不一致的
+已有 manifest：
+
+```text
+3 failed, 18 deselected in 0.26s
+```
+
+#### GREEN 7
+
+同一命令结果：
+
+```text
+3 passed, 18 deselected in 0.20s
+```
+
+### 审查修复测试
+
+任务 2 测试：
+
+```powershell
+python -m pytest tests/test_release_manifest.py tests/test_schema_contracts.py -q
+```
+
+结果：`27 passed in 0.88s`。
+
+相关回归：
+
+```powershell
+python -m pytest tests/test_release_manifest.py tests/test_schema_contracts.py tests/test_processing_record.py tests/test_quality_contracts.py tests/test_document_ingest_pipeline.py tests/test_runtime_dependencies.py -q
+```
+
+结果：`45 passed in 1.10s`。
+
+语法与差异检查：
+
+```powershell
+python -m compileall -q src/agent_knowledge_hub
+git diff --check
+```
+
+结果：exit 0，无输出。
+
+### 审查修复修改文件
+
+- 修改 `src/agent_knowledge_hub/release_manifest.py`
+- 修改 `tests/test_release_manifest.py`
+- 追加 `.superpowers/sdd/task-2-report.md`
+
+### 审查修复自查
+
+- 路径：覆盖 Windows 绝对路径和父目录逃逸；解析后仍以 release 根目录为边界。
+- 版本：普通内容篡改仍优先保持既有 hash mismatch；只有哈希有效时追加版本一致性检查。
+- 幂等：已有 ready manifest 的状态、索引、基线和原始字节均被测试锁定。
+- 范围：未触及索引、检索、CLI、激活或正式 finalize API。
+- 依赖：未引入 JSON Schema 运行时库或其他依赖。
+
+### 审查修复顾虑
+
+- 无新增顾虑；原报告中关于运行时 schema 校验和 latest 排序局部复用的说明仍适用。
