@@ -30,12 +30,16 @@ from agent_knowledge_hub.inventory import (
 )
 from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.layer2_run import run_layer2_acceptance
-from agent_knowledge_hub.vector_index import build_vector_index
 from agent_knowledge_hub.pipeline import ingest_file, ingest_manifest
 from agent_knowledge_hub.quality import (
     build_parse_quality_summary,
     write_parse_quality_summary_bundle,
 )
+from agent_knowledge_hub.release_manifest import (
+    activate_release,
+    load_release_manifest,
+)
+from agent_knowledge_hub.release_pipeline import build_release_bundle
 from agent_knowledge_hub.retrieval import (
     build_context_pack_for_processed_dir,
     compare_context_pack_against_reference,
@@ -44,6 +48,7 @@ from agent_knowledge_hub.retrieval import (
     write_context_pack_bundle,
     write_gap_report_bundle,
 )
+from agent_knowledge_hub.vector_index import build_vector_index
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -199,6 +204,24 @@ def main(argv: list[str] | None = None) -> int:
                 index_path=args.index_path,
             )
             payload = summary.to_dict()
+        elif args.command == "build-release":
+            release = build_release_bundle(
+                processed_dir=args.processed_dir,
+                releases_dir=args.releases_dir,
+            )
+            payload = {
+                **release.to_dict(),
+                "manifest_path": str(release.manifest_path),
+            }
+        elif args.command == "activate-release":
+            activate_release(args.manifest_path, args.active_pointer)
+            release = load_release_manifest(args.manifest_path)
+            payload = {
+                "release_id": release.release_id,
+                "status": release.status,
+                "manifest_path": str(release.manifest_path),
+                "active_pointer": str(args.active_pointer.resolve()),
+            }
         elif args.command == "layer2-run":
             summary = run_layer2_acceptance(
                 processed_dir=args.processed_dir,
@@ -450,6 +473,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     vector_parser.add_argument("--processed-dir", required=True, type=Path)
     vector_parser.add_argument("--index-path", required=True, type=Path)
+
+    build_release_parser = subparsers.add_parser(
+        "build-release",
+        help="Build a release-bound FTS index, vector index, and quality baseline.",
+    )
+    build_release_parser.add_argument("--processed-dir", required=True, type=Path)
+    build_release_parser.add_argument("--releases-dir", required=True, type=Path)
+
+    activate_release_parser = subparsers.add_parser(
+        "activate-release",
+        help="Atomically point production at a ready release.",
+    )
+    activate_release_parser.add_argument("--manifest-path", required=True, type=Path)
+    activate_release_parser.add_argument("--active-pointer", required=True, type=Path)
 
     layer2_parser = subparsers.add_parser(
         "layer2-run",
