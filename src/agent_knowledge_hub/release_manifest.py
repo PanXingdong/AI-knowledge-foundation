@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -152,6 +152,104 @@ def load_release_manifest(path: Path) -> ReleaseManifest:
         baseline=payload["baseline"],
         manifest_path=manifest_path,
     )
+
+
+def finalize_release(
+    manifest_path: Path,
+    fts_index_path: Path,
+    vector_index_path: Path,
+    baseline_path: Path,
+) -> ReleaseManifest:
+    manifest = load_release_manifest(manifest_path)
+    errors = validate_release_artifacts(manifest.manifest_path)
+    if errors:
+        raise ValueError(";".join(errors))
+
+    release_root = manifest.manifest_path.parent.resolve()
+    fts_path, fts_relative = _release_relative_artifact(
+        release_root,
+        fts_index_path,
+        "fts",
+    )
+    vector_path, vector_relative = _release_relative_artifact(
+        release_root,
+        vector_index_path,
+        "vector",
+    )
+    baseline_file, baseline_relative = _release_relative_artifact(
+        release_root,
+        baseline_path,
+        "baseline",
+    )
+    for name, path in (
+        ("fts", fts_path),
+        ("vector", vector_path),
+        ("baseline", baseline_file),
+    ):
+        if not path.is_file():
+            raise ValueError(f"{name}_artifact_missing")
+
+    from agent_knowledge_hub.fts_index import read_fts_release_id
+    from agent_knowledge_hub.vector_index import read_vector_release_id
+
+    if read_fts_release_id(fts_path) != manifest.release_id:
+        raise ValueError("fts_release_mismatch")
+    if read_vector_release_id(vector_path) != manifest.release_id:
+        raise ValueError("vector_release_mismatch")
+    baseline_payload = json.loads(baseline_file.read_text(encoding="utf-8"))
+    if baseline_payload.get("release_id") != manifest.release_id:
+        raise ValueError("baseline_release_mismatch")
+
+    ready = replace(
+        manifest,
+        status="ready",
+        indexes={
+            "fts": {
+                "path": fts_relative,
+                "sha256": file_sha256(fts_path),
+            },
+            "vector": {
+                "path": vector_relative,
+                "sha256": file_sha256(vector_path),
+            },
+        },
+        baseline={
+            "path": baseline_relative,
+            "sha256": file_sha256(baseline_file),
+        },
+    )
+    _atomic_write_json(ready.manifest_path, ready.to_dict())
+    return ready
+
+
+def activate_release(
+    manifest_path: Path,
+    active_pointer_path: Path,
+) -> None:
+    manifest = load_release_manifest(manifest_path)
+    if manifest.status != "ready":
+        raise ValueError("release_not_ready")
+    _validate_bound_release(manifest)
+
+    pointer_path = active_pointer_path.resolve()
+    _atomic_write_json(
+        pointer_path,
+        {
+            "schema_version": "active-knowledge-release.v1",
+            "release_id": manifest.release_id,
+            "manifest_path": str(manifest.manifest_path.resolve()),
+        },
+    )
+
+
+def load_active_release(active_pointer_path: Path) -> ReleaseManifest:
+    payload = json.loads(
+        active_pointer_path.resolve().read_text(encoding="utf-8")
+    )
+    manifest = load_release_manifest(Path(str(payload["manifest_path"])))
+    if manifest.release_id != payload.get("release_id"):
+        raise ValueError("active_release_mismatch")
+    return manifest
 
 
 def _load_matching_existing_release(
@@ -463,6 +561,68 @@ def _resolve_relative(
     except ValueError as error:
         raise ValueError(f"{error_code}:{document_version_id}") from error
     return resolved
+
+
+def _release_relative_artifact(
+    release_root: Path,
+    path: Path,
+    name: str,
+) -> tuple[Path, str]:
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(release_root.resolve())
+    except ValueError as error:
+        raise ValueError(f"release_artifact_path_escape:{name}") from error
+    return resolved, relative.as_posix()
+
+
+def _validate_bound_release(manifest: ReleaseManifest) -> None:
+    errors = validate_release_artifacts(manifest.manifest_path)
+    if errors:
+        raise ValueError(";".join(errors))
+
+    try:
+        fts_path = manifest.resolve_artifact("fts")
+        vector_path = manifest.resolve_artifact("vector")
+        baseline_binding = manifest.baseline or {}
+        baseline_path, _ = _release_relative_artifact(
+            manifest.manifest_path.parent.resolve(),
+            manifest.manifest_path.parent / baseline_binding["path"],
+            "baseline",
+        )
+    except KeyError as error:
+        raise ValueError("release_artifact_binding_missing") from error
+
+    bindings = (
+        ("fts", fts_path, manifest.indexes["fts"]),
+        ("vector", vector_path, manifest.indexes["vector"]),
+        ("baseline", baseline_path, baseline_binding),
+    )
+    for name, path, binding in bindings:
+        if not path.is_file():
+            raise ValueError(f"{name}_artifact_missing")
+        if file_sha256(path) != binding.get("sha256"):
+            raise ValueError(f"{name}_hash_mismatch")
+
+    from agent_knowledge_hub.fts_index import read_fts_release_id
+    from agent_knowledge_hub.vector_index import read_vector_release_id
+
+    if read_fts_release_id(fts_path) != manifest.release_id:
+        raise ValueError("fts_release_mismatch")
+    if read_vector_release_id(vector_path) != manifest.release_id:
+        raise ValueError("vector_release_mismatch")
+    baseline_payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+    if baseline_payload.get("release_id") != manifest.release_id:
+        raise ValueError("baseline_release_mismatch")
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        write_json(temp_path, payload)
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _is_derived_quality_path(path: str, document_version_id: str) -> bool:

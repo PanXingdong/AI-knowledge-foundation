@@ -1,16 +1,23 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.pipeline import ingest_file
+from agent_knowledge_hub.quality_baseline import build_quality_baseline
 from agent_knowledge_hub.release_manifest import (
+    activate_release,
     create_candidate_release,
+    finalize_release,
     iter_release_documents,
+    load_active_release,
     load_release_manifest,
     validate_release_artifacts,
 )
-from agent_knowledge_hub.utils import file_sha256
+from agent_knowledge_hub.utils import file_sha256, write_json
+from agent_knowledge_hub.vector_index import build_vector_index
 
 
 def _ingest_version(root: Path, source: Path, version: str, text: str):
@@ -28,6 +35,42 @@ def _write_json(path: Path, payload: dict):
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+
+
+def _build_release_artifacts(tmp_path: Path):
+    processed = tmp_path / "processed"
+    _ingest_version(
+        processed,
+        tmp_path / "one.md",
+        "v1",
+        "# One\n\nOne evidence",
+    )
+    _ingest_version(
+        processed,
+        tmp_path / "two.md",
+        "v1",
+        "# Two\n\nTwo evidence",
+    )
+    release = create_candidate_release(processed, tmp_path / "releases")
+    release_dir = release.manifest_path.parent
+    fts_path = release_dir / "indexes" / "chunks.db"
+    vector_path = release_dir / "indexes" / "chunks.json"
+    baseline_path = release_dir / "quality-baseline.json"
+    build_fts_index(
+        processed_dir=processed,
+        index_path=fts_path,
+        release_manifest_path=release.manifest_path,
+    )
+    build_vector_index(
+        processed_dir=processed,
+        index_path=vector_path,
+        release_manifest_path=release.manifest_path,
+    )
+    write_json(
+        baseline_path,
+        build_quality_baseline(release.manifest_path).to_dict(),
+    )
+    return release, fts_path, vector_path, baseline_path
 
 
 def test_candidate_release_pins_one_explicit_version(tmp_path: Path):
@@ -389,3 +432,170 @@ def test_candidate_release_requires_at_least_one_document(tmp_path: Path):
         match="^Cannot create a release without documents$",
     ):
         create_candidate_release(tmp_path / "empty", tmp_path / "releases")
+
+
+def test_activation_requires_ready_release(tmp_path: Path):
+    release, _, _, _ = _build_release_artifacts(tmp_path)
+    pointer = tmp_path / "active" / "active-release.json"
+
+    with pytest.raises(ValueError, match="^release_not_ready$"):
+        activate_release(release.manifest_path, pointer)
+
+    assert not pointer.exists()
+    assert not pointer.with_suffix(pointer.suffix + ".tmp").exists()
+
+
+@pytest.mark.parametrize(
+    ("artifact", "error_code"),
+    [
+        ("fts", "fts_release_mismatch"),
+        ("vector", "vector_release_mismatch"),
+        ("baseline", "baseline_release_mismatch"),
+    ],
+)
+def test_finalize_rejects_release_id_mismatch(
+    tmp_path: Path,
+    artifact: str,
+    error_code: str,
+):
+    release, fts_path, vector_path, baseline_path = _build_release_artifacts(
+        tmp_path
+    )
+    if artifact == "fts":
+        connection = sqlite3.connect(fts_path)
+        try:
+            connection.execute(
+                "UPDATE release_metadata SET value = 'release_other' "
+                "WHERE key = 'release_id'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    else:
+        path = vector_path if artifact == "vector" else baseline_path
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["release_id"] = "release_other"
+        write_json(path, payload)
+
+    with pytest.raises(ValueError, match=f"^{error_code}$"):
+        finalize_release(
+            release.manifest_path,
+            fts_index_path=fts_path,
+            vector_index_path=vector_path,
+            baseline_path=baseline_path,
+        )
+
+    assert load_release_manifest(release.manifest_path).status == "candidate"
+    assert not release.manifest_path.with_suffix(
+        release.manifest_path.suffix + ".tmp"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    ("artifact", "error_prefix"),
+    [
+        ("canonical", "canonical_hash_mismatch"),
+        ("chunks", "chunks_hash_mismatch"),
+        ("quality", "quality_record_hash_mismatch"),
+    ],
+)
+def test_finalize_rejects_mutated_source_artifact(
+    tmp_path: Path,
+    artifact: str,
+    error_prefix: str,
+):
+    release, fts_path, vector_path, baseline_path = _build_release_artifacts(
+        tmp_path
+    )
+    document = release.documents[0]
+    if artifact == "canonical":
+        path = Path(release.processed_dir) / document.canonical_path
+    elif artifact == "chunks":
+        path = Path(release.processed_dir) / document.chunks_path
+    else:
+        path = Path(release.processed_dir) / document.quality_record_path
+    path.write_bytes(path.read_bytes() + b" ")
+
+    with pytest.raises(ValueError, match=f"^{error_prefix}:"):
+        finalize_release(
+            release.manifest_path,
+            fts_index_path=fts_path,
+            vector_index_path=vector_path,
+            baseline_path=baseline_path,
+        )
+
+
+def test_finalize_binds_relative_paths_and_hashes_then_activates_atomically(
+    tmp_path: Path,
+):
+    release, fts_path, vector_path, baseline_path = _build_release_artifacts(
+        tmp_path
+    )
+
+    ready = finalize_release(
+        release.manifest_path,
+        fts_index_path=fts_path,
+        vector_index_path=vector_path,
+        baseline_path=baseline_path,
+    )
+
+    assert ready.status == "ready"
+    assert ready.indexes == {
+        "fts": {
+            "path": "indexes/chunks.db",
+            "sha256": file_sha256(fts_path),
+        },
+        "vector": {
+            "path": "indexes/chunks.json",
+            "sha256": file_sha256(vector_path),
+        },
+    }
+    assert ready.baseline == {
+        "path": "quality-baseline.json",
+        "sha256": file_sha256(baseline_path),
+    }
+    assert not ready.manifest_path.with_suffix(
+        ready.manifest_path.suffix + ".tmp"
+    ).exists()
+
+    pointer = tmp_path / "runtime" / "nested" / "active-release.json"
+    activate_release(ready.manifest_path, pointer)
+
+    assert load_active_release(pointer) == ready
+    assert not pointer.with_suffix(pointer.suffix + ".tmp").exists()
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    ["canonical", "chunks", "quality", "fts", "vector", "baseline"],
+)
+def test_activation_rejects_tampered_ready_release_artifact(
+    tmp_path: Path,
+    artifact: str,
+):
+    release, fts_path, vector_path, baseline_path = _build_release_artifacts(
+        tmp_path
+    )
+    ready = finalize_release(
+        release.manifest_path,
+        fts_index_path=fts_path,
+        vector_index_path=vector_path,
+        baseline_path=baseline_path,
+    )
+    document = ready.documents[0]
+    paths = {
+        "canonical": Path(ready.processed_dir) / document.canonical_path,
+        "chunks": Path(ready.processed_dir) / document.chunks_path,
+        "quality": Path(ready.processed_dir) / document.quality_record_path,
+        "fts": fts_path,
+        "vector": vector_path,
+        "baseline": baseline_path,
+    }
+    paths[artifact].write_bytes(paths[artifact].read_bytes() + b" ")
+    pointer = tmp_path / "active-release.json"
+
+    with pytest.raises(ValueError, match="hash_mismatch"):
+        activate_release(ready.manifest_path, pointer)
+
+    assert not pointer.exists()
+    assert not pointer.with_suffix(pointer.suffix + ".tmp").exists()
