@@ -6,6 +6,7 @@ import pytest
 
 from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.pipeline import ingest_file
+from agent_knowledge_hub.processing_record import processing_run_id
 from agent_knowledge_hub.quality_baseline import build_quality_baseline
 from agent_knowledge_hub.release_manifest import (
     activate_release,
@@ -183,6 +184,77 @@ def test_candidate_release_rejects_invalid_processing_run_identity(tmp_path: Pat
         create_candidate_release(processed, tmp_path / "releases")
 
 
+@pytest.mark.parametrize("entrypoint", ["create", "validate"])
+@pytest.mark.parametrize(
+    ("field", "fake_value", "error_code"),
+    [
+        (
+            "source_file_hash",
+            "f" * 64,
+            "processing_record_source_file_hash_mismatch",
+        ),
+        (
+            "parser_name",
+            "forged-parser",
+            "processing_record_parser_name_mismatch",
+        ),
+        (
+            "chunker_version",
+            "forged-chunker",
+            "processing_record_chunker_version_mismatch",
+        ),
+    ],
+)
+def test_release_rejects_forged_processing_provenance_with_recomputed_run(
+    tmp_path: Path,
+    entrypoint: str,
+    field: str,
+    fake_value: str,
+    error_code: str,
+):
+    processed = tmp_path / "processed"
+    result = _ingest_version(
+        processed, tmp_path / "demo.md", "v1", "# V1\n\noriginal"
+    )
+    manifest = (
+        create_candidate_release(processed, tmp_path / "releases")
+        if entrypoint == "validate"
+        else None
+    )
+    payload = json.loads(result.processing_record_path.read_text(encoding="utf-8"))
+    payload[field] = fake_value
+    payload["processing_run_id"] = processing_run_id(
+        document_version_id=payload["document_version_id"],
+        source_file_hash=payload["source_file_hash"],
+        parser_name=payload["parser_name"],
+        chunker_version=payload["chunker_version"],
+        quality_rules_version=payload["quality_rules_version"],
+        canonical_sha256=payload["canonical_sha256"],
+        chunks_sha256=payload["chunks_sha256"],
+    )
+    write_json(result.processing_record_path, payload)
+
+    if entrypoint == "create":
+        with pytest.raises(
+            ValueError,
+            match=rf"^{error_code}:{result.document_version_id}$",
+        ):
+            create_candidate_release(processed, tmp_path / "releases")
+        return
+
+    manifest_payload = json.loads(manifest.manifest_path.read_text(encoding="utf-8"))
+    manifest_payload["documents"][0]["processing_record_sha256"] = file_sha256(
+        result.processing_record_path
+    )
+    manifest_payload["documents"][0]["processing_run_id"] = payload[
+        "processing_run_id"
+    ]
+    write_json(manifest.manifest_path, manifest_payload)
+    assert validate_release_artifacts(manifest.manifest_path) == [
+        f"{error_code}:{result.document_version_id}"
+    ]
+
+
 def test_release_validation_rejects_rehashed_canonical_from_other_version(
     tmp_path: Path,
 ):
@@ -219,7 +291,7 @@ def test_release_validation_rejects_processing_record_from_other_version(
     _write_json(result.processing_record_path, processing)
 
     assert validate_release_artifacts(manifest.manifest_path) == [
-        f"processing_record_hash_mismatch:{result.document_version_id}"
+        f"processing_record_document_version_mismatch:{result.document_version_id}"
     ]
 
 

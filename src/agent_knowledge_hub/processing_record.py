@@ -88,22 +88,36 @@ def load_or_infer_processing_record(version_dir: Path) -> ProcessingRecord:
     chunks_path = version_dir / "chunks.jsonl"
     if record_path.exists():
         record = ProcessingRecord(**json.loads(record_path.read_text(encoding="utf-8")))
+        if record.schema_version != PROCESSING_RECORD_SCHEMA_VERSION:
+            raise ValueError(
+                f"processing_record_schema_mismatch:{record.document_version_id}"
+            )
         if file_sha256(canonical_path) != record.canonical_sha256:
             raise ValueError(f"canonical_hash_mismatch:{record.document_version_id}")
         if file_sha256(chunks_path) != record.chunks_sha256:
             raise ValueError(f"chunks_hash_mismatch:{record.document_version_id}")
         payload = json.loads(canonical_path.read_text(encoding="utf-8"))
-        actual_document_version_id = str(
-            (payload.get("document_version") or {}).get("document_version_id") or ""
-        )
-        if record.schema_version != PROCESSING_RECORD_SCHEMA_VERSION:
-            raise ValueError(
-                f"processing_record_schema_mismatch:{record.document_version_id}"
-            )
+        version = payload.get("document_version") or {}
+        report = payload.get("parse_report") or {}
+        actual_document_version_id = str(version.get("document_version_id") or "")
         if record.document_version_id != actual_document_version_id:
             raise ValueError(
                 "processing_record_document_version_mismatch:"
                 f"{actual_document_version_id}"
+            )
+        if record.source_file_hash != str(version.get("file_hash") or ""):
+            raise ValueError(
+                "processing_record_source_file_hash_mismatch:"
+                f"{record.document_version_id}"
+            )
+        if record.parser_name != str(report.get("parser_name") or ""):
+            raise ValueError(
+                f"processing_record_parser_name_mismatch:{record.document_version_id}"
+            )
+        if record.chunker_version != CHUNKER_VERSION:
+            raise ValueError(
+                "processing_record_chunker_version_mismatch:"
+                f"{record.document_version_id}"
             )
         if record.quality_rules_version != QUALITY_RULES_VERSION:
             raise ValueError(

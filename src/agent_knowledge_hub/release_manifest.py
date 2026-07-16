@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_knowledge_hub.processing_record import (
+    CHUNKER_VERSION,
     PROCESSING_RECORD_SCHEMA_VERSION,
     QUALITY_RULES_VERSION,
     load_or_infer_processing_record,
@@ -335,6 +336,25 @@ def validate_release_artifacts(manifest_path: Path) -> list[str]:
     release_root = manifest.manifest_path.parent.resolve()
     errors: list[str] = []
     for document in manifest.documents:
+        canonical_payload: dict[str, Any] | None = None
+        try:
+            provenance_canonical_path = _resolve_relative(
+                processed_root,
+                document.canonical_path,
+                "canonical_path_outside_processed_dir",
+                document.document_version_id,
+            )
+        except ValueError:
+            pass
+        else:
+            if (
+                provenance_canonical_path.is_file()
+                and file_sha256(provenance_canonical_path)
+                == document.canonical_sha256
+            ):
+                canonical_payload = json.loads(
+                    provenance_canonical_path.read_text(encoding="utf-8")
+                )
         processing_is_derived = _is_derived_processing_path(
             document.processing_record_path,
             document.document_version_id,
@@ -355,21 +375,23 @@ def validate_release_artifacts(manifest_path: Path) -> list[str]:
                     "processing_record_artifact_missing:"
                     f"{document.document_version_id}"
                 )
-            elif file_sha256(processing_path) != document.processing_record_sha256:
-                errors.append(
-                    f"processing_record_hash_mismatch:{document.document_version_id}"
-                )
             else:
                 processing_payload = json.loads(
                     processing_path.read_text(encoding="utf-8")
                 )
-                processing_error = _validate_processing_payload(
-                    processing_payload,
-                    document,
-                    manifest.quality_rules_version,
-                )
+                processing_error: str | None = None
+                if canonical_payload is not None:
+                    processing_error = _validate_processing_payload(
+                        processing_payload,
+                        document,
+                        canonical_payload,
+                    )
                 if processing_error:
                     errors.append(processing_error)
+                elif file_sha256(processing_path) != document.processing_record_sha256:
+                    errors.append(
+                        f"processing_record_hash_mismatch:{document.document_version_id}"
+                    )
         quality_is_derived = _is_derived_quality_path(
             document.quality_record_path,
             document.document_version_id,
@@ -702,14 +724,27 @@ def _is_derived_processing_path(path: str, document_version_id: str) -> bool:
 def _validate_processing_payload(
     payload: dict[str, Any],
     document: ReleaseDocument,
-    quality_rules_version: str,
+    canonical_payload: dict[str, Any],
 ) -> str | None:
     document_version_id = document.document_version_id
+    canonical_version = canonical_payload.get("document_version") or {}
+    canonical_report = canonical_payload.get("parse_report") or {}
     checks = (
         ("schema", payload.get("schema_version"), PROCESSING_RECORD_SCHEMA_VERSION),
+        (
+            "source_file_hash",
+            payload.get("source_file_hash"),
+            str(canonical_version.get("file_hash") or ""),
+        ),
+        (
+            "parser_name",
+            payload.get("parser_name"),
+            str(canonical_report.get("parser_name") or ""),
+        ),
+        ("chunker_version", payload.get("chunker_version"), CHUNKER_VERSION),
+        ("quality_rules", payload.get("quality_rules_version"), QUALITY_RULES_VERSION),
         ("document_version", payload.get("document_version_id"), document_version_id),
         ("run_id", payload.get("processing_run_id"), document.processing_run_id),
-        ("quality_rules", payload.get("quality_rules_version"), quality_rules_version),
         ("canonical", payload.get("canonical_sha256"), document.canonical_sha256),
         ("chunks", payload.get("chunks_sha256"), document.chunks_sha256),
     )

@@ -34,6 +34,39 @@ def clear_vector_index_cache() -> None:
     _VECTOR_INDEX_CACHE.clear()
     _BGE_VECTOR_INDEX_CACHE.clear()
 
+
+def model_content_fingerprint(model_path: Path | str) -> str:
+    """Hash a model file or a directory's sorted regular-file contents."""
+    root = Path(model_path)
+    if root.is_symlink():
+        raise VectorIndexError("model_path_symlink_unsupported")
+    if root.is_file():
+        return _file_content_sha256(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"BGE-M3 model path does not exist: {root}")
+
+    digest = hashlib.sha256(b"bge-model-directory-v1\0")
+    entries = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    for path in entries:
+        if path.is_symlink():
+            raise VectorIndexError("model_path_symlink_unsupported")
+        if not path.is_file():
+            continue
+        relative_bytes = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative_bytes).to_bytes(8, "big"))
+        digest.update(relative_bytes)
+        digest.update(bytes.fromhex(_file_content_sha256(path)))
+    return digest.hexdigest()
+
+
+def _file_content_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 EMBEDDING_STRATEGY = "local-hashed-token-v1"
 BGE_M3_EMBEDDING_STRATEGY = "bge-m3-dense-v1"
 BGE_M3_DEFAULT_MODEL_PATH = "models/bge-m3"
@@ -224,6 +257,7 @@ def build_bge_m3_vector_index(
         raise ValueError("batch_size must be > 0")
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
+    model_fingerprint = model_content_fingerprint(resolved_model_path)
 
     processed_versions, release_id = _resolve_processed_versions(
         processed_root,
@@ -266,6 +300,7 @@ def build_bge_m3_vector_index(
         "processed_dir": str(processed_root),
         "release_id": release_id,
         "model_path": str(resolved_model_path),
+        "model_fingerprint": model_fingerprint,
         "model_name": "BAAI/bge-m3",
         "dimension": int(vectors.shape[1]),
         "max_length": max_length,
@@ -315,6 +350,7 @@ def build_bge_m3_vector_index_resumable(
         raise ValueError("batch_size must be > 0")
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
+    model_fingerprint = model_content_fingerprint(resolved_model_path)
 
     processed_versions, release_id = _resolve_processed_versions(
         processed_root,
@@ -335,6 +371,7 @@ def build_bge_m3_vector_index_resumable(
         "processed_dir": str(processed_root),
         "index_path": str(resolved_index_path),
         "model_path": str(resolved_model_path),
+        "model_fingerprint": model_fingerprint,
         "batch_size": batch_size,
         "max_length": max_length,
         "chunk_count": len(rows),
@@ -350,6 +387,7 @@ def build_bge_m3_vector_index_resumable(
         identity_fields = (
             "embedding_strategy",
             "model_path",
+            "model_fingerprint",
             "max_length",
             "batch_size",
             "release_id",
@@ -418,6 +456,7 @@ def build_bge_m3_vector_index_resumable(
         "processed_dir": str(processed_root),
         "release_id": release_id,
         "model_path": str(resolved_model_path),
+        "model_fingerprint": model_fingerprint,
         "model_name": "BAAI/bge-m3",
         "dimension": int(vectors.shape[1]),
         "max_length": max_length,

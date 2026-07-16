@@ -162,7 +162,132 @@ def test_bge_builders_write_release_metadata(
     assert summary.release_id == release.release_id
     assert summary.indexed_document_count == 1
     assert metadata["release_id"] == release.release_id
+    assert metadata["model_fingerprint"] == (
+        vector_index.model_content_fingerprint(model_path)
+    )
     assert vector_index.read_vector_release_id(index_path) == release.release_id
+
+
+def test_model_content_fingerprint_is_stable_across_equivalent_directories(
+    tmp_path: Path,
+):
+    import hashlib
+
+    model_file = tmp_path / "model.bin"
+    model_file.write_bytes(b"single model file")
+    assert vector_index.model_content_fingerprint(model_file) == hashlib.sha256(
+        b"single model file"
+    ).hexdigest()
+
+    first = tmp_path / "first-model"
+    second = tmp_path / "second-model"
+    for root in (first, second):
+        (root / "nested").mkdir(parents=True)
+        (root / "config.json").write_text('{"model":"bge"}', encoding="utf-8")
+        (root / "nested" / "weights.bin").write_bytes(b"\x00\x01weights")
+
+    first_fingerprint = vector_index.model_content_fingerprint(first)
+    assert first_fingerprint == vector_index.model_content_fingerprint(second)
+
+    (second / "nested" / "weights.bin").write_bytes(b"\x00\x02weights")
+    assert first_fingerprint != vector_index.model_content_fingerprint(second)
+
+
+def test_model_content_fingerprint_rejects_symlink(tmp_path: Path):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    link = model_path / "linked.bin"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+
+    with pytest.raises(
+        vector_index.VectorIndexError,
+        match="^model_path_symlink_unsupported$",
+    ):
+        vector_index.model_content_fingerprint(model_path)
+
+
+def test_standard_bge_metadata_records_model_content_fingerprint(
+    tmp_path: Path,
+    monkeypatch,
+):
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "legacy.md", "Legacy", "alpha")
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    (model_path / "weights.bin").write_bytes(b"stable model bytes")
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: _FakeBgeModel(),
+    )
+    index_path = tmp_path / "standard.npz"
+
+    build_bge_m3_vector_index(
+        processed_dir=processed,
+        index_path=index_path,
+        model_path=model_path,
+    )
+
+    metadata = json.loads(
+        Path(str(index_path) + ".metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["model_fingerprint"] == (
+        vector_index.model_content_fingerprint(model_path)
+    )
+
+
+def test_resumable_rejects_same_model_path_content_replacement_before_reuse(
+    tmp_path: Path,
+    monkeypatch,
+):
+    processed = tmp_path / "processed"
+    _ingest(processed, tmp_path / "legacy.md", "Legacy", "alpha")
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    weights_path = model_path / "weights.bin"
+    weights_path.write_bytes(b"model-v1")
+    work_dir = tmp_path / "work"
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: _FakeBgeModel(),
+    )
+    build_bge_m3_vector_index_resumable(
+        processed_dir=processed,
+        index_path=tmp_path / "first.npz",
+        model_path=model_path,
+        work_dir=work_dir,
+    )
+    manifest_path = work_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["model_fingerprint"] == vector_index.model_content_fingerprint(
+        model_path
+    )
+    manifest_before = manifest_path.read_bytes()
+    part_paths = sorted(work_dir.glob("part_*.npy"))
+    part_bytes_before = {path: path.read_bytes() for path in part_paths}
+    weights_path.write_bytes(b"model-v2")
+    monkeypatch.setattr(
+        "agent_knowledge_hub.vector_index._load_bge_m3_model",
+        lambda _path: pytest.fail("changed model must fail before model loading"),
+    )
+
+    with pytest.raises(
+        vector_index.VectorIndexError,
+        match="^resumable_work_dir_input_mismatch$",
+    ):
+        build_bge_m3_vector_index_resumable(
+            processed_dir=processed,
+            index_path=tmp_path / "second.npz",
+            model_path=model_path,
+            work_dir=work_dir,
+        )
+
+    assert manifest_path.read_bytes() == manifest_before
+    assert {path: path.read_bytes() for path in part_paths} == part_bytes_before
 
 
 def test_resumable_rejects_different_release_before_loading_model(
