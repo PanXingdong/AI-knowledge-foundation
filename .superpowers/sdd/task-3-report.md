@@ -127,3 +127,114 @@ git -c core.whitespace=cr-at-eol diff --check
 
 - 完整测试仍报告 29 条既有 FastAPI/Starlette 弃用警告，与本任务无关。
 - BGE 新构建的 metadata 文件名由历史 `*.npz.metadata.json` 统一为简报指定的 `*.metadata.json`；读取和查询已提供历史文件名 fallback，但其他直接依赖旧文件名的外部脚本需要迁移。
+
+## 审查修复：向量索引 release 完整性
+
+### 修复内容
+
+- BGE 普通与 resumable 构建恢复历史 metadata 输出路径
+  `Path(str(index_path) + ".metadata.json")`，不再要求外部调用迁移。
+- `read_vector_release_id()` 和 BGE 查询仍兼容审查前短暂产生的
+  `index.metadata.json` 过渡路径。
+- resumable `work_dir/manifest.json` 新增 `release_id` 与
+  `input_fingerprint`。指纹按当前有序 rows 逐项绑定 `chunk_id` 和完整索引文本的
+  SHA-256，再对有序输入整体计算 SHA-256。
+- legacy 构建记录 `release_id: null`，仍通过输入指纹阻断相同 chunk ID、相同数量但
+  文本已变化的旧分片复用。
+- 已有 work manifest 的 release ID 或输入指纹不匹配时，在加载模型或检查/复用 part
+  前抛出 `VectorIndexError("resumable_work_dir_input_mismatch")`；原 manifest 和
+  part 文件保持不变。
+- 未修改 retrieval、CLI、finalize、activation 或依赖声明。
+
+### TDD 证据
+
+#### RED 4：BGE 构建器输出路径回归
+
+```powershell
+python -m pytest tests/test_release_bound_indexes.py::test_bge_builders_write_release_metadata -q
+```
+
+结果：exit 1，普通与 resumable 两条构建路径均找不到历史输出名：
+
+```text
+2 failed in 0.34s
+FileNotFoundError: ...build_bge_m3_vector_index.npz.metadata.json
+FileNotFoundError: ...build_bge_m3_vector_index_resumable.npz.metadata.json
+```
+
+#### GREEN 4
+
+```powershell
+python -m pytest tests/test_release_bound_indexes.py::test_bge_builders_write_release_metadata tests/test_release_bound_indexes.py::test_vector_release_reader_supports_legacy_bge_metadata_name -q
+```
+
+结果：`3 passed in 0.28s`。
+
+#### RED 5：resumable manifest 未绑定 release 与输入
+
+```powershell
+python -m pytest tests/test_release_bound_indexes.py -q -k "resumable_rejects"
+```
+
+结果：exit 1：
+
+```text
+2 failed, 8 deselected in 0.29s
+KeyError: 'release_id'
+```
+
+两个测试证明 release-aware 与 legacy 首次构建的 work manifest 均未记录 release ID
+和输入指纹，因而无法在模型加载前验证旧分片来源。
+
+#### GREEN 5
+
+同一命令结果：
+
+```text
+2 passed, 8 deselected in 0.25s
+```
+
+### 审查修复测试
+
+任务 3 与现有索引测试：
+
+```powershell
+python -m pytest tests/test_release_bound_indexes.py tests/test_fts_index.py tests/test_vector_index.py -q
+```
+
+结果：`15 passed in 0.82s`。
+
+完整回归：
+
+```powershell
+python -m pytest -q
+```
+
+结果：`352 passed, 6 skipped, 29 warnings in 9.09s`。
+
+语法与差异检查：
+
+```powershell
+python -m compileall -q src tests
+git -c core.whitespace=cr-at-eol diff --check
+```
+
+结果：exit 0，无输出。
+
+### 审查修复自查
+
+- 输出兼容：测试同时锁定历史 `index.npz.metadata.json` 存在且不产生
+  `index.metadata.json`；reader 对两种路径保持兼容。
+- 指纹强度：legacy 测试直接修改 chunk 文本并保持原 chunk ID 与行数，确认不是仅按
+  数量、文件名或 chunk ID 判断。
+- 早期阻断：第二次调用将模型加载替换为立即失败函数；实际得到稳定 mismatch 错误，
+  并确认 manifest 字节与已有 part 均未变化。
+- release 绑定：release-aware work manifest 记录实际 release ID；篡改为另一 release
+  后再次构建会在模型加载前被拒绝。
+- 范围：仅修改 vector 索引实现、任务 3 测试与本报告。
+
+### 审查修复顾虑
+
+- 无新增功能性顾虑。原报告关于 BGE metadata 文件名迁移的顾虑已由恢复历史输出路径
+  消除。
+- 完整测试仍有 29 条既有 FastAPI/Starlette 弃用警告。

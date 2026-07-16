@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -322,10 +323,12 @@ def build_bge_m3_vector_index_resumable(
     rows, texts, document_version_ids = _collect_dense_index_rows(processed_versions)
     if not rows:
         raise ValueError(f"No chunks found under processed directory: {processed_root}")
+    input_fingerprint = _dense_input_fingerprint(rows, texts)
 
     import numpy as np
 
     resolved_work_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = resolved_work_dir / "manifest.json"
     manifest = {
         "schema_version": "bge-m3-vector-parts.v1",
         "processed_dir": str(processed_root),
@@ -334,8 +337,21 @@ def build_bge_m3_vector_index_resumable(
         "batch_size": batch_size,
         "max_length": max_length,
         "chunk_count": len(rows),
+        "release_id": release_id,
+        "input_fingerprint": input_fingerprint,
     }
-    write_json(resolved_work_dir / "manifest.json", manifest)
+    if manifest_path.exists():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError) as error:
+            raise VectorIndexError("resumable_work_dir_input_mismatch") from error
+        if (
+            existing_manifest.get("release_id") != release_id
+            or existing_manifest.get("input_fingerprint") != input_fingerprint
+        ):
+            raise VectorIndexError("resumable_work_dir_input_mismatch")
+    else:
+        write_json(manifest_path, manifest)
 
     model = _load_bge_m3_model(resolved_model_path)
     total = len(texts)
@@ -622,6 +638,26 @@ def _collect_dense_index_rows(
     return rows, texts, document_version_ids
 
 
+def _dense_input_fingerprint(
+    rows: list[dict[str, str]],
+    texts: list[str],
+) -> str:
+    inputs = [
+        {
+            "chunk_id": row["chunk_id"],
+            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+        for row, text in zip(rows, texts, strict=True)
+    ]
+    content = json.dumps(
+        inputs,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
 def _resolve_processed_versions(
     processed_root: Path,
     release_manifest_path: Path | str | None,
@@ -666,14 +702,14 @@ def _select_bge_m3_device() -> str:
 
 
 def _bge_metadata_path(index_path: Path) -> Path:
-    return index_path.with_suffix(".metadata.json")
+    return Path(str(index_path) + ".metadata.json")
 
 
 def _existing_bge_metadata_path(index_path: Path) -> Path:
     metadata_path = _bge_metadata_path(index_path)
-    legacy_path = index_path.with_suffix(index_path.suffix + ".metadata.json")
-    if not metadata_path.exists() and legacy_path.exists():
-        return legacy_path
+    transitional_path = index_path.with_suffix(".metadata.json")
+    if not metadata_path.exists() and transitional_path.exists():
+        return transitional_path
     return metadata_path
 
 
