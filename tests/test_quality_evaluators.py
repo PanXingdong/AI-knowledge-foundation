@@ -1,0 +1,532 @@
+import json
+from pathlib import Path
+
+from agent_knowledge_hub.pipeline import ingest_file
+from agent_knowledge_hub.quality_evaluators import (
+    SOFT_MAX_BLOCK_CHARS,
+    SOFT_MIN_CHUNK_CHARS,
+    SOFT_MIN_PAGE_CHARS,
+    SOFT_WARNING_COUNT,
+    evaluate_document_version,
+)
+from agent_knowledge_hub.quality_registry import REASON_CODE_REGISTRY
+from agent_knowledge_hub.utils import write_json
+
+
+def _ingest(tmp_path: Path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    source = tmp_path / "healthy.md"
+    source.write_text("# API\n\nMsgSend sends a message.", encoding="utf-8")
+    return ingest_file(
+        file_path=source,
+        out_dir=tmp_path / "processed",
+        title="Healthy API",
+        document_version="v1",
+    )
+
+
+def _reason_codes(version_dir: Path) -> set[str]:
+    return {item.reason_code for item in evaluate_document_version(version_dir)}
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    path.write_text(
+        "".join(
+            f"{json.dumps(row, ensure_ascii=False, sort_keys=True)}\n" for row in rows
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_healthy_document_has_no_hard_integrity_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+
+    signals = evaluate_document_version(result.output_dir)
+
+    assert not {
+        item.reason_code
+        for item in signals
+        if item.severity in {"error", "fatal"}
+    }
+
+
+def test_missing_chunks_is_document_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    result.chunks_jsonl_path.unlink()
+
+    assert "document.integrity.chunks_missing" in _reason_codes(result.output_dir)
+
+
+def test_invalid_canonical_json_is_safe_document_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    result.document_json_path.write_text("{", encoding="utf-8")
+
+    assert "document.integrity.canonical_missing" in _reason_codes(result.output_dir)
+
+
+def test_invalid_chunks_json_is_safe_document_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    result.chunks_jsonl_path.write_text("{not-json}\n", encoding="utf-8")
+
+    assert "document.integrity.no_chunks" in _reason_codes(result.output_dir)
+
+
+def test_unknown_chunk_evidence_is_hard_signal_with_reference_id(tmp_path: Path):
+    result = _ingest(tmp_path)
+    rows = _read_jsonl(result.chunks_jsonl_path)
+    rows[0]["evidence_ids"] = ["span_missing"]
+    _write_jsonl(result.chunks_jsonl_path, rows)
+
+    signals = evaluate_document_version(result.output_dir)
+    signal = next(
+        item
+        for item in signals
+        if item.reason_code == "chunk.evidence.reference_missing"
+    )
+
+    assert signal.evidence_ids == ("span_missing",)
+    assert signal.chunk_id == rows[0]["chunk_id"]
+
+
+def test_chunk_without_evidence_is_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    rows = _read_jsonl(result.chunks_jsonl_path)
+    rows[0]["evidence_ids"] = []
+    _write_jsonl(result.chunks_jsonl_path, rows)
+
+    assert "chunk.evidence.missing" in _reason_codes(result.output_dir)
+
+
+def test_empty_chunk_is_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    rows = _read_jsonl(result.chunks_jsonl_path)
+    rows[0]["text"] = ""
+    _write_jsonl(result.chunks_jsonl_path, rows)
+
+    assert "chunk.integrity.empty" in _reason_codes(result.output_dir)
+
+
+def test_chunk_document_version_mismatch_is_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    rows = _read_jsonl(result.chunks_jsonl_path)
+    rows[0]["document_version_id"] = "docver_other"
+    _write_jsonl(result.chunks_jsonl_path, rows)
+
+    assert (
+        "chunk.integrity.document_version_mismatch"
+        in _reason_codes(result.output_dir)
+    )
+
+
+def test_quality_sidecar_version_mismatch_is_document_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.quality_record_path.read_text(encoding="utf-8"))
+    payload["document_version_id"] = "docver_other"
+    write_json(result.quality_record_path, payload)
+
+    assert (
+        "document.integrity.document_version_mismatch"
+        in _reason_codes(result.output_dir)
+    )
+
+
+def test_block_page_outside_declared_count_is_one_hard_signal_with_evidence(
+    tmp_path: Path,
+):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["parse_report"]["page_count"] = 1
+    payload["blocks"][0]["page_start"] = 2
+    payload["blocks"][0]["page_end"] = 2
+    payload["evidence_spans"][0]["page"] = 2
+    write_json(result.document_json_path, payload)
+
+    matching = [
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "page.integrity.reference_out_of_range"
+        and item.page == 2
+    ]
+
+    assert len(matching) == 1
+    assert matching[0].evidence_ids == (
+        payload["evidence_spans"][0]["evidence_id"],
+    )
+
+
+def test_markdown_without_page_count_has_no_source_location_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+
+    assert (
+        "page.integrity.source_location_missing"
+        not in _reason_codes(result.output_dir)
+    )
+
+
+def test_known_page_count_without_resolvable_location_is_hard_signal(
+    tmp_path: Path,
+):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["parse_report"]["page_count"] = 1
+    payload["blocks"][0]["page_start"] = None
+    payload["blocks"][0]["page_end"] = None
+    payload["evidence_spans"] = [
+        item
+        for item in payload["evidence_spans"]
+        if item["block_id"] != payload["blocks"][0]["block_id"]
+    ]
+    write_json(result.document_json_path, payload)
+
+    assert (
+        "page.integrity.source_location_missing"
+        in _reason_codes(result.output_dir)
+    )
+
+
+def test_empty_block_is_hard_signal_with_block_evidence(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    block = payload["blocks"][0]
+    evidence_id = next(
+        item["evidence_id"]
+        for item in payload["evidence_spans"]
+        if item["block_id"] == block["block_id"]
+    )
+    block["text"] = ""
+    write_json(result.document_json_path, payload)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "block.integrity.empty"
+        and item.block_id == block["block_id"]
+    )
+
+    assert signal.evidence_ids == (evidence_id,)
+
+
+def test_invalid_block_type_is_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["blocks"][0]["block_type"] = "image"
+    write_json(result.document_json_path, payload)
+
+    assert "block.integrity.type_invalid" in _reason_codes(result.output_dir)
+
+
+def test_invalid_block_page_range_is_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["blocks"][0]["page_start"] = 2
+    payload["blocks"][0]["page_end"] = 1
+    write_json(result.document_json_path, payload)
+
+    assert "block.integrity.page_range_invalid" in _reason_codes(result.output_dir)
+
+
+def test_block_document_version_mismatch_is_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["blocks"][0]["document_version_id"] = "docver_other"
+    write_json(result.document_json_path, payload)
+
+    assert (
+        "block.integrity.document_version_mismatch"
+        in _reason_codes(result.output_dir)
+    )
+
+
+def test_block_without_evidence_is_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    block_id = payload["blocks"][0]["block_id"]
+    payload["evidence_spans"] = [
+        item
+        for item in payload["evidence_spans"]
+        if item["block_id"] != block_id
+    ]
+    write_json(result.document_json_path, payload)
+
+    assert "block.evidence.missing" in _reason_codes(result.output_dir)
+
+
+def test_evidence_hash_mismatch_is_hard_signal_with_evidence_id(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    evidence = payload["evidence_spans"][0]
+    evidence["text_hash"] = "0" * 64
+    write_json(result.document_json_path, payload)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "block.evidence.hash_mismatch"
+    )
+
+    assert signal.evidence_ids == (evidence["evidence_id"],)
+    assert signal.block_id == evidence["block_id"]
+
+
+def test_evidence_document_version_mismatch_is_page_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    evidence = payload["evidence_spans"][0]
+    evidence["document_version_id"] = "docver_other"
+    write_json(result.document_json_path, payload)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "page.integrity.document_version_mismatch"
+    )
+
+    assert signal.evidence_ids == (evidence["evidence_id"],)
+
+
+def test_duplicate_block_marks_only_second_sorted_id_with_evidence(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    source_block = payload["blocks"][0]
+    source_evidence = next(
+        item
+        for item in payload["evidence_spans"]
+        if item["block_id"] == source_block["block_id"]
+    )
+    source_block["block_id"] = "block_z"
+    source_evidence["block_id"] = "block_z"
+    source_evidence["evidence_id"] = "span_z"
+    duplicate_block = {**source_block, "block_id": "block_a"}
+    duplicate_evidence = {
+        **source_evidence,
+        "block_id": "block_a",
+        "evidence_id": "span_a",
+    }
+    payload["blocks"].append(duplicate_block)
+    payload["evidence_spans"].append(duplicate_evidence)
+    write_json(result.document_json_path, payload)
+
+    matching = [
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "block.content.duplicate"
+    ]
+
+    assert [(item.block_id, item.evidence_ids) for item in matching] == [
+        ("block_z", ("span_z",))
+    ]
+
+
+def test_repeated_evaluation_is_dictionary_identical(tmp_path: Path):
+    result = _ingest(tmp_path)
+
+    first = evaluate_document_version(result.output_dir)
+    second = evaluate_document_version(result.output_dir)
+
+    assert [item.to_dict() for item in first] == [
+        item.to_dict() for item in second
+    ]
+
+
+def test_same_defect_has_same_reason_for_different_suppliers(tmp_path: Path):
+    first = _ingest(tmp_path / "qnx")
+    second = _ingest(tmp_path / "qualcomm")
+    for result, supplier in ((first, "QNX"), (second, "Qualcomm")):
+        payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+        payload["document"]["supplier"] = supplier
+        payload["evidence_spans"][0]["text_hash"] = "0" * 64
+        write_json(result.document_json_path, payload)
+
+    first_codes = _reason_codes(first.output_dir)
+    second_codes = _reason_codes(second.output_dir)
+
+    assert "block.evidence.hash_mismatch" in first_codes
+    assert first_codes == second_codes
+
+
+def test_all_signal_scope_and_severity_come_from_registry(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["blocks"][0]["text"] = ""
+    payload["blocks"][0]["block_type"] = "invalid"
+    write_json(result.document_json_path, payload)
+
+    signals = evaluate_document_version(result.output_dir)
+
+    assert signals
+    assert all(
+        (item.scope, item.severity)
+        == (
+            REASON_CODE_REGISTRY[item.reason_code].scope,
+            REASON_CODE_REGISTRY[item.reason_code].severity,
+        )
+        for item in signals
+    )
+
+
+def test_evaluation_does_not_modify_artifacts(tmp_path: Path):
+    result = _ingest(tmp_path)
+    paths = (
+        result.document_json_path,
+        result.chunks_jsonl_path,
+        result.processing_record_path,
+        result.quality_record_path,
+    )
+    before = {path: path.read_bytes() for path in paths}
+
+    evaluate_document_version(result.output_dir)
+
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_duplicate_chunk_marks_only_second_sorted_id_with_evidence(tmp_path: Path):
+    result = _ingest(tmp_path)
+    rows = _read_jsonl(result.chunks_jsonl_path)
+    rows[0]["chunk_id"] = "chunk_z"
+    duplicate = {**rows[0], "chunk_id": "chunk_a"}
+    rows.append(duplicate)
+    _write_jsonl(result.chunks_jsonl_path, rows)
+
+    matching = [
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "chunk.content.duplicate"
+    ]
+
+    assert [(item.chunk_id, item.evidence_ids) for item in matching] == [
+        ("chunk_z", tuple(sorted(rows[0]["evidence_ids"])))
+    ]
+
+
+def test_soft_chunk_threshold_uses_brief_constant(tmp_path: Path):
+    result = _ingest(tmp_path)
+    rows = _read_jsonl(result.chunks_jsonl_path)
+    rows[0]["text"] = "x" * (SOFT_MIN_CHUNK_CHARS - 1)
+    _write_jsonl(result.chunks_jsonl_path, rows)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "chunk.content.too_short"
+    )
+
+    assert signal.threshold == SOFT_MIN_CHUNK_CHARS
+
+
+def test_soft_block_threshold_uses_brief_constant(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["blocks"][0]["text"] = "x" * (SOFT_MAX_BLOCK_CHARS + 1)
+    write_json(result.document_json_path, payload)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "block.content.too_long"
+    )
+
+    assert signal.threshold == SOFT_MAX_BLOCK_CHARS
+
+
+def test_soft_page_threshold_uses_brief_constant(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["parse_report"]["page_count"] = 1
+    for block in payload["blocks"]:
+        block["page_start"] = 1
+        block["page_end"] = 1
+        block["text"] = ""
+    for evidence in payload["evidence_spans"]:
+        evidence["page"] = 1
+    write_json(result.document_json_path, payload)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "page.content.text_too_short"
+    )
+
+    assert signal.threshold == SOFT_MIN_PAGE_CHARS
+
+
+def test_warning_count_high_uses_brief_constant(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["parse_report"]["warnings"] = [
+        f"warning-{index}" for index in range(SOFT_WARNING_COUNT + 1)
+    ]
+    write_json(result.document_json_path, payload)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "document.parse.warning_count_high"
+    )
+
+    assert signal.threshold == SOFT_WARNING_COUNT
+
+
+def test_parse_fallback_used_is_document_soft_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["parse_report"]["quality_report"] = {"fallback_used": True}
+    write_json(result.document_json_path, payload)
+
+    assert "document.parse.fallback_used" in _reason_codes(result.output_dir)
+
+
+def test_evidence_version_relation_is_validated_for_referenced_chunk(
+    tmp_path: Path,
+):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    evidence = payload["evidence_spans"][0]
+    evidence["document_version_id"] = "docver_other"
+    write_json(result.document_json_path, payload)
+
+    signals = evaluate_document_version(result.output_dir)
+    mismatch = next(
+        item
+        for item in signals
+        if item.reason_code == "page.integrity.document_version_mismatch"
+    )
+
+    assert evidence["evidence_id"] in mismatch.evidence_ids
+
+
+def test_zero_page_count_is_known_for_page_hard_signals(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    payload["parse_report"]["page_count"] = 0
+    payload["blocks"][0]["page_start"] = 1
+    payload["blocks"][0]["page_end"] = 1
+    payload["evidence_spans"][0]["page"] = 1
+    write_json(result.document_json_path, payload)
+
+    assert "page.integrity.reference_out_of_range" in _reason_codes(
+        result.output_dir
+    )
+
+
+def test_duplicate_chunks_without_ids_do_not_abort_evaluation(tmp_path: Path):
+    result = _ingest(tmp_path)
+    rows = _read_jsonl(result.chunks_jsonl_path)
+    rows[0].pop("chunk_id")
+    rows.append(dict(rows[0]))
+    _write_jsonl(result.chunks_jsonl_path, rows)
+
+    signals = evaluate_document_version(result.output_dir)
+
+    assert any(
+        item.reason_code == "chunk.content.duplicate"
+        and item.chunk_id == "chunk_1"
+        for item in signals
+    )
