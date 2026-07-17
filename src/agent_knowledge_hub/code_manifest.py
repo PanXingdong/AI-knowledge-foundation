@@ -114,13 +114,26 @@ def scan_repo(
     _exts = extensions if extensions is not None else TARGET_EXTENSIONS
     document_version = get_repo_version(repo_dir)
 
+    repo_root = repo_dir.resolve()
     rows: list[dict[str, str]] = []
-    for file_path in sorted(repo_dir.rglob("*")):
+    for file_path in sorted(repo_root.rglob("*")):
         if not file_path.is_file():
             continue
         if file_path.suffix.lower() not in _exts:
             continue
-        rel = file_path.relative_to(repo_dir)
+        # Reject symlinks that point outside the repo to prevent accidental
+        # inclusion of files from outside the expected boundary.
+        if file_path.is_symlink():
+            real = file_path.resolve()
+            try:
+                real.relative_to(repo_root)
+            except ValueError:
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    "跳过仓库外 symlink：%s -> %s", file_path, real
+                )
+                continue
+        rel = file_path.relative_to(repo_root)
         rel_parts = rel.parts
         if _should_exclude(rel_parts, _exclude):
             continue
@@ -128,7 +141,8 @@ def scan_repo(
         module = rel_parts[0] if rel_parts else "unknown"
         rows.append({
             "sample_id":        _make_sample_id(rel),
-            "file_path":        str(file_path),
+            # 使用相对路径而非绝对路径，使 CSV 可跨机器复用
+            "file_path":        rel.as_posix(),
             "document_title":   rel.as_posix(),
             "slot_type":        "source_code",
             "owner":            "PATAC",

@@ -13,6 +13,7 @@ from agent_knowledge_hub.code_watcher import (
     WATCHABLE_EXTENSIONS,
     _ChangeBuffer,
     CodeRepositoryWatcher,
+    _MAX_RETRIES,
 )
 from agent_knowledge_hub.code_manifest import DEFAULT_EXCLUDE_DIRS
 
@@ -24,34 +25,40 @@ from agent_knowledge_hub.code_manifest import DEFAULT_EXCLUDE_DIRS
 class TestChangeBuffer:
     def test_empty_buffer_returns_empty_set(self):
         buf = _ChangeBuffer(debounce_seconds=0.1)
-        assert buf.drain() == set()
+        changed, deleted = buf.drain()
+        assert changed == set()
+        assert deleted == set()
 
     def test_drain_before_debounce_returns_empty(self):
         buf = _ChangeBuffer(debounce_seconds=10.0)
         buf.add(Path("/tmp/a.cpp"))
-        assert buf.drain() == set()
+        changed, deleted = buf.drain()
+        assert changed == set()
 
     def test_drain_after_debounce_returns_paths(self):
         buf = _ChangeBuffer(debounce_seconds=0.05)
         buf.add(Path("/tmp/a.cpp"))
         buf.add(Path("/tmp/b.h"))
         time.sleep(0.1)
-        result = buf.drain()
-        assert result == {Path("/tmp/a.cpp"), Path("/tmp/b.h")}
+        changed, deleted = buf.drain()
+        assert changed == {Path("/tmp/a.cpp"), Path("/tmp/b.h")}
+        assert deleted == set()
 
     def test_drain_clears_buffer(self):
         buf = _ChangeBuffer(debounce_seconds=0.05)
         buf.add(Path("/tmp/a.cpp"))
         time.sleep(0.1)
         buf.drain()
-        assert buf.drain() == set()
+        changed, deleted = buf.drain()
+        assert changed == set()
 
     def test_new_event_resets_debounce(self):
         buf = _ChangeBuffer(debounce_seconds=0.15)
         buf.add(Path("/tmp/a.cpp"))
         time.sleep(0.1)
         buf.add(Path("/tmp/b.cpp"))   # 重置计时器
-        assert buf.drain() == set()   # 尚未超过防抖窗口
+        changed, _ = buf.drain()
+        assert changed == set()       # 尚未超过防抖窗口
 
     def test_thread_safety(self):
         buf = _ChangeBuffer(debounce_seconds=0.0)
@@ -67,8 +74,51 @@ class TestChangeBuffer:
         for t in threads:
             t.join()
 
-        result = buf.drain()
-        assert result == set(paths)
+        changed, _ = buf.drain()
+        assert changed == set(paths)
+
+    def test_deleted_tracked_separately(self):
+        buf = _ChangeBuffer(debounce_seconds=0.0)
+        buf.add(Path("/tmp/a.cpp"))
+        buf.add_deleted(Path("/tmp/b.cpp"))
+        time.sleep(0.05)
+        changed, deleted = buf.drain()
+        assert changed == {Path("/tmp/a.cpp")}
+        assert deleted == {Path("/tmp/b.cpp")}
+
+    def test_delete_cancels_pending_change(self):
+        buf = _ChangeBuffer(debounce_seconds=0.0)
+        buf.add(Path("/tmp/a.cpp"))
+        buf.add_deleted(Path("/tmp/a.cpp"))  # 删除取消变更
+        time.sleep(0.05)
+        changed, deleted = buf.drain()
+        assert Path("/tmp/a.cpp") not in changed
+        assert Path("/tmp/a.cpp") in deleted
+
+    def test_change_after_delete_cancels_delete(self):
+        buf = _ChangeBuffer(debounce_seconds=0.0)
+        buf.add_deleted(Path("/tmp/a.cpp"))
+        buf.add(Path("/tmp/a.cpp"))           # 文件重新出现
+        time.sleep(0.05)
+        changed, deleted = buf.drain()
+        assert Path("/tmp/a.cpp") in changed
+        assert Path("/tmp/a.cpp") not in deleted
+
+    def test_force_drain_bypasses_debounce(self):
+        buf = _ChangeBuffer(debounce_seconds=9999.0)
+        buf.add(Path("/tmp/a.cpp"))
+        changed, _ = buf.drain(force=True)
+        assert changed == {Path("/tmp/a.cpp")}
+
+    def test_re_enqueue_retry_limit(self):
+        buf = _ChangeBuffer(debounce_seconds=0.0)
+        path = Path("/tmp/fail.cpp")
+        for _ in range(_MAX_RETRIES + 2):
+            buf.re_enqueue_failed({path}, set())
+        time.sleep(0.05)
+        changed, _ = buf.drain()
+        # After exceeding retries the path should be silently dropped
+        assert path not in changed
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +131,7 @@ class TestCodeRepositoryWatcherFiltering:
     def _make_watcher(self, tmp_path: Path) -> CodeRepositoryWatcher:
         return CodeRepositoryWatcher(
             watch_dir=tmp_path,
-            on_change=lambda _: None,
+            on_change=lambda _c, _d: None,
             debounce_seconds=0.0,
         )
 
@@ -92,7 +142,8 @@ class TestCodeRepositoryWatcherFiltering:
         target.touch()
         watcher._enqueue(target)
         time.sleep(0.05)
-        assert target.resolve() in watcher._buffer.drain()
+        changed, _ = watcher._buffer.drain()
+        assert target.resolve() in changed
 
     def test_unsupported_extension_is_rejected(self, tmp_path: Path):
         watcher = self._make_watcher(tmp_path)
@@ -100,7 +151,8 @@ class TestCodeRepositoryWatcherFiltering:
         target.touch()
         watcher._enqueue(target)
         time.sleep(0.05)
-        assert watcher._buffer.drain() == set()
+        changed, _ = watcher._buffer.drain()
+        assert changed == set()
 
     def test_excluded_dir_is_rejected(self, tmp_path: Path):
         watcher = self._make_watcher(tmp_path)
@@ -109,7 +161,8 @@ class TestCodeRepositoryWatcherFiltering:
         excluded.touch()
         watcher._enqueue(excluded)
         time.sleep(0.05)
-        assert watcher._buffer.drain() == set()
+        changed, _ = watcher._buffer.drain()
+        assert changed == set()
 
     def test_nested_excluded_dir_is_rejected(self, tmp_path: Path):
         watcher = self._make_watcher(tmp_path)
@@ -118,7 +171,29 @@ class TestCodeRepositoryWatcherFiltering:
         nested.touch()
         watcher._enqueue(nested)
         time.sleep(0.05)
-        assert watcher._buffer.drain() == set()
+        changed, _ = watcher._buffer.drain()
+        assert changed == set()
+
+    def test_custom_exclude_merges_with_defaults(self, tmp_path: Path):
+        """用户自定义 exclude 不应替换默认 exclude。"""
+        watcher = CodeRepositoryWatcher(
+            watch_dir=tmp_path,
+            on_change=lambda _c, _d: None,
+            debounce_seconds=0.0,
+            exclude_dirs={"my_custom_dir"},
+        )
+        # 默认 exclude 仍然生效
+        assert "KanziEngine" in watcher._exclude_dirs
+        assert "my_custom_dir" in watcher._exclude_dirs
+
+    def test_deleted_file_enqueued_to_deleted_set(self, tmp_path: Path):
+        watcher = self._make_watcher(tmp_path)
+        path = tmp_path / "foo.cpp"
+        # File doesn't need to exist for deletion tracking
+        watcher._enqueue_deleted(path)
+        time.sleep(0.05)
+        _, deleted = watcher._buffer.drain()
+        assert path.resolve() in deleted
 
 
 # ---------------------------------------------------------------------------
