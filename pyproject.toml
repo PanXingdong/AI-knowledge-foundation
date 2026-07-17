@@ -24,6 +24,9 @@ ocr = [
   "rapidocr",
   "onnxruntime",
 ]
+mcp = [
+  "mcp[cli]>=1.0",
+]
 test = [
   "pytest",
 ]

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
-from typing import TYPE_CHECKING
 
 try:  # pragma: no cover - exercised indirectly in environment-specific tests
     from mcp.server.fastmcp import FastMCP
@@ -260,6 +260,130 @@ def create_mcp_server(
     return server
 
 
+class MCPCodeSearchResult(BaseModel):
+    query: str
+    processed_dir: str
+    result_count: int
+    document_count: int
+    results: list[dict[str, Any]]
+
+
+def create_mcp_server_with_repos(
+    *,
+    code_processed_dir: Path | str | None = None,
+    docs_processed_dir: Path | str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8788,
+    streamable_http_path: str = "/mcp",
+) -> FastMCPType:
+    """Create an MCP server with pre-bound knowledge base paths.
+
+    Adds convenience tools ``search_code_repo`` and ``search_docs`` that do not
+    require callers to know the on-disk processed_dir paths.  The generic tools
+    from :func:`create_mcp_server` are always included as well.
+    """
+    server = create_mcp_server(
+        host=host,
+        port=port,
+        streamable_http_path=streamable_http_path,
+    )
+
+    _code_dir = Path(code_processed_dir).resolve() if code_processed_dir else None
+    _docs_dir = Path(docs_processed_dir).resolve() if docs_processed_dir else None
+
+    if _code_dir is not None:
+
+        @server.tool(
+            name="search_code_repo",
+            description=(
+                "Search the ClusterHMI C++ code repository knowledge base. "
+                "Use when the user asks about implementation details, function behaviour, "
+                "data structures, module interactions, or file locations in the ClusterHMI codebase. "
+                "Returns ranked code chunk results with file paths and line context."
+            ),
+            structured_output=True,
+        )
+        def search_code_repo(
+            query: str,
+            top_k: int = Field(default=10, ge=1, le=50),
+            per_document_limit: int = Field(default=3, ge=1, le=20),
+        ) -> MCPCodeSearchResult:
+            result = search_processed_dir(
+                processed_dir=str(_code_dir),
+                query=query,
+                top_k=top_k,
+                per_document_limit=per_document_limit,
+            )
+            d = result.to_dict()
+            return MCPCodeSearchResult(
+                query=d["query"],
+                processed_dir=d["processed_dir"],
+                result_count=d["result_count"],
+                document_count=d["document_count"],
+                results=d["results"],
+            )
+
+        @server.tool(
+            name="get_code_context_pack",
+            description=(
+                "Build a structured Context Pack from ClusterHMI code chunks. "
+                "Use before code review, debugging, refactoring, or explaining a module. "
+                "Returns a ranked, section-organised pack with evidence numbers for tracing."
+            ),
+            structured_output=True,
+        )
+        def get_code_context_pack(
+            query: str,
+            task_type: str = "general_query",
+            top_k: int = Field(default=10, ge=1, le=50),
+            per_document_limit: int = Field(default=3, ge=1, le=20),
+        ) -> MCPContextPackResult:
+            result = build_context_pack_for_processed_dir(
+                processed_dir=str(_code_dir),
+                query=query,
+                task_type=task_type,
+                top_k=top_k,
+                per_document_limit=per_document_limit,
+            )
+            return MCPContextPackResult(
+                **result.to_json_dict(),
+                markdown=result.markdown,
+            )
+
+    if _docs_dir is not None:
+
+        @server.tool(
+            name="search_docs",
+            description=(
+                "Search the QNX engineering documentation knowledge base (manuals, guides, references). "
+                "Use when the user asks about QNX APIs, RTOS behaviour, BSP configuration, "
+                "IPC mechanisms, or any question answered by official QNX documentation."
+            ),
+            structured_output=True,
+        )
+        def search_docs(
+            query: str,
+            top_k: int = Field(default=8, ge=1, le=50),
+            per_document_limit: int = Field(default=2, ge=1, le=20),
+        ) -> MCPCodeSearchResult:
+            result = search_processed_dir(
+                processed_dir=str(_docs_dir),
+                query=query,
+                top_k=top_k,
+                per_document_limit=per_document_limit,
+            )
+            d = result.to_dict()
+            return MCPCodeSearchResult(
+                query=d["query"],
+                processed_dir=d["processed_dir"],
+                result_count=d["result_count"],
+                document_count=d["document_count"],
+                results=d["results"],
+            )
+
+    return server
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agent-knowledge-hub-mcp",
@@ -273,13 +397,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
     parser.add_argument("--streamable-http-path", default="/mcp")
+    parser.add_argument(
+        "--code-processed-dir",
+        type=Path,
+        default=os.environ.get("CLUSTER_CODE_PROCESSED_DIR"),
+        help="Pre-bound path to the code repository processed/ dir. "
+             "Enables search_code_repo and get_code_context_pack tools. "
+             "Can also be set via CLUSTER_CODE_PROCESSED_DIR env var.",
+    )
+    parser.add_argument(
+        "--docs-processed-dir",
+        type=Path,
+        default=os.environ.get("QNX_DOCS_PROCESSED_DIR"),
+        help="Pre-bound path to the QNX documentation processed/ dir. "
+             "Enables search_docs tool. "
+             "Can also be set via QNX_DOCS_PROCESSED_DIR env var.",
+    )
     args = parser.parse_args(argv)
 
-    server = create_mcp_server(
-        host=args.host,
-        port=args.port,
-        streamable_http_path=args.streamable_http_path,
-    )
+    if args.code_processed_dir or args.docs_processed_dir:
+        server = create_mcp_server_with_repos(
+            code_processed_dir=args.code_processed_dir,
+            docs_processed_dir=args.docs_processed_dir,
+            host=args.host,
+            port=args.port,
+            streamable_http_path=args.streamable_http_path,
+        )
+    else:
+        server = create_mcp_server(
+            host=args.host,
+            port=args.port,
+            streamable_http_path=args.streamable_http_path,
+        )
     server.run(transport=args.transport)
     return 0
 

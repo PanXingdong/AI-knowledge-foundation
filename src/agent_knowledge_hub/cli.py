@@ -346,6 +346,38 @@ def main(argv: list[str] | None = None) -> int:
             rows = scan_repo(repo_dir, exclude_dirs, TARGET_EXTENSIONS)
             write_csv(rows, args.output)
             payload = {"scanned_files": len(rows), "output": str(args.output)}
+        elif args.command == "serve-mcp":
+            import os as _os
+            from agent_knowledge_hub.mcp_server import (
+                create_mcp_server,
+                create_mcp_server_with_repos,
+            )
+            code_dir = args.code_processed_dir or (
+                Path(_os.environ["CLUSTER_CODE_PROCESSED_DIR"])
+                if "CLUSTER_CODE_PROCESSED_DIR" in _os.environ
+                else None
+            )
+            docs_dir = args.docs_processed_dir or (
+                Path(_os.environ["QNX_DOCS_PROCESSED_DIR"])
+                if "QNX_DOCS_PROCESSED_DIR" in _os.environ
+                else None
+            )
+            if code_dir or docs_dir:
+                server = create_mcp_server_with_repos(
+                    code_processed_dir=code_dir,
+                    docs_processed_dir=docs_dir,
+                    host=args.host,
+                    port=args.port,
+                    streamable_http_path=args.streamable_http_path,
+                )
+            else:
+                server = create_mcp_server(
+                    host=args.host,
+                    port=args.port,
+                    streamable_http_path=args.streamable_http_path,
+                )
+            server.run(transport=args.transport)
+            return 0
         elif args.command == "dependency-check":
             report = check_runtime_dependencies()
             if args.output_dir:
@@ -723,6 +755,40 @@ def _build_parser() -> argparse.ArgumentParser:
         "--require-valid",
         action="store_true",
         help="Return a non-zero exit code when contract errors are found.",
+    )
+
+    mcp_parser = subparsers.add_parser(
+        "serve-mcp",
+        help="Run the MCP server for Claude Code / Claude Desktop integration.",
+    )
+    mcp_parser.add_argument(
+        "--transport",
+        default="streamable-http",
+        choices=("stdio", "sse", "streamable-http"),
+        help="MCP transport protocol (default: streamable-http).",
+    )
+    mcp_parser.add_argument("--host", default="127.0.0.1")
+    mcp_parser.add_argument("--port", type=int, default=8788)
+    mcp_parser.add_argument("--streamable-http-path", default="/mcp")
+    mcp_parser.add_argument(
+        "--code-processed-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the code repository processed/ dir. "
+            "Activates search_code_repo and get_code_context_pack tools. "
+            "Falls back to CLUSTER_CODE_PROCESSED_DIR env var if not set."
+        ),
+    )
+    mcp_parser.add_argument(
+        "--docs-processed-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the QNX documentation processed/ dir. "
+            "Activates search_docs tool. "
+            "Falls back to QNX_DOCS_PROCESSED_DIR env var if not set."
+        ),
     )
 
     return parser
