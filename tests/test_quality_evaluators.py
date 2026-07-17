@@ -3,6 +3,14 @@ import shutil
 from pathlib import Path
 
 from agent_knowledge_hub.pipeline import ingest_file
+from agent_knowledge_hub.processing_record import (
+    build_processing_record,
+    write_processing_record,
+)
+from agent_knowledge_hub.quality_contracts import (
+    build_quality_record,
+    write_quality_record,
+)
 from agent_knowledge_hub.quality_evaluators import (
     SOFT_MAX_BLOCK_CHARS,
     SOFT_MIN_CHUNK_CHARS,
@@ -52,6 +60,91 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _refresh_case_sidecars(result, canonical, chunks) -> None:
+    write_processing_record(
+        result.processing_record_path,
+        build_processing_record(
+            document_version_id=canonical["document_version"][
+                "document_version_id"
+            ],
+            source_file_hash=canonical["document_version"]["file_hash"],
+            parser_name=canonical["parse_report"]["parser_name"],
+            canonical_path=result.document_json_path,
+            chunks_path=result.chunks_jsonl_path,
+        ),
+    )
+    write_quality_record(
+        result.quality_record_path,
+        build_quality_record(canonical, chunks),
+    )
+
+
+def _build_case(root: Path, case: dict[str, object]) -> Path:
+    root.mkdir(parents=True)
+    source = root / "synthetic-public.md"
+    source.write_text(
+        "# Public API\n\n"
+        "This synthetic public fixture describes message delivery behavior "
+        "without containing supplier documentation or confidential data.",
+        encoding="utf-8",
+    )
+    result = ingest_file(
+        file_path=source,
+        out_dir=root / "processed",
+        title=f"Golden {case['case_id']}",
+        document_version="v1",
+    )
+    canonical = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    chunks = _read_jsonl(result.chunks_jsonl_path)
+    canonical["document"]["supplier"] = case["supplier"]
+    canonical["parse_report"]["source_format"] = "pdf"
+    canonical["parse_report"]["has_page_numbers"] = True
+    canonical["parse_report"]["page_count"] = 1
+    for block in canonical["blocks"]:
+        block["page_start"] = 1
+        block["page_end"] = 1
+    for evidence in canonical["evidence_spans"]:
+        evidence["page"] = 1
+    for section in canonical["sections"]:
+        section["page_start"] = 1
+        section["page_end"] = 1
+    for chunk in chunks:
+        chunk["page_start"] = 1
+        chunk["page_end"] = 1
+    defect = case["defect"]
+    if defect == "missing_chunk_evidence":
+        chunks[0]["evidence_ids"] = ["span_missing"]
+    elif defect == "page_out_of_range":
+        canonical["blocks"][0]["page_start"] = 2
+        canonical["blocks"][0]["page_end"] = 1
+    elif defect == "duplicate_chunk":
+        chunks.append({**chunks[0], "chunk_id": "chunk_z_duplicate"})
+    elif defect != "none":
+        raise AssertionError(f"unknown golden defect: {defect}")
+    write_json(result.document_json_path, canonical)
+    _write_jsonl(result.chunks_jsonl_path, chunks)
+    _refresh_case_sidecars(result, canonical, chunks)
+    return result.output_dir
+
+
+def test_golden_cases_match_expected_signals(tmp_path: Path):
+    cases = json.loads(
+        (Path(__file__).parent / "fixtures" / "quality" / "cases.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    for case in cases:
+        version_dir = _build_case(tmp_path / case["case_id"], case)
+        signals = evaluate_document_version(version_dir)
+        actual_codes = sorted({item.reason_code for item in signals})
+        hard_count = sum(
+            1 for item in signals if item.severity in {"error", "fatal"}
+        )
+        for expected in case["expected_reason_codes"]:
+            assert expected in actual_codes, case["case_id"]
+        assert hard_count == case["expected_hard_count"], case["case_id"]
 
 
 def test_healthy_document_has_no_hard_integrity_signal(tmp_path: Path):

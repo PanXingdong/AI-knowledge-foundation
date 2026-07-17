@@ -44,6 +44,12 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 def test_observe_keeps_all_chunks_but_records_would_exclude(tmp_path: Path):
     healthy = _ingest(tmp_path, "healthy", "# Healthy\n\nEnough healthy content.")
     broken = _ingest(tmp_path, "broken", "# Broken\n\nBroken evidence content.")
+    healthy_rows = _read_jsonl(healthy.chunks_jsonl_path)
+    duplicate_chunk_id = "chunk_z_duplicate"
+    healthy_rows.append(
+        {**healthy_rows[0], "chunk_id": duplicate_chunk_id}
+    )
+    _write_jsonl(healthy.chunks_jsonl_path, healthy_rows)
     rows = _read_jsonl(broken.chunks_jsonl_path)
     rows[0]["evidence_ids"] = ["span_missing"]
     _write_jsonl(broken.chunks_jsonl_path, rows)
@@ -60,6 +66,17 @@ def test_observe_keeps_all_chunks_but_records_would_exclude(tmp_path: Path):
     assert all(
         decision.effective_action in {"allow", "warn"}
         for decision in result.report.decisions
+    )
+    duplicate_decision = next(
+        decision
+        for decision in result.report.decisions
+        if "chunk.content.duplicate" in decision.reason_codes
+    )
+    assert duplicate_decision.recommended_action == "warn"
+    assert duplicate_decision.effective_action == "warn"
+    assert (
+        duplicate_chunk_id
+        not in result.publication_preview.would_exclude_chunk_ids
     )
 
 

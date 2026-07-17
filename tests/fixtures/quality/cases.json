@@ -1,0 +1,33 @@
+[
+  {
+    "case_id": "healthy-normal",
+    "supplier": "internal",
+    "defect": "none",
+    "expected_reason_codes": [],
+    "expected_hard_count": 0
+  },
+  {
+    "case_id": "qnx-missing-evidence",
+    "supplier": "QNX",
+    "defect": "missing_chunk_evidence",
+    "expected_reason_codes": ["chunk.evidence.reference_missing"],
+    "expected_hard_count": 1
+  },
+  {
+    "case_id": "qualcomm-page-out-of-range",
+    "supplier": "Qualcomm",
+    "defect": "page_out_of_range",
+    "expected_reason_codes": [
+      "page.integrity.reference_out_of_range",
+      "block.integrity.page_range_invalid"
+    ],
+    "expected_hard_count": 2
+  },
+  {
+    "case_id": "supplier-neutral-duplicate",
+    "supplier": "Other",
+    "defect": "duplicate_chunk",
+    "expected_reason_codes": ["chunk.content.duplicate"],
+    "expected_hard_count": 0
+  }
+]
