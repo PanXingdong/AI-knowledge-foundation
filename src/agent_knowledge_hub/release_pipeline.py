@@ -6,9 +6,9 @@ from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.quality_baseline import build_quality_baseline
 from agent_knowledge_hub.release_manifest import (
     ReleaseManifest,
-    _validate_bound_release,
     create_candidate_release,
     finalize_release,
+    validate_bound_release,
 )
 from agent_knowledge_hub.utils import write_json
 from agent_knowledge_hub.vector_index import build_vector_index
@@ -22,7 +22,7 @@ def build_release_bundle(
     releases_root = Path(releases_dir)
     candidate = create_candidate_release(processed_root, releases_root)
     if candidate.status == "ready":
-        _validate_bound_release(candidate)
+        validate_bound_release(candidate)
         return candidate
 
     release_dir = candidate.manifest_path.parent

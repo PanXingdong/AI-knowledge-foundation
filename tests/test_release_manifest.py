@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import agent_knowledge_hub.release_manifest as release_manifest_module
 from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.pipeline import ingest_file
 from agent_knowledge_hub.processing_record import processing_run_id
@@ -22,6 +23,11 @@ from agent_knowledge_hub.vector_index import (
     build_bge_m3_vector_index,
     build_vector_index,
 )
+
+
+def test_bound_release_validator_is_public_api():
+    assert callable(release_manifest_module.validate_bound_release)
+    assert not hasattr(release_manifest_module, "_validate_bound_release")
 
 
 def _ingest_version(root: Path, source: Path, version: str, text: str):

@@ -15,9 +15,9 @@ from typing import Iterable
 from agent_knowledge_hub.fts_index import query_fts_index, read_fts_release_id
 from agent_knowledge_hub.release_manifest import (
     ReleaseManifest,
-    _validate_bound_release,
     iter_release_documents,
     load_release_manifest,
+    validate_bound_release,
 )
 from agent_knowledge_hub.utils import normalize_space, stable_id, write_json
 from agent_knowledge_hub.vector_index import (
@@ -2389,7 +2389,7 @@ def _resolve_release_indexes(
     if manifest.status != "ready":
         raise ValueError("release_status_invalid")
 
-    _validate_bound_release(manifest)
+    validate_bound_release(manifest)
     bound_fts = manifest.resolve_artifact("fts")
     bound_vector = manifest.resolve_artifact("vector")
     for name, requested, bound in (

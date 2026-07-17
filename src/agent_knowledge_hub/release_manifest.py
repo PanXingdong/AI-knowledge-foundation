@@ -256,7 +256,7 @@ def activate_release(
     manifest = load_release_manifest(manifest_path)
     if manifest.status != "ready":
         raise ValueError("release_not_ready")
-    _validate_bound_release(manifest)
+    validate_bound_release(manifest)
 
     pointer_path = active_pointer_path.resolve()
     _atomic_write_json(
@@ -290,7 +290,7 @@ def _load_matching_existing_release(
         if (
             existing.release_id != release_id
             or existing.documents != documents
-            or validate_release_artifacts(manifest_path)
+            or bool(validate_release_artifacts(manifest_path))
         ):
             raise ValueError(error_message)
     except (KeyError, OSError, TypeError, json.JSONDecodeError) as error:
@@ -645,7 +645,7 @@ def _release_relative_artifact(
     return resolved, relative.as_posix()
 
 
-def _validate_bound_release(manifest: ReleaseManifest) -> None:
+def validate_bound_release(manifest: ReleaseManifest) -> None:
     errors = validate_release_artifacts(manifest.manifest_path)
     if errors:
         raise ValueError(";".join(errors))
@@ -799,7 +799,7 @@ def _finalize_ready_idempotently(
         )
         if requested_paths != expected_paths:
             raise ValueError("release_already_ready")
-        _validate_bound_release(manifest)
+        validate_bound_release(manifest)
     except ValueError as error:
         if str(error) == "release_already_ready":
             raise
