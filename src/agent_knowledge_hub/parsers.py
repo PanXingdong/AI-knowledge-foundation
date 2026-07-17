@@ -97,6 +97,28 @@ SUPPORTED_EXTENSIONS = {
     ".md",
     ".markdown",
     ".txt",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".inl",
+    ".py",
+    ".sh",
+    ".cmake",
+    ".mk",
+    ".java",
+    ".js",
+    ".ts",
+    ".rs",
+    ".proto",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
     ".html",
     ".htm",
     ".pdf",
@@ -112,6 +134,13 @@ SUPPORTED_EXTENSIONS = {
 }
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
+_CODE_EXTENSIONS = {
+    ".c", ".cc", ".cpp", ".cxx",
+    ".h", ".hh", ".hpp", ".hxx", ".inl",
+    ".py", ".sh", ".cmake", ".mk",
+    ".java", ".js", ".ts", ".rs", ".proto",
+    ".json", ".yaml", ".yml", ".xml",
+}
 
 _MIN_TRUSTED_PDF_TEXT_CHARS = 40
 _MIN_CJK_CHARS_FOR_MOJIBAKE_CHECK = 20
@@ -133,6 +162,8 @@ def parse_document(path: Path) -> ParsedDocument:
         return parse_markdown(path)
     if suffix == ".txt":
         return parse_text(path)
+    if suffix in _CODE_EXTENSIONS:
+        return parse_source_code(path)
     if suffix in {".html", ".htm"}:
         return parse_html(path)
     if suffix == ".pdf":
@@ -176,6 +207,24 @@ def parse_text(path: Path) -> ParsedDocument:
         quality_report=_build_generic_quality_report(
             blocks=blocks,
             source_format="text",
+        ),
+    )
+
+
+def parse_source_code(path: Path) -> ParsedDocument:
+    text = read_text_with_fallback(path)
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    blocks = [
+        ParsedBlock(block_type="code", text=normalized)
+    ] if normalized else []
+    return ParsedDocument(
+        source_format="source_code",
+        parser_name="stdlib-code-parser",
+        page_count=None,
+        blocks=blocks,
+        quality_report=_build_generic_quality_report(
+            blocks=blocks,
+            source_format="source_code",
         ),
     )
 

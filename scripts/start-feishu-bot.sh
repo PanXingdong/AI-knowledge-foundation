@@ -34,6 +34,8 @@ fi
 : "${FEISHU_API_BASE:=https://open.feishu.cn/open-apis}"
 : "${LOCAL_API_BASE:=http://127.0.0.1:8789}"
 : "${PROCESSED_DIR:=$PROJECT_ROOT/.tmp_demo_processed}"
+: "${API_STARTUP_TIMEOUT:=300}"
+: "${SKIP_PREWARM:=1}"
 
 API_PORT=8789
 API_LOG="/tmp/uvicorn.log"
@@ -44,6 +46,8 @@ echo "启动飞书Bot（官方SDK长连接方式）"
 echo "=================================="
 echo "App ID: $FEISHU_APP_ID"
 echo "API端口: $API_PORT"
+echo "API启动超时: ${API_STARTUP_TIMEOUT}s"
+echo "跳过预热: $SKIP_PREWARM"
 echo "Bot日志: $BOT_LOG"
 echo ""
 
@@ -60,14 +64,28 @@ mkdir -p "$PROCESSED_DIR"
 echo "启动本地API服务..."
 nohup python3 -m uvicorn agent_knowledge_hub.service:create_app --factory --host 127.0.0.1 --port $API_PORT > "$API_LOG" 2>&1 &
 API_PID=$!
-sleep 3
 
 # 检查API是否启动成功
-if ! ss -tlnp 2>/dev/null | grep -q ":$API_PORT "; then
-    echo "API服务启动失败，请检查日志:"
-    tail -n 20 "$API_LOG"
+api_started=0
+for (( elapsed=0; elapsed<API_STARTUP_TIMEOUT; elapsed++ )); do
+    if ss -tlnp 2>/dev/null | grep -q ":$API_PORT "; then
+        api_started=1
+        break
+    fi
+    if ! kill -0 "$API_PID" 2>/dev/null; then
+        echo "API服务启动失败，请检查日志:"
+        tail -n 40 "$API_LOG"
+        exit 1
+    fi
+    sleep 1
+done
+
+if [[ $api_started -ne 1 ]]; then
+    echo "API服务在 ${API_STARTUP_TIMEOUT}s 内未完成启动，请检查日志:"
+    tail -n 40 "$API_LOG"
     exit 1
 fi
+
 echo "API服务已启动 (端口 $API_PORT)"
 echo ""
 

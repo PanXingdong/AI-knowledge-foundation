@@ -442,15 +442,18 @@ def build_chunks(
         if not block_text:
             continue
 
-        # --- Filter 1: noise sections ---
-        if _is_noise_block(block.section_path, block_text):
-            continue
-
-        # --- Filter 2: fragment blocks (page headers/footers, dates, etc.) ---
-        if _is_fragment_block(block_text):
-            continue
-
         block_type = block.block_type  # "paragraph" | "heading" | "table"
+        # Code blocks may carry synthetic section path "0" and identifier-like
+        # lines that look like fragments; keep them to preserve source retrieval.
+        if block_type != "code":
+            # --- Filter 1: noise sections ---
+            if _is_noise_block(block.section_path, block_text):
+                continue
+
+            # --- Filter 2: fragment blocks (page headers/footers, dates, etc.) ---
+            if _is_fragment_block(block_text):
+                continue
+
         block_evidence = evidence_by_block.get(block.block_id)
         section_changed = (
             bool(current_section_path) and block.section_path != current_section_path
