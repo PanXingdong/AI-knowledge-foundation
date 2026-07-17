@@ -6,3 +6,4 @@ uvicorn
 lark-oapi
 FlagEmbedding
 sentence-transformers
+watchdog

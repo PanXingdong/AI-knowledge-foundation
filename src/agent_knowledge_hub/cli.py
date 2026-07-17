@@ -318,6 +318,34 @@ def main(argv: list[str] | None = None) -> int:
                 eval_run_dir=args.eval_run_dir,
             )
             payload = summary.to_dict()
+        elif args.command == "watch-repo":
+            from agent_knowledge_hub.code_watcher import run_watch_service
+            run_watch_service(
+                watch_dir=args.watch_dir,
+                out_dir=args.out_dir,
+                project=args.project,
+                owner=args.owner,
+                fts_index_path=args.fts_index_path,
+                vector_index_path=args.vector_index_path,
+                exclude_dirs=set(args.exclude_dir) if args.exclude_dir else None,
+                debounce_seconds=args.debounce_seconds,
+                rebuild_indexes=not args.no_rebuild_indexes,
+            )
+            return 0
+        elif args.command == "generate-code-manifest":
+            from agent_knowledge_hub.code_manifest import (
+                DEFAULT_EXCLUDE_DIRS,
+                TARGET_EXTENSIONS,
+                scan_repo,
+                write_csv,
+            )
+            repo_dir = args.repo_dir.resolve()
+            exclude_dirs = (
+                frozenset[str]() if args.no_default_excludes else DEFAULT_EXCLUDE_DIRS
+            ) | frozenset(args.exclude_dir or [])
+            rows = scan_repo(repo_dir, exclude_dirs, TARGET_EXTENSIONS)
+            write_csv(rows, args.output)
+            payload = {"scanned_files": len(rows), "output": str(args.output)}
         elif args.command == "dependency-check":
             report = check_runtime_dependencies()
             if args.output_dir:
@@ -633,6 +661,56 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Check local parser/OCR dependencies before ingesting documents.",
     )
     dependency_parser.add_argument("--output-dir", type=Path)
+
+    watch_parser = subparsers.add_parser(
+        "watch-repo",
+        help="监听代码仓目录，文件变更后自动增量入库并重建检索索引。",
+    )
+    watch_parser.add_argument(
+        "--watch-dir", required=True, type=Path,
+        help="要监听的代码仓根目录（如 ClusterHMI）。",
+    )
+    watch_parser.add_argument(
+        "--out-dir", required=True, type=Path,
+        help="知识库产物输出目录（processed/）。",
+    )
+    watch_parser.add_argument("--project", default="ClusterHMI")
+    watch_parser.add_argument("--owner", default="PATAC")
+    watch_parser.add_argument("--fts-index-path", type=Path)
+    watch_parser.add_argument("--vector-index-path", type=Path)
+    watch_parser.add_argument(
+        "--exclude-dir", action="append", default=[],
+        help="排除的目录名（可多次指定）。默认排除 KanziEngine/someip/ClusterHMIPrebuilts。",
+    )
+    watch_parser.add_argument(
+        "--debounce-seconds", type=float, default=3.0,
+        help="防抖等待时间（秒），连续变更会被合并处理，默认 3 秒。",
+    )
+    watch_parser.add_argument(
+        "--no-rebuild-indexes", action="store_true",
+        help="入库后不自动重建检索索引。",
+    )
+
+    manifest_gen_parser = subparsers.add_parser(
+        "generate-code-manifest",
+        help="扫描代码仓目录，生成知识库接入清单 CSV。",
+    )
+    manifest_gen_parser.add_argument(
+        "--repo-dir", required=True, type=Path,
+        help="代码仓根目录（如 ClusterHMI）。",
+    )
+    manifest_gen_parser.add_argument(
+        "--output", required=True, type=Path,
+        help="输出 CSV 路径。",
+    )
+    manifest_gen_parser.add_argument(
+        "--exclude-dir", action="append", default=[],
+        help="排除的目录名（可多次指定）。",
+    )
+    manifest_gen_parser.add_argument(
+        "--no-default-excludes", action="store_true",
+        help="不使用默认排除列表。",
+    )
 
     contract_parser = subparsers.add_parser(
         "validate-processed",

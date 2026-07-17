@@ -250,6 +250,146 @@ def _write_legacy_ingest_summary(path: Path, summary: IncrementalIngestSummary) 
     )
 
 
+def ingest_paths_incremental(
+    *,
+    paths: set[Path] | list[Path],
+    out_dir: Path | str,
+    project: str = "unknown",
+    owner: str = "unknown",
+    supplier: str = "unknown",
+    source_type: str = "source_code",
+    document_version: str = "unknown",
+    max_chunk_chars: int = 1600,
+    max_tokens: int = 512,
+    overlap_chars: int = 160,
+) -> IncrementalIngestSummary:
+    """
+    对一组文件路径做增量入库：哈希未变则跳过，已变则重新入库。
+
+    与 ingest_manifest_incremental 的区别：
+    - 直接接收 Path 集合，无需 CSV 清单文件。
+    - 适合文件监听器（code_watcher）触发的实时更新场景。
+
+    Parameters
+    ----------
+    paths:
+        需要检查并按需重新入库的文件路径集合。
+    out_dir:
+        知识库产物输出目录（processed/）。
+    project / owner / supplier / source_type / document_version:
+        写入 chunk 元数据的字段，可按需覆盖。
+    """
+    output_root = Path(out_dir).resolve()
+    state_path = output_root / "ingest-state.json"
+    state = _load_state(state_path)
+    next_state = dict(state)
+
+    documents: list[IncrementalIngestDocument] = []
+    failed: list[dict[str, str]] = []
+    processed_count = 0
+    unchanged_count = 0
+    changed_count = 0
+
+    for source_path in sorted(paths):
+        source_path = source_path.resolve()
+        if not source_path.is_file():
+            continue
+
+        try:
+            content_hash = file_sha256(source_path)
+        except OSError as exc:
+            failed.append({"file_path": str(source_path), "reason": str(exc)})
+            continue
+
+        state_key = str(source_path)
+        previous = state.get(state_key) or {}
+        previous_hash = previous.get("content_hash")
+
+        if previous_hash == content_hash:
+            unchanged_count += 1
+            documents.append(
+                IncrementalIngestDocument(
+                    sample_id=previous.get("sample_id") or source_path.stem,
+                    status="unchanged",
+                    source_path=str(source_path),
+                    content_hash=content_hash,
+                    previous_hash=previous_hash,
+                    output_dir=previous.get("output_dir"),
+                    document_json_path=previous.get("document_json_path"),
+                    chunks_jsonl_path=previous.get("chunks_jsonl_path"),
+                )
+            )
+            continue
+
+        sample_id = source_path.stem
+        try:
+            result = ingest_file(
+                file_path=source_path,
+                out_dir=output_root,
+                title=source_path.stem,
+                source_type=source_type,
+                owner=owner,
+                project=project,
+                supplier=supplier,
+                document_version=document_version,
+                sample_id=sample_id,
+                max_chunk_chars=max_chunk_chars,
+                max_tokens=max_tokens,
+                overlap_chars=overlap_chars,
+            )
+            processed_count += 1
+            if previous_hash is not None:
+                changed_count += 1
+            document = IncrementalIngestDocument(
+                sample_id=sample_id,
+                status="processed",
+                source_path=str(source_path),
+                content_hash=content_hash,
+                previous_hash=previous_hash,
+                output_dir=str(result.output_dir),
+                document_json_path=str(result.document_json_path),
+                chunks_jsonl_path=str(result.chunks_jsonl_path),
+            )
+            documents.append(document)
+            next_state[state_key] = {
+                **document.to_dict(),
+                "updated_at": utc_now_iso(),
+            }
+        except (DocumentParseError, OSError, ValueError) as exc:
+            failed.append({"file_path": str(source_path), "reason": str(exc)})
+            documents.append(
+                IncrementalIngestDocument(
+                    sample_id=sample_id,
+                    status="failed",
+                    source_path=str(source_path),
+                    content_hash=content_hash,
+                    previous_hash=previous_hash,
+                    output_dir=None,
+                    document_json_path=None,
+                    chunks_jsonl_path=None,
+                    reason=str(exc),
+                )
+            )
+
+    summary = IncrementalIngestSummary(
+        manifest_path=output_root / "ingest-state.json",
+        output_dir=output_root,
+        generated_at=utc_now_iso(),
+        processed_count=processed_count,
+        unchanged_count=unchanged_count,
+        changed_count=changed_count,
+        skipped_count=0,
+        failed_count=len(failed),
+        documents=documents,
+        skipped=[],
+        failed=failed,
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    write_json(output_root / "ingest-state.json", {"documents": next_state})
+    write_json(output_root / "ingest-run-summary.json", summary.to_dict())
+    return summary
+
+
 def _get(row: dict[str, str], key: str) -> str:
     return (row.get(key) or "").strip()
 
