@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-knowledge-foundation.local/schemas/knowledge-quality.v1/quarantine-preview.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "policy_id",
+    "policy_version",
+    "mode",
+    "items"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "knowledge-quarantine-preview.v1"
+    },
+    "policy_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "policy_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "const": "observe"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "scope",
+          "object_id",
+          "decision_id",
+          "reason_codes",
+          "recommended_action"
+        ],
+        "properties": {
+          "scope": {
+            "enum": [
+              "document",
+              "page",
+              "block",
+              "chunk",
+              "release"
+            ]
+          },
+          "object_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "decision_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason_codes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "recommended_action": {
+            "enum": [
+              "allow",
+              "warn",
+              "quarantine",
+              "block_document",
+              "block_release"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
