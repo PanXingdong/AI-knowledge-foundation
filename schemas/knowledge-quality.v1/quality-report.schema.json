@@ -246,10 +246,7 @@
         "effective_action": {
           "enum": [
             "allow",
-            "warn",
-            "quarantine",
-            "block_document",
-            "block_release"
+            "warn"
           ]
         },
         "scope": {

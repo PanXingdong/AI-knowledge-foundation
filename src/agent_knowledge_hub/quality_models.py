@@ -22,6 +22,14 @@ QUALITY_MODES = frozenset({"observe", "candidate_enforce", "production_enforce"}
 JsonScalar = str | int | float | bool | None
 
 
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class ObservedQualitySignal:
     signal_id: str
@@ -44,6 +52,8 @@ class ObservedQualitySignal:
 
     @classmethod
     def create(cls, **values: Any) -> ObservedQualitySignal:
+        if "signal_id" in values:
+            raise ValueError("signal_id_is_generated")
         payload = dict(values)
         evidence_ids = tuple(
             sorted(str(item) for item in payload.pop("evidence_ids", ()))
@@ -67,7 +77,7 @@ class ObservedQualitySignal:
         return cls(signal_id=signal_id, evidence_ids=evidence_ids, **payload)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_ready(asdict(self))
 
 
 @dataclass(frozen=True)
@@ -87,7 +97,7 @@ class QualityPolicy:
     policy_hash: str
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_ready(asdict(self))
 
 
 @dataclass(frozen=True)
@@ -106,7 +116,13 @@ class QualityDecision:
 
     @classmethod
     def create(cls, **values: Any) -> QualityDecision:
+        if "decision_id" in values:
+            raise ValueError("decision_id_is_generated")
         payload = dict(values)
+        if payload.get("mode") == "observe" and payload.get(
+            "effective_action"
+        ) not in {"allow", "warn"}:
+            raise ValueError("observe_effective_action_must_not_enforce")
         signal_ids = tuple(sorted(payload.pop("signal_ids")))
         reason_codes = tuple(sorted(payload.pop("reason_codes")))
         decision_id = stable_id(
@@ -130,7 +146,7 @@ class QualityDecision:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_ready(asdict(self))
 
 
 @dataclass(frozen=True)
@@ -148,11 +164,7 @@ class QualityReport:
     summary: dict[str, int]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            **asdict(self),
-            "signals": [item.to_dict() for item in self.signals],
-            "decisions": [item.to_dict() for item in self.decisions],
-        }
+        return _json_ready(asdict(self))
 
 
 @dataclass(frozen=True)
@@ -168,7 +180,7 @@ class PublicationPreview:
     decision_ids: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_ready(asdict(self))
 
 
 @dataclass(frozen=True)
@@ -180,4 +192,4 @@ class QuarantinePreview:
     items: tuple[dict[str, Any], ...]
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_ready(asdict(self))

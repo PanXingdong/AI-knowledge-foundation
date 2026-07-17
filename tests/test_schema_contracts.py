@@ -1,6 +1,9 @@
 import json
+from copy import deepcopy
 from dataclasses import fields
 from pathlib import Path
+
+import pytest
 
 from agent_knowledge_hub.models import CANONICAL_DOCUMENT_SCHEMA_VERSION
 from agent_knowledge_hub.processing_record import PROCESSING_RECORD_SCHEMA_VERSION
@@ -196,6 +199,46 @@ def test_quality_report_nested_definitions_match_dataclasses_exactly():
         assert definition["additionalProperties"] is False
         assert set(definition["properties"]) == model_fields
         assert set(definition["required"]) == model_fields
+
+
+def test_quality_report_schema_accepts_non_enforcing_observe_decisions_only():
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = _quality_schema("quality-report.schema.json")
+    validator = jsonschema.Draft202012Validator(schema)
+    report = {
+        "schema_version": QUALITY_REPORT_SCHEMA_VERSION,
+        "policy_id": "phase1-observe-default",
+        "policy_version": "1",
+        "policy_hash": "a" * 64,
+        "mode": "observe",
+        "artifact_fingerprint": "artifact_1",
+        "determinism_fingerprint": "determinism_1",
+        "document_version_ids": ["docver_1"],
+        "signals": [],
+        "decisions": [
+            {
+                "decision_id": "decision_1",
+                "signal_ids": ["signal_1"],
+                "policy_id": "phase1-observe-default",
+                "policy_version": "1",
+                "mode": "observe",
+                "recommended_action": "quarantine",
+                "effective_action": "warn",
+                "scope": "chunk",
+                "object_id": "chunk_1",
+                "reason_codes": ["chunk.evidence.reference_missing"],
+                "artifact_fingerprint": "artifact_1",
+            }
+        ],
+        "summary": {"warning": 1},
+    }
+
+    validator.validate(report)
+    for enforcing_action in ("quarantine", "block_document", "block_release"):
+        invalid_report = deepcopy(report)
+        invalid_report["decisions"][0]["effective_action"] = enforcing_action
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(invalid_report)
 
 
 def test_quality_policy_rule_definition_matches_dataclass_exactly():
