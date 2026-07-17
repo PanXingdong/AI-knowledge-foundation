@@ -12,9 +12,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
-from agent_knowledge_hub.fts_index import query_fts_index
+from agent_knowledge_hub.fts_index import query_fts_index, read_fts_release_id
+from agent_knowledge_hub.release_manifest import (
+    ReleaseManifest,
+    iter_release_documents,
+    load_release_manifest,
+    validate_bound_release,
+)
 from agent_knowledge_hub.utils import normalize_space, stable_id, write_json
-from agent_knowledge_hub.vector_index import VectorIndexError, query_vector_index
+from agent_knowledge_hub.vector_index import (
+    VectorIndexError,
+    query_vector_index,
+    read_vector_release_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1322,6 +1332,7 @@ class ContextPackResult:
     chunk_count: int
     document_count: int
     warnings: list[str]
+    release_id: str | None = None
     token_used: int = 0
     token_budget: int | None = None
 
@@ -1338,6 +1349,7 @@ class ContextPackResult:
             "query": self.query,
             "normalized_query": self.normalized_query,
             "processed_dir": str(self.processed_dir),
+            "release_id": self.release_id,
             "applied_filters": {key: list(value) for key, value in self.applied_filters.items()},
             "chunk_count": self.chunk_count,
             "document_count": self.document_count,
@@ -1360,6 +1372,7 @@ class ContextPackResult:
             "task_profile": dict(self.task_profile),
             "contract": _build_context_pack_contract(),
             "processed_dir": str(self.processed_dir),
+            "release_id": self.release_id,
             "query": self.query,
             "normalized_query": self.normalized_query,
             "applied_filters": {key: list(value) for key, value in self.applied_filters.items()},
@@ -1597,6 +1610,7 @@ def build_context_pack_for_processed_dir(
     fts_index_path: Path | str | None = None,
     vector_index_path: Path | str | None = None,
     token_budget: int | None = None,
+    release_manifest_path: Path | str | None = None,
 ) -> ContextPackResult:
     processed_root = Path(processed_dir).resolve()
     _t_prev = time.time()
@@ -1613,7 +1627,24 @@ def build_context_pack_for_processed_dir(
     if not processed_root.exists():
         raise FileNotFoundError(f"Processed directory does not exist: {processed_root}")
 
-    loaded_chunks = _load_processed_chunks(processed_root)
+    manifest = (
+        load_release_manifest(Path(release_manifest_path))
+        if release_manifest_path is not None
+        else None
+    )
+    if manifest is not None and Path(manifest.processed_dir).resolve() != processed_root:
+        raise ValueError("release_processed_dir_mismatch")
+    fts_index_path, vector_index_path = _resolve_release_indexes(
+        manifest=manifest,
+        fts_index_path=fts_index_path,
+        vector_index_path=vector_index_path,
+    )
+    _assert_release_index_compatibility(
+        release_id=manifest.release_id if manifest else None,
+        fts_index_path=fts_index_path,
+        vector_index_path=vector_index_path,
+    )
+    loaded_chunks = _load_processed_chunks(processed_root, manifest)
     _t_now = time.time()
     logger.info("[perf] load_chunks: %.2fs (%d chunks)", _t_now - _t_prev, len(loaded_chunks))
     _t_prev = _t_now
@@ -1721,11 +1752,11 @@ def build_context_pack_for_processed_dir(
     # the lifetime of the service process for a fixed processed_dir). When a
     # high-confidence external index has already narrowed the pool, score only
     # that pool to avoid cold-start full-corpus BM25 work on large knowledge bases.
-    _bm25_cached = str(processed_root) in _BM25_CONTEXT_CACHE
+    _bm25_cache_key = _release_cache_key(processed_root, manifest)
+    _bm25_cached = _bm25_cache_key in _BM25_CONTEXT_CACHE
     if focused_external_candidates:
         cached_bm25_context = _build_bm25_context(list(eligible_chunks))
     else:
-        _bm25_cache_key = str(processed_root)
         if _bm25_cache_key not in _BM25_CONTEXT_CACHE:
             _BM25_CONTEXT_CACHE[_bm25_cache_key] = _build_bm25_context(list(loaded_chunks))
         cached_bm25_context = _BM25_CONTEXT_CACHE[_bm25_cache_key]
@@ -1746,6 +1777,7 @@ def build_context_pack_for_processed_dir(
         fts_bonus_by_chunk_id=fts_bonus_by_chunk_id,
         vector_bonus_by_chunk_id=vector_bonus_by_chunk_id,
         bm25_context=cached_bm25_context,
+        cache_namespace=manifest.release_id if manifest else "legacy-latest",
     )
     # _select_candidates is O(pool_size²). Candidates are already sorted by
     # score, so capping the pool here gives ample diversity room while avoiding
@@ -1851,6 +1883,7 @@ def build_context_pack_for_processed_dir(
         chunk_count=len(selected_chunks),
         document_count=len({chunk.document_version_id for chunk in selected_chunks}),
         warnings=warnings,
+        release_id=manifest.release_id if manifest else None,
         token_used=estimate_tokens(markdown),
         token_budget=token_budget,
     )
@@ -1934,6 +1967,7 @@ def trace_evidence_in_processed_dir(
     *,
     processed_dir: Path | str,
     evidence_id: str,
+    release_manifest_path: Path | str | None = None,
 ) -> EvidenceTraceResult:
     processed_root = Path(processed_dir).resolve()
     normalized_evidence_id = normalize_space(evidence_id)
@@ -1942,7 +1976,19 @@ def trace_evidence_in_processed_dir(
     if not processed_root.exists():
         raise FileNotFoundError(f"Processed directory does not exist: {processed_root}")
 
-    for chunks_path, document_payload in _iter_latest_processed_versions(processed_root):
+    manifest = (
+        load_release_manifest(Path(release_manifest_path))
+        if release_manifest_path is not None
+        else None
+    )
+    if manifest is not None and Path(manifest.processed_dir).resolve() != processed_root:
+        raise ValueError("release_processed_dir_mismatch")
+    versions = (
+        iter_release_documents(manifest.manifest_path)
+        if manifest is not None
+        else _iter_latest_processed_versions(processed_root)
+    )
+    for chunks_path, document_payload in versions:
         evidence_payload = _find_evidence_payload(document_payload, normalized_evidence_id)
         if evidence_payload is None:
             continue
@@ -2063,6 +2109,11 @@ def load_context_pack_result(path: Path | str) -> ContextPackResult:
             or len({chunk.document_version_id for chunk in selected_chunks})
         ),
         warnings=warnings,
+        release_id=(
+            str(payload["release_id"])
+            if payload.get("release_id") is not None
+            else None
+        ),
         token_used=int(
             payload["token_used"]
             if payload.get("token_used") is not None
@@ -2154,12 +2205,12 @@ def write_gap_report_bundle(
 # eliminating repeated disk I/O and corpus tokenization.
 # Call clear_retrieval_caches() to invalidate after re-ingestion.
 # ---------------------------------------------------------------------------
-_CHUNK_CACHE: dict[str, list["_LoadedChunk"]] = {}  # str(processed_dir) → list[_LoadedChunk]
-_BM25_CONTEXT_CACHE: dict[str, "_Bm25Context"] = {}  # str(processed_dir) → _Bm25Context
+_CHUNK_CACHE: dict[str, list["_LoadedChunk"]] = {}  # processed_dir|release_id → chunks
+_BM25_CONTEXT_CACHE: dict[str, "_Bm25Context"] = {}  # processed_dir|release_id → context
 # chunk_id → (topic_scores, topic_subfacets, coherence, structure, ev_quality, thin_penalty)
-_CHUNK_STATIC_SCORE_CACHE: dict[str, tuple] = {}
+_CHUNK_STATIC_SCORE_CACHE: dict[tuple[str, str], tuple] = {}
 # chunk_id → (chunk_tokens, title_normalized, section_text, leaf_section_text)
-_CHUNK_TOKEN_CACHE: dict[str, tuple] = {}
+_CHUNK_TOKEN_CACHE: dict[tuple[str, str], tuple] = {}
 
 # Hard cap on per-chunk caches. Each of the ~65k corpus chunks stores a small
 # fixed-size tuple; at 250k entries we evict the oldest half to stay within a
@@ -2276,7 +2327,7 @@ def prewarm(
     t1 = time.time()
     logger.info("[prewarm] load_chunks: %.1fs (%d chunks)", t1 - t0, len(chunks))
 
-    cache_key = str(processed_root)
+    cache_key = _release_cache_key(processed_root, None)
     if cache_key not in _BM25_CONTEXT_CACHE:
         logger.info("[prewarm] building BM25 context ...")
         _BM25_CONTEXT_CACHE[cache_key] = _build_bm25_context(chunks)
@@ -2297,12 +2348,73 @@ def prewarm(
     logger.info("[prewarm] done. total: %.1fs", time.time() - t0)
 
 
-def _load_processed_chunks(processed_dir: Path) -> list[_LoadedChunk]:
-    cache_key = str(processed_dir)
+def _release_cache_key(
+    processed_dir: Path,
+    manifest: ReleaseManifest | None,
+) -> str:
+    release_id = manifest.release_id if manifest else "legacy-latest"
+    return f"{processed_dir}|{release_id}"
+
+
+def _assert_release_index_compatibility(
+    *,
+    release_id: str | None,
+    fts_index_path: Path | str | None,
+    vector_index_path: Path | str | None,
+) -> None:
+    if release_id is None:
+        return
+    if fts_index_path is not None:
+        actual = read_fts_release_id(fts_index_path)
+        if actual != release_id:
+            raise ValueError(
+                f"fts_release_mismatch:expected={release_id}:actual={actual}"
+            )
+    if vector_index_path is not None:
+        actual = read_vector_release_id(vector_index_path)
+        if actual != release_id:
+            raise ValueError(
+                f"vector_release_mismatch:expected={release_id}:actual={actual}"
+            )
+
+
+def _resolve_release_indexes(
+    *,
+    manifest: ReleaseManifest | None,
+    fts_index_path: Path | str | None,
+    vector_index_path: Path | str | None,
+) -> tuple[Path | str | None, Path | str | None]:
+    if manifest is None or manifest.status == "candidate":
+        return fts_index_path, vector_index_path
+    if manifest.status != "ready":
+        raise ValueError("release_status_invalid")
+
+    validate_bound_release(manifest)
+    bound_fts = manifest.resolve_artifact("fts")
+    bound_vector = manifest.resolve_artifact("vector")
+    for name, requested, bound in (
+        ("fts", fts_index_path, bound_fts),
+        ("vector", vector_index_path, bound_vector),
+    ):
+        if requested is not None and Path(requested).resolve() != bound:
+            raise ValueError(f"ready_{name}_path_mismatch")
+    return bound_fts, bound_vector
+
+
+def _load_processed_chunks(
+    processed_dir: Path,
+    manifest: ReleaseManifest | None = None,
+) -> list[_LoadedChunk]:
+    cache_key = _release_cache_key(processed_dir, manifest)
     if cache_key in _CHUNK_CACHE:
         return _CHUNK_CACHE[cache_key]
     chunks: list[_LoadedChunk] = []
-    for chunks_path, document_payload in _iter_latest_processed_versions(processed_dir):
+    versions = (
+        iter_release_documents(manifest.manifest_path)
+        if manifest is not None
+        else _iter_latest_processed_versions(processed_dir)
+    )
+    for chunks_path, document_payload in versions:
         document_chunks: list[_LoadedChunk] = []
         document_info = document_payload.get("document", {}) if document_payload else {}
         document_version_info = document_payload.get("document_version", {}) if document_payload else {}
@@ -2832,7 +2944,11 @@ def _load_vector_bonus_by_chunk_id(
         _merge_hits(hits, weight=1.0)
     except FileNotFoundError:
         return {}, "vector_index_unavailable:not_found:lexical_only"
-    except (OSError, VectorIndexError):
+    except VectorIndexError as error:
+        if str(error) == "bge_model_fingerprint_mismatch":
+            raise
+        return {}, "vector_index_unavailable:query_failed:lexical_only"
+    except OSError:
         return {}, "vector_index_unavailable:query_failed:lexical_only"
 
     expanded = _llm_expand_query(query)
@@ -3011,6 +3127,7 @@ def _build_candidate_scores(
     fts_bonus_by_chunk_id: dict[str, float] | None = None,
     vector_bonus_by_chunk_id: dict[str, float] | None = None,
     bm25_context: _Bm25Context | None = None,
+    cache_namespace: str = "legacy-latest",
 ) -> list[_CandidateScore]:
     chunk_list = list(chunks)
     if bm25_context is None:
@@ -3020,7 +3137,7 @@ def _build_candidate_scores(
     candidates: list[_CandidateScore] = []
     for chunk in chunk_list:
         # Restore query-independent per-chunk scores from cache when available.
-        static_key = chunk.chunk_id
+        static_key = (cache_namespace, chunk.chunk_id)
         if static_key in _CHUNK_STATIC_SCORE_CACHE:
             (
                 topic_scores,
@@ -3063,7 +3180,9 @@ def _build_candidate_scores(
             )
         # Use cached token data to avoid re-tokenising the same chunk text on
         # every request (tokenisation is query-independent).
-        _chunk_tokens, _title_text, _section_text, _leaf_section_text = _get_chunk_token_data(chunk)
+        _chunk_tokens, _title_text, _section_text, _leaf_section_text = (
+            _get_chunk_token_data(chunk, cache_namespace=cache_namespace)
+        )
         overall_score = _score_tokens_from_cached(
             chunk_tokens=_chunk_tokens,
             title_text=_title_text,
@@ -3461,9 +3580,13 @@ def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
     return intersection / max(1, min(len(left), len(right)))
 
 
-def _get_chunk_token_data(chunk: _LoadedChunk) -> tuple[Counter[str], str, str, str]:
-    """Return pre-tokenised chunk data, using a module-level cache keyed by chunk_id."""
-    cache_key = chunk.chunk_id
+def _get_chunk_token_data(
+    chunk: _LoadedChunk,
+    *,
+    cache_namespace: str = "legacy-latest",
+) -> tuple[Counter[str], str, str, str]:
+    """Return pre-tokenised chunk data, isolated by release namespace."""
+    cache_key = (cache_namespace, chunk.chunk_id)
     if cache_key in _CHUNK_TOKEN_CACHE:
         return _CHUNK_TOKEN_CACHE[cache_key]  # type: narrowed via _evict guard
     chunk_text_normalized = normalize_space(chunk.text).lower()

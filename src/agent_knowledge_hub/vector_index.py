@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -9,6 +10,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from agent_knowledge_hub.release_manifest import (
+    iter_release_documents,
+    load_release_manifest,
+)
 from agent_knowledge_hub.utils import normalize_space, write_json
 
 
@@ -21,13 +26,47 @@ class VectorIndexError(Exception):
 # Eliminates repeated JSON disk reads, IDF computation, and per-chunk vector weighting.
 _VECTOR_INDEX_CACHE: dict[str, tuple] = {}
 _BGE_VECTOR_INDEX_CACHE: dict[str, tuple] = {}
-_BGE_MODEL_CACHE: dict[str, Any] = {}
+_BGE_MODEL_CACHE: dict[tuple[str, str | None], Any] = {}
 
 
 def clear_vector_index_cache() -> None:
     """Invalidate the vector index cache (call after re-building the index)."""
     _VECTOR_INDEX_CACHE.clear()
     _BGE_VECTOR_INDEX_CACHE.clear()
+    _BGE_MODEL_CACHE.clear()
+
+
+def model_content_fingerprint(model_path: Path | str) -> str:
+    """Hash a model file or a directory's sorted regular-file contents."""
+    root = Path(model_path)
+    if root.is_symlink():
+        raise VectorIndexError("model_path_symlink_unsupported")
+    if root.is_file():
+        return _file_content_sha256(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"BGE-M3 model path does not exist: {root}")
+
+    digest = hashlib.sha256(b"bge-model-directory-v1\0")
+    entries = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    for path in entries:
+        if path.is_symlink():
+            raise VectorIndexError("model_path_symlink_unsupported")
+        if not path.is_file():
+            continue
+        relative_bytes = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative_bytes).to_bytes(8, "big"))
+        digest.update(relative_bytes)
+        digest.update(bytes.fromhex(_file_content_sha256(path)))
+    return digest.hexdigest()
+
+
+def _file_content_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
 
 EMBEDDING_STRATEGY = "local-hashed-token-v1"
 BGE_M3_EMBEDDING_STRATEGY = "bge-m3-dense-v1"
@@ -84,6 +123,7 @@ class VectorIndexBuildSummary:
     indexed_chunk_count: int
     indexed_document_count: int
     embedding_strategy: str
+    release_id: str | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -92,6 +132,7 @@ class VectorIndexBuildSummary:
             "indexed_chunk_count": self.indexed_chunk_count,
             "indexed_document_count": self.indexed_document_count,
             "embedding_strategy": self.embedding_strategy,
+            "release_id": self.release_id,
         }
 
 
@@ -114,17 +155,22 @@ def build_vector_index(
     *,
     processed_dir: Path | str,
     index_path: Path | str,
+    release_manifest_path: Path | str | None = None,
 ) -> VectorIndexBuildSummary:
     processed_root = Path(processed_dir).resolve()
     resolved_index_path = Path(index_path).resolve()
     if not processed_root.exists():
         raise FileNotFoundError(f"Processed directory does not exist: {processed_root}")
 
+    processed_versions, release_id = _resolve_processed_versions(
+        processed_root,
+        release_manifest_path,
+    )
     rows: list[dict[str, object]] = []
     document_version_ids: set[str] = set()
     document_frequency: Counter[str] = Counter()
 
-    for chunks_path, document_payload in _iter_latest_processed_versions(processed_root):
+    for chunks_path, document_payload in processed_versions:
         document_info = document_payload.get("document") or {}
         version_info = document_payload.get("document_version") or {}
         document_title = normalize_space(str(document_info.get("title") or "unknown"))
@@ -171,6 +217,7 @@ def build_vector_index(
         "schema_version": "vector-index.v1",
         "embedding_strategy": EMBEDDING_STRATEGY,
         "processed_dir": str(processed_root),
+        "release_id": release_id,
         "document_count": len(document_version_ids),
         "chunk_count": len(rows),
         "document_frequency": dict(sorted(document_frequency.items())),
@@ -184,6 +231,7 @@ def build_vector_index(
         indexed_chunk_count=len(rows),
         indexed_document_count=len(document_version_ids),
         embedding_strategy=EMBEDDING_STRATEGY,
+        release_id=release_id,
     )
     write_json(resolved_index_path.with_suffix(".summary.json"), summary.to_dict())
     return summary
@@ -197,10 +245,14 @@ def build_bge_m3_vector_index(
     batch_size: int = 8,
     max_length: int = 1024,
     progress_callback: Callable[[int, int], None] | None = None,
+    release_manifest_path: Path | str | None = None,
 ) -> VectorIndexBuildSummary:
     processed_root = Path(processed_dir).resolve()
     resolved_index_path = Path(index_path).resolve()
-    resolved_model_path = Path(model_path).resolve()
+    raw_model_path = Path(model_path)
+    if raw_model_path.is_symlink():
+        raise VectorIndexError("model_path_symlink_unsupported")
+    resolved_model_path = raw_model_path.resolve()
     if not processed_root.exists():
         raise FileNotFoundError(f"Processed directory does not exist: {processed_root}")
     if not resolved_model_path.exists():
@@ -209,8 +261,13 @@ def build_bge_m3_vector_index(
         raise ValueError("batch_size must be > 0")
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
+    model_fingerprint = model_content_fingerprint(resolved_model_path)
 
-    rows, texts, document_version_ids = _collect_dense_index_rows(processed_root)
+    processed_versions, release_id = _resolve_processed_versions(
+        processed_root,
+        release_manifest_path,
+    )
+    rows, texts, document_version_ids = _collect_dense_index_rows(processed_versions)
     if not rows:
         raise ValueError(f"No chunks found under processed directory: {processed_root}")
 
@@ -245,7 +302,9 @@ def build_bge_m3_vector_index(
         "schema_version": "vector-index.v2",
         "embedding_strategy": BGE_M3_EMBEDDING_STRATEGY,
         "processed_dir": str(processed_root),
+        "release_id": release_id,
         "model_path": str(resolved_model_path),
+        "model_fingerprint": model_fingerprint,
         "model_name": "BAAI/bge-m3",
         "dimension": int(vectors.shape[1]),
         "max_length": max_length,
@@ -261,6 +320,7 @@ def build_bge_m3_vector_index(
         indexed_chunk_count=len(rows),
         indexed_document_count=len(document_version_ids),
         embedding_strategy=BGE_M3_EMBEDDING_STRATEGY,
+        release_id=release_id,
     )
     write_json(resolved_index_path.with_suffix(".summary.json"), summary.to_dict())
     clear_vector_index_cache()
@@ -276,10 +336,14 @@ def build_bge_m3_vector_index_resumable(
     max_length: int = 512,
     work_dir: Path | str | None = None,
     progress_callback: Callable[[int, int, bool], None] | None = None,
+    release_manifest_path: Path | str | None = None,
 ) -> VectorIndexBuildSummary:
     processed_root = Path(processed_dir).resolve()
     resolved_index_path = Path(index_path).resolve()
-    resolved_model_path = Path(model_path).resolve()
+    raw_model_path = Path(model_path)
+    if raw_model_path.is_symlink():
+        raise VectorIndexError("model_path_symlink_unsupported")
+    resolved_model_path = raw_model_path.resolve()
     resolved_work_dir = (
         Path(work_dir).resolve()
         if work_dir is not None
@@ -293,27 +357,68 @@ def build_bge_m3_vector_index_resumable(
         raise ValueError("batch_size must be > 0")
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
+    model_fingerprint = model_content_fingerprint(resolved_model_path)
 
-    rows, texts, document_version_ids = _collect_dense_index_rows(processed_root)
+    processed_versions, release_id = _resolve_processed_versions(
+        processed_root,
+        release_manifest_path,
+    )
+    rows, texts, document_version_ids = _collect_dense_index_rows(processed_versions)
     if not rows:
         raise ValueError(f"No chunks found under processed directory: {processed_root}")
+    input_fingerprint = _dense_input_fingerprint(rows, texts)
 
     import numpy as np
 
     resolved_work_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = resolved_work_dir / "manifest.json"
     manifest = {
         "schema_version": "bge-m3-vector-parts.v1",
+        "embedding_strategy": BGE_M3_EMBEDDING_STRATEGY,
         "processed_dir": str(processed_root),
         "index_path": str(resolved_index_path),
         "model_path": str(resolved_model_path),
+        "model_fingerprint": model_fingerprint,
         "batch_size": batch_size,
         "max_length": max_length,
         "chunk_count": len(rows),
+        "release_id": release_id,
+        "input_fingerprint": input_fingerprint,
     }
-    write_json(resolved_work_dir / "manifest.json", manifest)
+    expected_part_dimension: int | None = None
+    if manifest_path.exists():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError) as error:
+            raise VectorIndexError("resumable_work_dir_input_mismatch") from error
+        identity_fields = (
+            "embedding_strategy",
+            "model_path",
+            "model_fingerprint",
+            "max_length",
+            "batch_size",
+            "release_id",
+            "input_fingerprint",
+        )
+        if any(
+            existing_manifest.get(field) != manifest.get(field)
+            for field in identity_fields
+        ):
+            raise VectorIndexError("resumable_work_dir_input_mismatch")
+        raw_dimension = existing_manifest.get("dimension")
+        expected_part_dimension = int(raw_dimension) if raw_dimension is not None else None
+    else:
+        write_json(manifest_path, manifest)
 
-    model = _load_bge_m3_model(resolved_model_path)
     total = len(texts)
+    _validate_resumable_parts(
+        work_dir=resolved_work_dir,
+        total=total,
+        batch_size=batch_size,
+        require_all=False,
+        expected_dimension=expected_part_dimension,
+    )
+    model = _load_bge_m3_model(resolved_model_path)
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
         part_path = resolved_work_dir / f"part_{start:08d}_{end:08d}.npy"
@@ -336,13 +441,16 @@ def build_bge_m3_vector_index_resumable(
         if progress_callback is not None:
             progress_callback(end, total, skipped)
 
-    parts = []
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        part_path = resolved_work_dir / f"part_{start:08d}_{end:08d}.npy"
-        if not part_path.exists():
-            raise FileNotFoundError(f"Missing BGE-M3 vector part: {part_path}")
-        parts.append(np.load(part_path).astype("float32", copy=False))
+    parts = _validate_resumable_parts(
+        work_dir=resolved_work_dir,
+        total=total,
+        batch_size=batch_size,
+        require_all=True,
+        expected_dimension=expected_part_dimension,
+    )
+    actual_dimension = int(parts[0].shape[1])
+    if expected_part_dimension is None:
+        write_json(manifest_path, {**manifest, "dimension": actual_dimension})
     vectors = np.vstack(parts).astype("float32", copy=False)
 
     resolved_index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,7 +461,9 @@ def build_bge_m3_vector_index_resumable(
         "schema_version": "vector-index.v2",
         "embedding_strategy": BGE_M3_EMBEDDING_STRATEGY,
         "processed_dir": str(processed_root),
+        "release_id": release_id,
         "model_path": str(resolved_model_path),
+        "model_fingerprint": model_fingerprint,
         "model_name": "BAAI/bge-m3",
         "dimension": int(vectors.shape[1]),
         "max_length": max_length,
@@ -369,10 +479,65 @@ def build_bge_m3_vector_index_resumable(
         indexed_chunk_count=len(rows),
         indexed_document_count=len(document_version_ids),
         embedding_strategy=BGE_M3_EMBEDDING_STRATEGY,
+        release_id=release_id,
     )
     write_json(resolved_index_path.with_suffix(".summary.json"), summary.to_dict())
     clear_vector_index_cache()
     return summary
+
+
+def _validate_resumable_parts(
+    *,
+    work_dir: Path,
+    total: int,
+    batch_size: int,
+    require_all: bool,
+    expected_dimension: int | None = None,
+) -> list[Any]:
+    import numpy as np
+
+    parts = []
+    resolved_dimension = expected_dimension
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        part_path = work_dir / f"part_{start:08d}_{end:08d}.npy"
+        if not part_path.exists():
+            if require_all:
+                raise VectorIndexError("resumable_part_invalid")
+            continue
+        try:
+            part = np.load(part_path).astype("float32", copy=False)
+        except (OSError, TypeError, ValueError) as error:
+            raise VectorIndexError("resumable_part_invalid") from error
+        if (
+            part.ndim != 2
+            or int(part.shape[0]) != end - start
+            or int(part.shape[1]) <= 0
+        ):
+            raise VectorIndexError("resumable_part_invalid")
+        if resolved_dimension is None:
+            resolved_dimension = int(part.shape[1])
+        elif int(part.shape[1]) != resolved_dimension:
+            raise VectorIndexError("resumable_part_invalid")
+        parts.append(part)
+    return parts
+
+
+def read_vector_release_id(index_path: Path | str) -> str | None:
+    resolved = Path(index_path).resolve()
+    payload_path = (
+        _existing_bge_metadata_path(resolved)
+        if resolved.suffix == ".npz"
+        else resolved
+    )
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    value = payload.get("release_id")
+    return str(value) if value else None
+
+
+def bge_metadata_path(index_path: Path | str) -> Path:
+    """Return the canonical metadata sidecar path for a BGE matrix."""
+    return _bge_metadata_path(Path(index_path).resolve())
 
 
 def query_vector_index(
@@ -470,7 +635,7 @@ def _query_bge_m3_vector_index(
     query: str,
     limit: int,
 ) -> list[VectorSearchHit]:
-    metadata_path = _bge_metadata_path(index_path)
+    metadata_path = _existing_bge_metadata_path(index_path)
     if not metadata_path.exists():
         raise FileNotFoundError(f"BGE-M3 vector metadata does not exist: {metadata_path}")
 
@@ -494,7 +659,17 @@ def _query_bge_m3_vector_index(
 
     vectors, rows, metadata = _BGE_VECTOR_INDEX_CACHE[cache_key]
     model_path = Path(str(metadata.get("model_path") or BGE_M3_DEFAULT_MODEL_PATH)).resolve()
-    model = _load_bge_m3_model(model_path)
+    expected_fingerprint = metadata.get("model_fingerprint")
+    if expected_fingerprint is not None:
+        actual_fingerprint = model_content_fingerprint(model_path)
+        if actual_fingerprint != str(expected_fingerprint):
+            raise VectorIndexError("bge_model_fingerprint_mismatch")
+    model = _load_bge_m3_model(
+        model_path,
+        expected_fingerprint=(
+            str(expected_fingerprint) if expected_fingerprint is not None else None
+        ),
+    )
     encoded = model.encode(
         [query],
         batch_size=1,
@@ -537,12 +712,14 @@ def _query_bge_m3_vector_index(
     return hits
 
 
-def _collect_dense_index_rows(processed_root: Path) -> tuple[list[dict[str, str]], list[str], set[str]]:
+def _collect_dense_index_rows(
+    processed_versions: list[tuple[Path, dict[str, Any]]],
+) -> tuple[list[dict[str, str]], list[str], set[str]]:
     rows: list[dict[str, str]] = []
     texts: list[str] = []
     document_version_ids: set[str] = set()
 
-    for chunks_path, document_payload in _iter_latest_processed_versions(processed_root):
+    for chunks_path, document_payload in processed_versions:
         document_info = document_payload.get("document") or {}
         version_info = document_payload.get("document_version") or {}
         document_title = normalize_space(str(document_info.get("title") or "unknown"))
@@ -581,8 +758,50 @@ def _collect_dense_index_rows(processed_root: Path) -> tuple[list[dict[str, str]
     return rows, texts, document_version_ids
 
 
-def _load_bge_m3_model(model_path: Path):
-    cache_key = str(model_path.resolve())
+def _dense_input_fingerprint(
+    rows: list[dict[str, str]],
+    texts: list[str],
+) -> str:
+    inputs = [
+        {
+            "chunk_id": row["chunk_id"],
+            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+        for row, text in zip(rows, texts, strict=True)
+    ]
+    content = json.dumps(
+        inputs,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _resolve_processed_versions(
+    processed_root: Path,
+    release_manifest_path: Path | str | None,
+) -> tuple[list[tuple[Path, dict[str, Any]]], str | None]:
+    if release_manifest_path is None:
+        return _iter_latest_processed_versions(processed_root), None
+
+    manifest = load_release_manifest(Path(release_manifest_path))
+    if Path(manifest.processed_dir).resolve() != processed_root:
+        raise ValueError("release_processed_dir_mismatch")
+    return iter_release_documents(manifest.manifest_path), manifest.release_id
+
+
+def _load_bge_m3_model(
+    model_path: Path,
+    *,
+    expected_fingerprint: str | None = None,
+):
+    resolved_path = model_path.resolve()
+    if expected_fingerprint is not None:
+        actual_fingerprint = model_content_fingerprint(resolved_path)
+        if actual_fingerprint != expected_fingerprint:
+            raise VectorIndexError("bge_model_fingerprint_mismatch")
+    cache_key = (str(resolved_path), expected_fingerprint)
     if cache_key not in _BGE_MODEL_CACHE:
         try:
             from FlagEmbedding import BGEM3FlagModel
@@ -593,7 +812,7 @@ def _load_bge_m3_model(model_path: Path):
             ) from exc
         device = _select_bge_m3_device()
         _BGE_MODEL_CACHE[cache_key] = BGEM3FlagModel(
-            str(model_path),
+            str(resolved_path),
             use_fp16=device.startswith("cuda"),
             device=device,
         )
@@ -612,7 +831,15 @@ def _select_bge_m3_device() -> str:
 
 
 def _bge_metadata_path(index_path: Path) -> Path:
-    return index_path.with_suffix(index_path.suffix + ".metadata.json")
+    return Path(str(index_path) + ".metadata.json")
+
+
+def _existing_bge_metadata_path(index_path: Path) -> Path:
+    metadata_path = _bge_metadata_path(index_path)
+    transitional_path = index_path.with_suffix(".metadata.json")
+    if not metadata_path.exists() and transitional_path.exists():
+        return transitional_path
+    return metadata_path
 
 
 def _build_sparse_vector(text: str) -> Counter[str]:

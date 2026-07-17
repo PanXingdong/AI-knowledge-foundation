@@ -5,6 +5,10 @@ import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from agent_knowledge_hub.release_manifest import (
+    iter_release_documents,
+    load_release_manifest,
+)
 from agent_knowledge_hub.utils import normalize_space, write_json
 
 
@@ -14,6 +18,7 @@ class FtsIndexBuildSummary:
     index_path: Path
     indexed_chunk_count: int
     indexed_document_count: int
+    release_id: str | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -21,6 +26,7 @@ class FtsIndexBuildSummary:
             "index_path": str(self.index_path),
             "indexed_chunk_count": self.indexed_chunk_count,
             "indexed_document_count": self.indexed_document_count,
+            "release_id": self.release_id,
         }
 
 
@@ -43,15 +49,26 @@ def build_fts_index(
     *,
     processed_dir: Path | str,
     index_path: Path | str,
+    release_manifest_path: Path | str | None = None,
 ) -> FtsIndexBuildSummary:
     processed_root = Path(processed_dir).resolve()
     resolved_index_path = Path(index_path).resolve()
     if not processed_root.exists():
         raise FileNotFoundError(f"Processed directory does not exist: {processed_root}")
 
+    release_id: str | None = None
+    if release_manifest_path is None:
+        processed_versions = _iter_latest_processed_versions(processed_root)
+    else:
+        manifest = load_release_manifest(Path(release_manifest_path))
+        if Path(manifest.processed_dir).resolve() != processed_root:
+            raise ValueError("release_processed_dir_mismatch")
+        processed_versions = iter_release_documents(manifest.manifest_path)
+        release_id = manifest.release_id
+
     rows: list[dict[str, object]] = []
     document_version_ids: set[str] = set()
-    for chunks_path, document_payload in _iter_latest_processed_versions(processed_root):
+    for chunks_path, document_payload in processed_versions:
         document_info = document_payload.get("document") or {}
         version_info = document_payload.get("document_version") or {}
         document_title = normalize_space(str(document_info.get("title") or "unknown"))
@@ -109,6 +126,14 @@ def build_fts_index(
             )
             """
         )
+        connection.execute(
+            "CREATE TABLE release_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        if release_id is not None:
+            connection.execute(
+                "INSERT INTO release_metadata(key, value) VALUES ('release_id', ?)",
+                (release_id,),
+            )
         connection.executemany(
             """
             INSERT INTO fts_chunks (
@@ -147,9 +172,23 @@ def build_fts_index(
         index_path=resolved_index_path,
         indexed_chunk_count=len(rows),
         indexed_document_count=len(document_version_ids),
+        release_id=release_id,
     )
     write_json(resolved_index_path.with_suffix(".summary.json"), summary.to_dict())
     return summary
+
+
+def read_fts_release_id(index_path: Path | str) -> str | None:
+    connection = sqlite3.connect(Path(index_path).resolve())
+    try:
+        row = connection.execute(
+            "SELECT value FROM release_metadata WHERE key = 'release_id'"
+        ).fetchone()
+        return str(row[0]) if row else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        connection.close()
 
 
 def query_fts_index(

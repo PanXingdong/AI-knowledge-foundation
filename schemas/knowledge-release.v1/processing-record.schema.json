@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-knowledge-foundation.local/schemas/knowledge-release.v1/processing-record.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "processing_run_id", "document_version_id",
+    "source_file_hash", "parser_name", "chunker_version",
+    "quality_rules_version", "canonical_sha256", "chunks_sha256",
+    "record_origin"
+  ],
+  "properties": {
+    "schema_version": {"const": "knowledge-processing-record.v1"},
+    "processing_run_id": {"type": "string", "minLength": 1},
+    "document_version_id": {"type": "string", "minLength": 1},
+    "source_file_hash": {"type": "string", "minLength": 1},
+    "parser_name": {"type": "string", "minLength": 1},
+    "chunker_version": {"type": "string", "minLength": 1},
+    "quality_rules_version": {"type": "string", "minLength": 1},
+    "canonical_sha256": {"type": "string", "minLength": 64, "maxLength": 64},
+    "chunks_sha256": {"type": "string", "minLength": 64, "maxLength": 64},
+    "record_origin": {"enum": ["ingestion", "legacy_inferred"]}
+  }
+}

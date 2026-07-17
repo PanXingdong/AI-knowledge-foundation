@@ -8,6 +8,8 @@ from agent_knowledge_hub.builder import build_canonical_document
 from agent_knowledge_hub.chunker import build_chunks, chunks_to_dicts
 from agent_knowledge_hub.models import IngestResult, ManifestIngestSummary
 from agent_knowledge_hub.parsers import DocumentParseError, parse_document
+from agent_knowledge_hub.processing_record import build_processing_record, write_processing_record
+from agent_knowledge_hub.quality_contracts import build_quality_record, write_quality_record
 from agent_knowledge_hub.utils import is_placeholder, slugify, write_json, write_jsonl
 
 
@@ -58,9 +60,24 @@ def ingest_file(
     document_dir = output_root / safe_title / canonical.document_version.document_version_id
     document_json_path = document_dir / "canonical-document.json"
     chunks_jsonl_path = document_dir / "chunks.jsonl"
+    processing_record_path = document_dir / "processing-record.json"
+    quality_record_path = document_dir / "quality-record.json"
 
     write_json(document_json_path, canonical.to_dict())
     write_jsonl(chunks_jsonl_path, chunks_to_dicts(chunks))
+    processing_record = build_processing_record(
+        document_version_id=canonical.document_version.document_version_id,
+        source_file_hash=canonical.document_version.file_hash,
+        parser_name=canonical.parse_report.parser_name,
+        canonical_path=document_json_path,
+        chunks_path=chunks_jsonl_path,
+    )
+    write_processing_record(processing_record_path, processing_record)
+    quality_record = build_quality_record(
+        canonical.to_dict(),
+        chunks_to_dicts(chunks),
+    )
+    write_quality_record(quality_record_path, quality_record)
 
     return IngestResult(
         sample_id=sample_id,
@@ -71,6 +88,8 @@ def ingest_file(
         output_dir=document_dir,
         document_json_path=document_json_path,
         chunks_jsonl_path=chunks_jsonl_path,
+        processing_record_path=processing_record_path,
+        quality_record_path=quality_record_path,
         chunk_count=len(chunks),
         warning_count=len(canonical.parse_report.warnings),
     )

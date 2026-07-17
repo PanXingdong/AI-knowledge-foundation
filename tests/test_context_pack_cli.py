@@ -5,6 +5,7 @@ import csv
 from agent_knowledge_hub.cli import main
 from agent_knowledge_hub.fts_index import build_fts_index
 from agent_knowledge_hub.pipeline import ingest_file
+from agent_knowledge_hub.release_manifest import create_candidate_release
 from agent_knowledge_hub.vector_index import build_vector_index
 
 
@@ -371,6 +372,44 @@ def test_trace_cli_writes_evidence_trace_json(tmp_path: Path, capsys):
     assert "/runtime-runs/{run_id}/events" in trace_payload["text"]
     captured = capsys.readouterr().out
     assert evidence_id in captured
+
+
+def test_trace_cli_can_pin_old_release_after_new_ingest(tmp_path: Path, capsys):
+    processed = tmp_path / "processed"
+    source = tmp_path / "api.md"
+    source.write_text("# API\n\nold release evidence", encoding="utf-8")
+    old = ingest_file(
+        file_path=source,
+        out_dir=processed,
+        title="API",
+        document_version="v1",
+    )
+    old_payload = json.loads(old.document_json_path.read_text(encoding="utf-8"))
+    old_evidence_id = old_payload["evidence_spans"][-1]["evidence_id"]
+    release = create_candidate_release(processed, tmp_path / "releases")
+    source.write_text("# API\n\nnew release evidence", encoding="utf-8")
+    ingest_file(
+        file_path=source,
+        out_dir=processed,
+        title="API",
+        document_version="v2",
+    )
+
+    assert main(
+        [
+            "trace",
+            "--processed-dir",
+            str(processed),
+            "--evidence-id",
+            old_evidence_id,
+            "--release-manifest-path",
+            str(release.manifest_path),
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["document_version"] == "v1"
+    assert payload["text"] == "old release evidence"
 
 
 def test_context_pack_cli_uses_vector_index_for_local_similarity_query(tmp_path: Path, capsys):
