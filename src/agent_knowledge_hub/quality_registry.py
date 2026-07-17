@@ -13,6 +13,9 @@ REASON_CODE_REGISTRY: dict[str, ReasonCodeDefinition] = {
     "release.integrity.no_documents": ReasonCodeDefinition(
         "release", "fatal", "block_release", True
     ),
+    "document.evaluator.detector_error": ReasonCodeDefinition(
+        "document", "error", "block_document", True
+    ),
     "document.integrity.canonical_missing": ReasonCodeDefinition(
         "document", "fatal", "block_document", True
     ),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +32,6 @@ class QualityObservationResult:
     report: QualityReport
     publication_preview: PublicationPreview
     quarantine_preview: QuarantinePreview
-    detector_errors: tuple[dict[str, str], ...]
     markdown: str
 
 
@@ -48,11 +48,13 @@ def _fingerprint_payload(payload: object) -> str:
 def _failed_input_object_id(failed: dict[str, Any], index: int) -> str:
     sample_id = str(failed.get("sample_id") or "").strip()
     if sample_id:
-        return sample_id
+        return f"failed-input:{sample_id}"
     file_path = str(failed.get("file_path") or "").strip()
     if file_path:
-        return Path(file_path).name or f"failed-input-{index}"
-    return f"failed-input-{index}"
+        file_identity = Path(file_path).name
+        return f"failed-input:{sha256_text(file_identity)[:16]}"
+    reason = str(failed.get("reason") or "")
+    return f"failed-input:{sha256_text(f'{index}:{reason}')[:16]}"
 
 
 def _evaluate_ingest_failures(
@@ -64,12 +66,30 @@ def _evaluate_ingest_failures(
     try:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        diagnostic = {
-            "error_type": type(exc).__name__,
-            "object_id": "ingest-summary",
-            "scope": "release",
-        }
-        return (), (diagnostic,)
+        reason_code = "document.evaluator.detector_error"
+        definition = REASON_CODE_REGISTRY[reason_code]
+        object_id = "failed-input:ingest-summary"
+        signal = ObservedQualitySignal.create(
+            reason_code=reason_code,
+            scope=definition.scope,
+            object_id=object_id,
+            detector="ingest-summary-loader",
+            detector_version="phase1-observe-v1",
+            metric_name="summary_loaded",
+            actual_value=type(exc).__name__,
+            threshold="no_exception",
+            confidence=1.0,
+            severity=definition.severity,
+            document_version_id=object_id,
+            message=type(exc).__name__,
+        )
+        return (signal,), (
+            {
+                "object_id": object_id,
+                "reason": type(exc).__name__,
+                "reason_code": reason_code,
+            },
+        )
     failed_rows = payload.get("failed") if isinstance(payload, dict) else []
     if not isinstance(failed_rows, list):
         failed_rows = []
@@ -98,7 +118,7 @@ def _evaluate_ingest_failures(
                 threshold=True,
                 confidence=1.0,
                 severity=definition.severity,
-                document_version_id="",
+                document_version_id=object_id,
                 message=reason,
             )
         )
@@ -124,24 +144,34 @@ def _evaluate_ingest_failures(
     )
 
 
-def _detector_error(
+def _detector_error_signal(
     *,
+    document_version_id: str,
     error: Exception,
-    object_id: str,
-    scope: str = "document",
-) -> dict[str, str]:
-    return {
-        "error_type": type(error).__name__,
-        "object_id": object_id,
-        "scope": scope,
-    }
+) -> ObservedQualitySignal:
+    reason_code = "document.evaluator.detector_error"
+    definition = REASON_CODE_REGISTRY[reason_code]
+    error_type = type(error).__name__
+    return ObservedQualitySignal.create(
+        reason_code=reason_code,
+        scope=definition.scope,
+        object_id=document_version_id,
+        detector="document-quality-evaluator",
+        detector_version="phase1-observe-v1",
+        metric_name="evaluation_succeeded",
+        actual_value=error_type,
+        threshold="no_exception",
+        confidence=1.0,
+        severity=definition.severity,
+        document_version_id=document_version_id,
+        message=error_type,
+    )
 
 
 def _render_observe_markdown(
     report: QualityReport,
     publication: PublicationPreview,
     quarantine: QuarantinePreview,
-    detector_errors: tuple[dict[str, str], ...],
 ) -> str:
     lines = [
         "# Quality Observe Report",
@@ -187,14 +217,19 @@ def _render_observe_markdown(
         )
     else:
         lines.append("- None")
+    detector_errors = tuple(
+        signal
+        for signal in report.signals
+        if signal.reason_code == "document.evaluator.detector_error"
+    )
     lines.extend(["", "## Detector Errors", ""])
     if detector_errors:
         lines.extend(
             (
-                f"- scope=`{item['scope']}` object=`{item['object_id']}` "
-                f"error=`{item['error_type']}`"
+                f"- scope=`{signal.scope}` object=`{signal.object_id}` "
+                f"error=`{signal.actual_value}`"
             )
-            for item in detector_errors
+            for signal in detector_errors
         )
     else:
         lines.append("- None")
@@ -212,7 +247,12 @@ def evaluate_processed_dir_observe(
     version_dirs = sorted(
         {
             path.parent
-            for pattern in ("canonical-document.json", "chunks.jsonl")
+            for pattern in (
+                "canonical-document.json",
+                "chunks.jsonl",
+                "processing-record.json",
+                "quality-record.json",
+            )
             for path in root.rglob(pattern)
         },
         key=lambda path: path.as_posix(),
@@ -222,7 +262,6 @@ def evaluate_processed_dir_observe(
     all_chunk_ids: list[str] = []
     artifact_parts: list[str] = []
     loaded_artifacts = []
-    detector_errors: list[dict[str, str]] = []
 
     ingest_signals, ingest_identity = _evaluate_ingest_failures(root)
     signals.extend(ingest_signals)
@@ -237,8 +276,20 @@ def evaluate_processed_dir_observe(
                 "unresolved-docver",
                 *(path.name for path in sorted(version_dir.iterdir())),
             )
-            detector_errors.append(
-                _detector_error(error=exc, object_id=object_id)
+            document_ids.append(object_id)
+            signals.append(
+                _detector_error_signal(
+                    document_version_id=object_id,
+                    error=exc,
+                )
+            )
+            artifact_parts.append(
+                _fingerprint_payload(
+                    {
+                        "document_version_id": object_id,
+                        "error_type": type(exc).__name__,
+                    }
+                )
             )
             continue
         loaded_artifacts.append(artifacts)
@@ -252,10 +303,10 @@ def evaluate_processed_dir_observe(
         try:
             signals.extend(evaluate_document_version(version_dir))
         except Exception as exc:
-            detector_errors.append(
-                _detector_error(
+            signals.append(
+                _detector_error_signal(
+                    document_version_id=artifacts.document_version_id,
                     error=exc,
-                    object_id=artifacts.document_version_id,
                 )
             )
 
@@ -273,21 +324,11 @@ def evaluate_processed_dir_observe(
                 threshold=1,
                 confidence=1.0,
                 severity=definition.severity,
-                document_version_id="",
+                document_version_id="processed-tree",
                 message="Processed tree contains no document versions.",
             )
         )
 
-    ordered_errors = tuple(
-        sorted(
-            detector_errors,
-            key=lambda item: (
-                item["scope"],
-                item["object_id"],
-                item["error_type"],
-            ),
-        )
-    )
     artifact_fp = _fingerprint_payload(sorted(artifact_parts))
     ordered_signals = tuple(sorted(signals, key=lambda item: item.signal_id))
     decisions = apply_quality_policy(
@@ -360,11 +401,9 @@ def evaluate_processed_dir_observe(
         {
             "decision_id": decision.decision_id,
             "object_id": decision.object_id,
-            "propagated": False,
             "reason_codes": list(decision.reason_codes),
             "recommended_action": decision.recommended_action,
             "scope": decision.scope,
-            "source_decision_id": decision.decision_id,
         }
         for decision in decisions
         if decision.recommended_action
@@ -375,25 +414,20 @@ def evaluate_processed_dir_observe(
         {
             "decision_id": decision_id,
             "object_id": chunk_id,
-            "propagated": True,
             "reason_codes": list(decision_by_id[decision_id].reason_codes),
             "recommended_action": "quarantine",
             "scope": "chunk",
-            "source_decision_id": decision_id,
         }
         for chunk_id, decision_ids in sorted(propagated_chunk_decisions.items())
         for decision_id in sorted(decision_ids)
     ]
+    quarantine_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in [*direct_quarantine_items, *propagated_quarantine_items]:
+        key = (item["scope"], item["object_id"], item["decision_id"])
+        if key not in quarantine_by_key:
+            quarantine_by_key[key] = item
     quarantine_items = tuple(
-        sorted(
-            [*direct_quarantine_items, *propagated_quarantine_items],
-            key=lambda item: (
-                item["scope"],
-                item["object_id"],
-                item["source_decision_id"],
-                item["decision_id"],
-            ),
-        )
+        quarantine_by_key[key] for key in sorted(quarantine_by_key)
     )
 
     summary_counter = Counter(
@@ -401,17 +435,34 @@ def evaluate_processed_dir_observe(
     )
     summary_counter["signal_count"] = len(ordered_signals)
     summary_counter["decision_count"] = len(decisions)
-    if ordered_errors:
-        summary_counter["detector_error"] = len(ordered_errors)
+    publication = PublicationPreview(
+        schema_version=PUBLICATION_PREVIEW_SCHEMA_VERSION,
+        policy_id=policy.policy_id,
+        policy_version=policy.policy_version,
+        mode="observe",
+        all_document_version_ids=tuple(sorted(document_ids)),
+        all_chunk_ids=tuple(sorted(all_chunk_ids)),
+        would_exclude_document_version_ids=tuple(sorted(would_exclude_docs)),
+        would_exclude_chunk_ids=tuple(sorted(would_exclude_chunks)),
+        decision_ids=tuple(sorted(item.decision_id for item in decisions)),
+    )
+    quarantine = QuarantinePreview(
+        schema_version=QUARANTINE_PREVIEW_SCHEMA_VERSION,
+        policy_id=policy.policy_id,
+        policy_version=policy.policy_version,
+        mode="observe",
+        items=quarantine_items,
+    )
     pre_report = {
         "artifact_fingerprint": artifact_fp,
         "decisions": [item.to_dict() for item in decisions],
-        "detector_errors": list(ordered_errors),
         "document_version_ids": sorted(document_ids),
         "mode": policy.mode,
         "policy_hash": policy.policy_hash,
         "policy_id": policy.policy_id,
         "policy_version": policy.policy_version,
+        "publication_preview": publication.to_dict(),
+        "quarantine_preview": quarantine.to_dict(),
         "signals": [item.to_dict() for item in ordered_signals],
         "summary": dict(sorted(summary_counter.items())),
     }
@@ -433,38 +484,47 @@ def evaluate_processed_dir_observe(
             )
         },
     )
-    publication = PublicationPreview(
-        schema_version=PUBLICATION_PREVIEW_SCHEMA_VERSION,
-        policy_id=policy.policy_id,
-        policy_version=policy.policy_version,
-        mode="observe",
-        all_document_version_ids=tuple(sorted(document_ids)),
-        all_chunk_ids=tuple(sorted(all_chunk_ids)),
-        would_exclude_document_version_ids=tuple(sorted(would_exclude_docs)),
-        would_exclude_chunk_ids=tuple(sorted(would_exclude_chunks)),
-        decision_ids=tuple(sorted(item.decision_id for item in decisions)),
-    )
-    quarantine = QuarantinePreview(
-        schema_version=QUARANTINE_PREVIEW_SCHEMA_VERSION,
-        policy_id=policy.policy_id,
-        policy_version=policy.policy_version,
-        mode="observe",
-        items=quarantine_items,
-    )
     markdown = _render_observe_markdown(
         report,
         publication,
         quarantine,
-        ordered_errors,
     )
     return QualityObservationResult(
         processed_dir=root,
         report=report,
         publication_preview=publication,
         quarantine_preview=quarantine,
-        detector_errors=ordered_errors,
         markdown=markdown,
     )
+
+
+def _temporary_sibling(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        return Path(handle.name)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    temp_path = _temporary_sibling(path)
+    try:
+        write_json(temp_path, payload)
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temp_path = _temporary_sibling(path)
+    try:
+        temp_path.write_text(content, encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def write_quality_observation_bundle(
@@ -478,19 +538,14 @@ def write_quality_observation_bundle(
         "publication_preview": root / "publication-preview.json",
         "quarantine_preview": root / "quarantine-preview.json",
     }
-    report_payload = {
-        **result.report.to_dict(),
-        "detector_errors": list(result.detector_errors),
-    }
-    write_json(paths["report_json"], report_payload)
-    write_json(
+    _atomic_write_json(paths["report_json"], result.report.to_dict())
+    _atomic_write_json(
         paths["publication_preview"],
         result.publication_preview.to_dict(),
     )
-    write_json(
+    _atomic_write_json(
         paths["quarantine_preview"],
         result.quarantine_preview.to_dict(),
     )
-    paths["report_markdown"].parent.mkdir(parents=True, exist_ok=True)
-    paths["report_markdown"].write_text(result.markdown, encoding="utf-8")
+    _atomic_write_text(paths["report_markdown"], result.markdown)
     return paths

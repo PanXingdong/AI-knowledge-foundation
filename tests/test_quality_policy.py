@@ -92,6 +92,12 @@ def test_default_policy_covers_every_registered_reason_code():
 
 def test_integrity_review_reason_codes_have_exact_registry_contract():
     expected = {
+        "document.evaluator.detector_error": (
+            "document",
+            "error",
+            "block_document",
+            True,
+        ),
         "document.integrity.canonical_invalid": (
             "document",
             "fatal",
@@ -157,6 +163,20 @@ def test_default_policy_recommends_block_but_observe_effectively_allows():
     )
 
     assert decisions[0].recommended_action == "block_release"
+    assert decisions[0].effective_action == "allow"
+
+
+def test_detector_error_recommends_document_block_but_observe_allows():
+    policy = build_default_observe_policy()
+
+    decisions = apply_quality_policy(
+        (_signal("document.evaluator.detector_error"),),
+        policy,
+        artifact_fingerprint="artifact_1",
+    )
+
+    assert decisions[0].scope == "document"
+    assert decisions[0].recommended_action == "block_document"
     assert decisions[0].effective_action == "allow"
 
 

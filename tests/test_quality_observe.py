@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from agent_knowledge_hub.pipeline import ingest_file
+from agent_knowledge_hub.quality_models import ObservedQualitySignal
 from agent_knowledge_hub.quality_observe import (
     evaluate_processed_dir_observe,
     write_quality_observation_bundle,
@@ -71,7 +72,6 @@ def test_observe_result_is_deterministic(tmp_path: Path):
     assert first.report.to_dict() == second.report.to_dict()
     assert first.publication_preview.to_dict() == second.publication_preview.to_dict()
     assert first.quarantine_preview.to_dict() == second.quarantine_preview.to_dict()
-    assert first.detector_errors == second.detector_errors
     assert first.markdown == second.markdown
 
 
@@ -104,12 +104,9 @@ def test_block_quarantine_propagates_to_every_referencing_chunk(tmp_path: Path):
         for item in observation.quarantine_preview.items
         if item["scope"] == "chunk"
         and item["object_id"] in expected_chunk_ids
-        and item.get("propagated") is True
+        and item["decision_id"] == source.decision_id
     ]
     assert {item["object_id"] for item in propagated} == expected_chunk_ids
-    assert {item["source_decision_id"] for item in propagated} == {
-        source.decision_id
-    }
 
 
 def test_page_quarantine_propagates_by_evidence_reference(tmp_path: Path):
@@ -134,7 +131,7 @@ def test_page_quarantine_propagates_by_evidence_reference(tmp_path: Path):
     assert any(
         item["scope"] == "chunk"
         and item["object_id"] == chunk_id
-        and item.get("source_decision_id") == source.decision_id
+        and item["decision_id"] == source.decision_id
         for item in observation.quarantine_preview.items
     )
 
@@ -157,9 +154,9 @@ def test_document_block_propagates_to_all_document_chunks(tmp_path: Path):
         observation.publication_preview.would_exclude_chunk_ids
     )
     assert {
-        item["source_decision_id"]
+        item["decision_id"]
         for item in observation.quarantine_preview.items
-        if item.get("propagated") is True
+        if item["scope"] == "chunk"
         and item["object_id"] in {str(row["chunk_id"]) for row in rows}
     } >= {document_decision.decision_id}
 
@@ -181,14 +178,67 @@ def test_quarantine_items_are_stably_sorted_and_reference_sources(tmp_path: Path
         key=lambda item: (
             item["scope"],
             item["object_id"],
-            item.get("source_decision_id", item["decision_id"]),
             item["decision_id"],
         ),
     )
     decision_ids = {item.decision_id for item in observation.report.decisions}
-    assert all(
-        item.get("source_decision_id", item["decision_id"]) in decision_ids
-        for item in items
+    assert all(item["decision_id"] in decision_ids for item in items)
+
+
+def test_direct_chunk_quarantine_is_not_duplicated_by_self_propagation(
+    tmp_path: Path,
+):
+    ingested = _ingest(tmp_path, "broken", "# Broken\n\nEvidence content.")
+    canonical = json.loads(ingested.document_json_path.read_text(encoding="utf-8"))
+    canonical["evidence_spans"][0]["text_hash"] = "0" * 64
+    ingested.document_json_path.write_text(
+        json.dumps(canonical, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    rows = _read_jsonl(ingested.chunks_jsonl_path)
+    rows[0]["text"] = ""
+    _write_jsonl(ingested.chunks_jsonl_path, rows)
+
+    observation = evaluate_processed_dir_observe(tmp_path / "processed")
+    chunk_id = str(rows[0]["chunk_id"])
+    chunk_items = [
+        item
+        for item in observation.quarantine_preview.items
+        if item["scope"] == "chunk" and item["object_id"] == chunk_id
+    ]
+    keys = [
+        (item["scope"], item["object_id"], item["decision_id"])
+        for item in observation.quarantine_preview.items
+    ]
+    direct = next(
+        decision
+        for decision in observation.report.decisions
+        if decision.scope == "chunk"
+        and "chunk.integrity.empty" in decision.reason_codes
+    )
+    block_source = next(
+        decision
+        for decision in observation.report.decisions
+        if "block.evidence.hash_mismatch" in decision.reason_codes
+    )
+
+    assert len(keys) == len(set(keys))
+    assert [
+        item
+        for item in chunk_items
+        if item["decision_id"] == direct.decision_id
+    ] == [
+        {
+            "decision_id": direct.decision_id,
+            "object_id": chunk_id,
+            "reason_codes": ["chunk.integrity.empty"],
+            "recommended_action": "quarantine",
+            "scope": "chunk",
+        }
+    ]
+    assert any(
+        item["decision_id"] == block_source.decision_id
+        for item in chunk_items
     )
 
 
@@ -259,6 +309,42 @@ def test_ingest_failure_fingerprint_ignores_absolute_file_path(tmp_path: Path):
     )
 
 
+def test_failed_input_identity_cannot_block_real_document_with_same_raw_id(
+    tmp_path: Path,
+):
+    healthy = _ingest(tmp_path, "healthy", "# Healthy\n\nHealthy content.")
+    (tmp_path / "processed" / "ingest-summary.json").write_text(
+        json.dumps(
+            {
+                "failed": [
+                    {
+                        "sample_id": healthy.document_version_id,
+                        "file_path": "failed.pdf",
+                        "reason": "OCR parse failed",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    chunk_ids = {
+        str(row["chunk_id"]) for row in _read_jsonl(healthy.chunks_jsonl_path)
+    }
+
+    result = evaluate_processed_dir_observe(tmp_path / "processed")
+    parse_signal = next(
+        signal
+        for signal in result.report.signals
+        if signal.reason_code == "document.parse.failed"
+    )
+
+    assert parse_signal.object_id.startswith("failed-input:")
+    assert parse_signal.object_id != healthy.document_version_id
+    assert not (
+        chunk_ids & set(result.publication_preview.would_exclude_chunk_ids)
+    )
+
+
 def test_copied_processed_tree_has_path_independent_fingerprints(tmp_path: Path):
     ingested = _ingest(tmp_path / "source", "healthy", "# Healthy\n\nContent.")
     copied_root = tmp_path / "elsewhere" / "processed"
@@ -272,6 +358,37 @@ def test_copied_processed_tree_has_path_independent_fingerprints(tmp_path: Path)
         first.report.determinism_fingerprint
         == second.report.determinism_fingerprint
     )
+
+
+@pytest.mark.parametrize(
+    ("sidecar_name", "reason_code"),
+    [
+        (
+            "processing-record.json",
+            "document.integrity.processing_record_invalid",
+        ),
+        ("quality-record.json", "document.integrity.quality_record_invalid"),
+    ],
+)
+def test_sidecar_only_directory_is_evaluated_as_document(
+    tmp_path: Path,
+    sidecar_name: str,
+    reason_code: str,
+):
+    version_dir = tmp_path / "processed" / "sidecar-only" / "version"
+    version_dir.mkdir(parents=True)
+    (version_dir / sidecar_name).write_text("{invalid", encoding="utf-8")
+
+    result = evaluate_processed_dir_observe(tmp_path / "processed")
+
+    assert reason_code in {signal.reason_code for signal in result.report.signals}
+    assert "document.integrity.canonical_missing" in {
+        signal.reason_code for signal in result.report.signals
+    }
+    assert "release.integrity.no_documents" not in {
+        signal.reason_code for signal in result.report.signals
+    }
+    assert len(result.report.document_version_ids) == 1
 
 
 def test_malformed_document_does_not_block_other_document_report(tmp_path: Path):
@@ -308,21 +425,35 @@ def test_evaluator_error_is_recorded_without_interrupting_other_documents(
     result = evaluate_processed_dir_observe(tmp_path / "processed")
 
     assert healthy.document_version_id in result.report.document_version_ids
-    assert result.report.summary["detector_error"] == 1
-    assert result.detector_errors == (
-        {
-            "error_type": "RuntimeError",
-            "object_id": broken.document_version_id,
-            "scope": "document",
-        },
+    signal = next(
+        signal
+        for signal in result.report.signals
+        if signal.reason_code == "document.evaluator.detector_error"
     )
-    assert "unstable detector detail" not in result.markdown
-    assert "RuntimeError" in result.markdown
-    assert broken.document_version_id in result.markdown
+    decision = next(
+        decision
+        for decision in result.report.decisions
+        if decision.signal_ids == (signal.signal_id,)
+    )
+
+    assert signal.object_id == broken.document_version_id
+    assert signal.document_version_id == broken.document_version_id
+    assert signal.actual_value == "RuntimeError"
+    assert decision.recommended_action == "block_document"
+    assert decision.effective_action == "allow"
+    assert broken.document_version_id in (
+        result.publication_preview.would_exclude_document_version_ids
+    )
 
 
 def test_bundle_contains_all_four_json_ready_files(tmp_path: Path):
-    _ingest(tmp_path, "healthy", "# Healthy\n\nEnough healthy content.")
+    ingested = _ingest(tmp_path, "broken", "# Broken\n\nEvidence content.")
+    canonical = json.loads(ingested.document_json_path.read_text(encoding="utf-8"))
+    canonical["evidence_spans"][0]["text_hash"] = "0" * 64
+    ingested.document_json_path.write_text(
+        json.dumps(canonical, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     result = evaluate_processed_dir_observe(tmp_path / "processed")
 
     paths = write_quality_observation_bundle(tmp_path / "report", result)
@@ -334,11 +465,132 @@ def test_bundle_contains_all_four_json_ready_files(tmp_path: Path):
         "quarantine_preview",
     }
     assert all(path.is_file() for path in paths.values())
-    assert json.loads(paths["report_json"].read_text(encoding="utf-8"))[
-        "determinism_fingerprint"
-    ] == result.report.determinism_fingerprint
-    assert json.loads(paths["publication_preview"].read_text(encoding="utf-8"))
-    assert json.loads(paths["quarantine_preview"].read_text(encoding="utf-8"))
+    report_payload = json.loads(paths["report_json"].read_text(encoding="utf-8"))
+    assert report_payload == result.report.to_dict()
+    jsonschema = pytest.importorskip("jsonschema")
+    schema_root = (
+        Path(__file__).parents[1] / "schemas" / "knowledge-quality.v1"
+    )
+    for path_key, schema_name in (
+        ("report_json", "quality-report.schema.json"),
+        ("publication_preview", "publication-preview.schema.json"),
+        ("quarantine_preview", "quarantine-preview.schema.json"),
+    ):
+        payload = json.loads(paths[path_key].read_text(encoding="utf-8"))
+        schema = json.loads((schema_root / schema_name).read_text(encoding="utf-8"))
+        jsonschema.Draft202012Validator(schema).validate(payload)
+
+
+def test_synthetic_empty_and_failed_reports_validate_schema(tmp_path: Path):
+    failed_root = tmp_path / "failed"
+    failed_root.mkdir()
+    (failed_root / "ingest-summary.json").write_text(
+        json.dumps(
+            {
+                "failed": [
+                    {
+                        "sample_id": "bad-pdf",
+                        "file_path": "bad.pdf",
+                        "reason": "OCR parse failed",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    jsonschema = pytest.importorskip("jsonschema")
+    schema_path = (
+        Path(__file__).parents[1]
+        / "schemas"
+        / "knowledge-quality.v1"
+        / "quality-report.schema.json"
+    )
+    validator = jsonschema.Draft202012Validator(
+        json.loads(schema_path.read_text(encoding="utf-8"))
+    )
+
+    validator.validate(evaluate_processed_dir_observe(tmp_path).report.to_dict())
+    validator.validate(
+        evaluate_processed_dir_observe(failed_root).report.to_dict()
+    )
+
+
+def test_bundle_writes_each_file_through_same_directory_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _ingest(tmp_path, "healthy", "# Healthy\n\nEnough healthy content.")
+    result = evaluate_processed_dir_observe(tmp_path / "processed")
+    output_dir = (tmp_path / "report").resolve()
+    replacements: list[tuple[Path, Path]] = []
+    real_replace = Path.replace
+
+    def recording_replace(source: Path, target: Path):
+        replacements.append((source, target))
+        return real_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", recording_replace)
+
+    paths = write_quality_observation_bundle(output_dir, result)
+
+    assert {target for _, target in replacements} == set(paths.values())
+    assert all(source.parent == target.parent for source, target in replacements)
+    assert all(source.name.endswith(".tmp") for source, _ in replacements)
+    assert not list(output_dir.glob("*.tmp"))
+
+
+def test_determinism_fingerprint_covers_propagated_previews(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ingested = _ingest(tmp_path, "healthy", "# Healthy\n\nEnough healthy content.")
+    canonical = json.loads(ingested.document_json_path.read_text(encoding="utf-8"))
+    evidence_id = str(canonical["evidence_spans"][0]["evidence_id"])
+    block_id = str(canonical["evidence_spans"][0]["block_id"])
+    rows = _read_jsonl(ingested.chunks_jsonl_path)
+    rows[0]["evidence_ids"] = []
+    _write_jsonl(ingested.chunks_jsonl_path, rows)
+    import agent_knowledge_hub.quality_observe as observe
+
+    signal = ObservedQualitySignal.create(
+        reason_code="block.evidence.hash_mismatch",
+        scope="block",
+        object_id=block_id,
+        detector="fixed-test-detector",
+        detector_version="1",
+        metric_name="fixed",
+        actual_value=False,
+        threshold=True,
+        confidence=1.0,
+        severity="error",
+        document_version_id=ingested.document_version_id,
+        block_id=block_id,
+        evidence_ids=(evidence_id,),
+    )
+    monkeypatch.setattr(observe, "artifact_fingerprint", lambda artifacts: "fixed")
+    monkeypatch.setattr(
+        observe,
+        "evaluate_document_version",
+        lambda version_dir: (signal,),
+    )
+
+    without_propagation = evaluate_processed_dir_observe(tmp_path / "processed")
+    rows[0]["evidence_ids"] = [evidence_id]
+    _write_jsonl(ingested.chunks_jsonl_path, rows)
+    with_propagation = evaluate_processed_dir_observe(tmp_path / "processed")
+
+    assert (
+        without_propagation.report.signals == with_propagation.report.signals
+    )
+    assert (
+        without_propagation.report.decisions == with_propagation.report.decisions
+    )
+    assert (
+        without_propagation.publication_preview.to_dict()
+        != with_propagation.publication_preview.to_dict()
+    )
+    assert (
+        without_propagation.report.determinism_fingerprint
+        != with_propagation.report.determinism_fingerprint
+    )
 
 
 def test_markdown_decision_lines_are_sorted(tmp_path: Path):
