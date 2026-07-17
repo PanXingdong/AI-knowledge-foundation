@@ -70,6 +70,27 @@ def test_signal_factory_sorts_evidence_ids():
     assert signal.evidence_ids == ("span_1", "span_2")
 
 
+def test_signal_factory_deduplicates_evidence_ids_for_schema():
+    signal = _signal(evidence_ids=("span_2", "span_1", "span_2"))
+
+    assert signal.evidence_ids == ("span_1", "span_2")
+    assert signal.to_dict()["evidence_ids"] == ["span_1", "span_2"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("object_id", ""),
+        ("reason_code", " "),
+        ("scope", ""),
+        ("document_version_id", ""),
+    ],
+)
+def test_signal_factory_rejects_empty_identity_fields(field, value):
+    with pytest.raises(ValueError, match=f"^invalid_quality_signal:{field}$"):
+        _signal(**{field: value})
+
+
 def test_observe_decision_keeps_recommended_and_effective_actions_separate():
     decision = _decision()
 

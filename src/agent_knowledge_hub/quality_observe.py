@@ -126,38 +126,17 @@ def _evaluate_ingest_failures(
     try:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        reason_code = "document.evaluator.detector_error"
-        definition = REASON_CODE_REGISTRY[reason_code]
-        object_id = "failed-input:ingest-summary"
-        signal = ObservedQualitySignal.create(
-            reason_code=reason_code,
-            scope=definition.scope,
-            object_id=object_id,
-            detector="ingest-summary-loader",
-            detector_version="phase1-observe-v1",
-            metric_name="summary_loaded",
-            actual_value=type(exc).__name__,
-            threshold="no_exception",
-            confidence=1.0,
-            severity=definition.severity,
-            document_version_id=object_id,
-            message=type(exc).__name__,
-        )
-        return (signal,), (
-            {
-                "object_id": object_id,
-                "reason": type(exc).__name__,
-                "reason_code": reason_code,
-            },
-        )
-    failed_rows = payload.get("failed") if isinstance(payload, dict) else []
+        return _ingest_summary_error(type(exc).__name__)
+    if not isinstance(payload, dict):
+        return _ingest_summary_error("invalid_top_level")
+    failed_rows = payload.get("failed")
     if not isinstance(failed_rows, list):
-        failed_rows = []
+        return _ingest_summary_error("failed_not_list")
+    if any(not isinstance(failed, dict) for failed in failed_rows):
+        return _ingest_summary_error("failed_item_not_object")
     signals: list[ObservedQualitySignal] = []
     identity_rows: list[dict[str, str]] = []
     for index, failed in enumerate(failed_rows):
-        if not isinstance(failed, dict):
-            continue
         reason = str(failed.get("reason") or "")
         reason_code = (
             "document.parse.unsupported"
@@ -200,6 +179,35 @@ def _evaluate_ingest_failures(
     return (
         _ordered_unique(signals, "signal_id"),
         tuple(unique_identity_rows[key] for key in sorted(unique_identity_rows)),
+    )
+
+
+def _ingest_summary_error(
+    error_name: str,
+) -> tuple[tuple[ObservedQualitySignal, ...], tuple[dict[str, str], ...]]:
+    reason_code = "document.evaluator.detector_error"
+    definition = REASON_CODE_REGISTRY[reason_code]
+    object_id = "failed-input:ingest-summary"
+    signal = ObservedQualitySignal.create(
+        reason_code=reason_code,
+        scope=definition.scope,
+        object_id=object_id,
+        detector="ingest-summary-loader",
+        detector_version="phase1-observe-v1",
+        metric_name="summary_loaded",
+        actual_value=error_name,
+        threshold="no_exception",
+        confidence=1.0,
+        severity=definition.severity,
+        document_version_id=object_id,
+        message=error_name,
+    )
+    return (signal,), (
+        {
+            "object_id": object_id,
+            "reason": error_name,
+            "reason_code": reason_code,
+        },
     )
 
 
@@ -415,7 +423,7 @@ def evaluate_processed_dir_observe(
         in {"quarantine", "block_document", "block_release"}
     }
     signal_by_id = {item.signal_id: item for item in ordered_signals}
-    source_decisions_by_evidence: dict[str, set[str]] = {}
+    source_decisions_by_evidence: dict[tuple[str, str], set[str]] = {}
     for decision in decisions:
         if decision.recommended_action not in {
             "quarantine",
@@ -424,8 +432,10 @@ def evaluate_processed_dir_observe(
         }:
             continue
         for signal_id in decision.signal_ids:
-            for evidence_id in signal_by_id[signal_id].evidence_ids:
-                source_decisions_by_evidence.setdefault(evidence_id, set()).add(
+            signal = signal_by_id[signal_id]
+            for evidence_id in signal.evidence_ids:
+                evidence_key = (signal.document_version_id, evidence_id)
+                source_decisions_by_evidence.setdefault(evidence_key, set()).add(
                     decision.decision_id
                 )
 
@@ -455,7 +465,10 @@ def evaluate_processed_dir_observe(
             }
             for evidence_id in evidence_ids:
                 source_ids.update(
-                    source_decisions_by_evidence.get(evidence_id, set())
+                    source_decisions_by_evidence.get(
+                        (artifacts.document_version_id, evidence_id),
+                        set(),
+                    )
                 )
             if source_ids:
                 would_exclude_chunks.add(chunk_id)

@@ -61,12 +61,13 @@ def _custom_payload(
         "policy_version": "7",
         "mode": "observe",
     }
-    selected_rules = rules or [
+    selected_rules = rules if rules is not None else [
         {
-            "reason_code": "chunk.content.too_short",
-            "severity": "warning",
-            "recommended_action": "warn",
+            "reason_code": reason_code,
+            "severity": definition.severity,
+            "recommended_action": definition.recommended_action,
         }
+        for reason_code, definition in sorted(REASON_CODE_REGISTRY.items())
     ]
     hash_payload = {**identity, "rules": selected_rules}
     payload = {
@@ -262,18 +263,9 @@ def test_decisions_are_deterministically_sorted_and_ignore_display_message():
     assert forward == reverse
 
 
-def test_custom_policy_hash_ignores_path_time_and_display_fields(tmp_path):
-    payload = _custom_payload(
-        source_path="C:/one/policy.json",
-        generated_at="2026-07-17T00:00:00Z",
-        display_name="First wording",
-    )
+def test_custom_policy_hash_ignores_policy_file_path(tmp_path):
+    payload = _custom_payload()
     first = load_quality_policy(_write_policy(tmp_path / "first.json", payload))
-    payload.update(
-        source_path="D:/other/policy.json",
-        generated_at="2030-01-01T00:00:00Z",
-        display_name="Translated wording",
-    )
     second = load_quality_policy(_write_policy(tmp_path / "second.json", payload))
 
     assert first.policy_hash == second.policy_hash
@@ -390,6 +382,53 @@ def test_load_quality_policy_normalizes_os_read_error(tmp_path, monkeypatch):
     ],
 )
 def test_custom_policy_rejects_invalid_contract(tmp_path, payload, error):
+    path = _write_policy(tmp_path / "policy.json", payload)
+
+    with pytest.raises(ValueError, match=f"^{error}$"):
+        load_quality_policy(path)
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        (_custom_payload(extra_field=True), "invalid_quality_policy"),
+        (
+            _custom_payload(
+                rules=[
+                    {
+                        "reason_code": reason_code,
+                        "severity": definition.severity,
+                        "recommended_action": definition.recommended_action,
+                        **({"extra": True} if index == 0 else {}),
+                    }
+                    for index, (reason_code, definition) in enumerate(
+                        sorted(REASON_CODE_REGISTRY.items())
+                    )
+                ]
+            ),
+            "invalid_quality_policy",
+        ),
+        (_custom_payload(rules=[]), "incomplete_quality_policy"),
+        (
+            _custom_payload(
+                rules=[
+                    {
+                        "reason_code": reason_code,
+                        "severity": definition.severity,
+                        "recommended_action": definition.recommended_action,
+                    }
+                    for reason_code, definition in list(
+                        sorted(REASON_CODE_REGISTRY.items())
+                    )[:-1]
+                ]
+            ),
+            "incomplete_quality_policy",
+        ),
+    ],
+)
+def test_custom_policy_requires_exact_schema_and_complete_registry(
+    tmp_path, payload, error
+):
     path = _write_policy(tmp_path / "policy.json", payload)
 
     with pytest.raises(ValueError, match=f"^{error}$"):

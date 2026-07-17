@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,23 @@ SOFT_MAX_BLOCK_CHARS = 20_000
 SOFT_MIN_CHUNK_CHARS = 10
 SOFT_MAX_CHUNK_CHARS = 8_000
 SOFT_WARNING_COUNT = 10
+_RUN_METADATA_FIELDS = frozenset(
+    {
+        "file_path",
+        "source_path",
+        "processed_dir",
+        "output_dir",
+        "manifest_path",
+        "document_json_path",
+        "chunks_jsonl_path",
+        "created_at",
+        "updated_at",
+        "generated_at",
+    }
+)
+_PROCESSING_DERIVED_FIELDS = frozenset(
+    {"processing_run_id", "canonical_sha256", "chunks_sha256"}
+)
 
 
 @dataclass(frozen=True)
@@ -149,11 +167,61 @@ def load_document_artifacts(version_dir: Path) -> DocumentArtifacts:
 
 
 def artifact_fingerprint(artifacts: DocumentArtifacts) -> str:
-    hashes = _artifact_hashes(
-        artifacts.canonical_path,
-        artifacts.chunks_path,
-        artifacts.processing_record_path,
-        artifacts.quality_record_path,
+    def semantic_payload(value: Any, excluded: frozenset[str]) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: semantic_payload(item, excluded)
+                for key, item in value.items()
+                if key not in excluded
+            }
+        if isinstance(value, list):
+            return [semantic_payload(item, excluded) for item in value]
+        return value
+
+    def payload_hash(value: Any, excluded: frozenset[str]) -> str:
+        normalized = json.dumps(
+            semantic_payload(value, excluded),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return sha256_text(normalized)
+
+    def json_artifact_hash(
+        path: Path,
+        value: dict[str, Any] | None,
+        excluded: frozenset[str],
+    ) -> str:
+        if not path.exists():
+            return "missing"
+        if value is None:
+            return file_sha256(path)
+        return payload_hash(value, excluded)
+
+    chunks_hash = (
+        "missing"
+        if not artifacts.chunks_path.exists()
+        else file_sha256(artifacts.chunks_path)
+        if "chunks_invalid_json" in artifacts.load_errors
+        else payload_hash(list(artifacts.chunks), _RUN_METADATA_FIELDS)
+    )
+    hashes = (
+        json_artifact_hash(
+            artifacts.canonical_path,
+            artifacts.canonical,
+            _RUN_METADATA_FIELDS,
+        ),
+        chunks_hash,
+        json_artifact_hash(
+            artifacts.processing_record_path,
+            artifacts.processing_record,
+            _RUN_METADATA_FIELDS | _PROCESSING_DERIVED_FIELDS,
+        ),
+        json_artifact_hash(
+            artifacts.quality_record_path,
+            artifacts.quality_record,
+            _RUN_METADATA_FIELDS,
+        ),
     )
     return stable_id("artifact", artifacts.document_version_id, *hashes)
 
@@ -377,6 +445,26 @@ def _evaluate_document(artifacts: DocumentArtifacts) -> list[ObservedQualitySign
             )
         )
     blocks = _dict_rows(artifacts.canonical.get("blocks"))
+    evidence_id_counts = Counter(
+        str(item.get("evidence_id"))
+        for item in _dict_rows(artifacts.canonical.get("evidence_spans"))
+        if item.get("evidence_id")
+    )
+    for evidence_id, count in sorted(evidence_id_counts.items()):
+        if count <= 1:
+            continue
+        signals.append(
+            _signal(
+                "document.integrity.duplicate_evidence_id",
+                artifacts=artifacts,
+                object_id=version_id,
+                detector="document-integrity",
+                metric_name="evidence_id_occurrence_count",
+                actual_value=count,
+                threshold=1,
+                evidence_ids=(evidence_id,),
+            )
+        )
     char_count = sum(len(str(item.get("text") or "")) for item in blocks)
     if char_count < SOFT_MIN_DOCUMENT_CHARS:
         signals.append(
@@ -559,16 +647,23 @@ def _evaluate_blocks(artifacts: DocumentArtifacts) -> list[ObservedQualitySignal
         if block_id in block_by_id:
             continue
         evidence_id = str(evidence.get("evidence_id") or "")
+        evidence_text_hash = sha256_text(str(evidence.get("text") or ""))
+        object_id = block_id or stable_id(
+            "orphan-evidence",
+            artifacts.document_version_id,
+            evidence_id,
+            evidence_text_hash,
+        )
         signals.append(
             _signal(
                 "block.evidence.block_reference_missing",
                 artifacts=artifacts,
-                object_id=block_id,
+                object_id=object_id,
                 detector="block-evidence",
                 metric_name="block_reference_exists",
                 actual_value=False,
                 threshold=True,
-                block_id=block_id,
+                block_id=block_id or None,
                 evidence_ids=(evidence_id,) if evidence_id else (),
             )
         )

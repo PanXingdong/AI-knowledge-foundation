@@ -735,6 +735,55 @@ def test_orphan_evidence_is_block_reference_missing_signal(tmp_path: Path):
     assert signal.evidence_ids == (evidence["evidence_id"],)
 
 
+def test_orphan_evidence_without_block_id_gets_stable_nonempty_object(
+    tmp_path: Path,
+):
+    result = _ingest(tmp_path / "source")
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    evidence = payload["evidence_spans"][0]
+    evidence["block_id"] = ""
+    write_json(result.document_json_path, payload)
+    copied_dir = tmp_path / "copied" / "different-name"
+    shutil.copytree(result.output_dir, copied_dir)
+
+    first = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "block.evidence.block_reference_missing"
+    )
+    second = next(
+        item
+        for item in evaluate_document_version(copied_dir)
+        if item.reason_code == "block.evidence.block_reference_missing"
+    )
+
+    assert first.object_id
+    assert first.block_id is None
+    assert first.object_id == second.object_id
+    assert first.signal_id == second.signal_id
+
+
+def test_duplicate_evidence_id_is_one_document_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    duplicate_id = payload["evidence_spans"][0]["evidence_id"]
+    payload["evidence_spans"].extend(
+        [dict(payload["evidence_spans"][0]), dict(payload["evidence_spans"][0])]
+    )
+    write_json(result.document_json_path, payload)
+
+    matching = [
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "document.integrity.duplicate_evidence_id"
+    ]
+
+    assert len(matching) == 1
+    assert matching[0].object_id == result.document_version_id
+    assert matching[0].evidence_ids == (duplicate_id,)
+    assert matching[0].severity == "error"
+
+
 def test_out_of_range_block_propagates_evidence_from_another_page(tmp_path: Path):
     result = _ingest(tmp_path)
     payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
@@ -771,6 +820,65 @@ def test_artifact_fingerprint_ignores_version_dir_path_and_mtime(tmp_path: Path)
     copied = artifact_fingerprint(load_document_artifacts(copied_dir))
 
     assert original == copied
+
+
+def test_artifact_fingerprint_uses_semantic_payload_not_run_metadata(
+    tmp_path: Path,
+):
+    result = _ingest(tmp_path / "original")
+    copied_dir = tmp_path / "copied" / "different-name"
+    shutil.copytree(result.output_dir, copied_dir)
+    excluded_fields = {
+        "file_path",
+        "source_path",
+        "processed_dir",
+        "output_dir",
+        "manifest_path",
+        "document_json_path",
+        "chunks_jsonl_path",
+        "created_at",
+        "updated_at",
+        "generated_at",
+    }
+
+    def replace_run_metadata(value, marker):
+        if isinstance(value, dict):
+            return {
+                key: (
+                    f"{marker}:{key}"
+                    if key in excluded_fields
+                    else replace_run_metadata(item, marker)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [replace_run_metadata(item, marker) for item in value]
+        return value
+
+    for filename in (
+        "canonical-document.json",
+        "processing-record.json",
+        "quality-record.json",
+    ):
+        path = copied_dir / filename
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = replace_run_metadata(payload, "different-machine")
+        if filename == "processing-record.json":
+            payload["processing_run_id"] = "different-run"
+            payload["canonical_sha256"] = "1" * 64
+            payload["chunks_sha256"] = "2" * 64
+        write_json(path, payload)
+
+    original = artifact_fingerprint(load_document_artifacts(result.output_dir))
+    copied = artifact_fingerprint(load_document_artifacts(copied_dir))
+    assert original == copied
+
+    canonical_path = copied_dir / "canonical-document.json"
+    canonical = json.loads(canonical_path.read_text(encoding="utf-8"))
+    canonical["blocks"][0]["text"] += " semantic change"
+    write_json(canonical_path, canonical)
+
+    assert artifact_fingerprint(load_document_artifacts(copied_dir)) != original
 
 
 def test_invalid_canonical_identity_and_signals_are_path_independent(

@@ -68,13 +68,48 @@ def load_quality_policy(path: Path | None) -> QualityPolicy:
         raise ValueError("invalid_quality_policy") from exc
     if not isinstance(payload, dict):
         raise ValueError("invalid_quality_policy")
+    required_fields = {
+        "schema_version",
+        "policy_id",
+        "policy_version",
+        "mode",
+        "rules",
+        "policy_hash",
+    }
+    if set(payload) != required_fields:
+        raise ValueError("invalid_quality_policy")
     if payload.get("schema_version") != QUALITY_POLICY_SCHEMA_VERSION:
         raise ValueError("unsupported_quality_policy_schema")
     if payload.get("mode") != "observe":
         raise ValueError("phase1_pr1_requires_observe_mode")
-    rules = tuple(QualityPolicyRule(**item) for item in payload.get("rules") or [])
+    if (
+        not isinstance(payload.get("policy_id"), str)
+        or not payload["policy_id"]
+        or not isinstance(payload.get("policy_version"), str)
+        or not payload["policy_version"]
+        or not isinstance(payload.get("policy_hash"), str)
+        or not isinstance(payload.get("rules"), list)
+    ):
+        raise ValueError("invalid_quality_policy")
+    raw_rules = payload["rules"]
+    rule_fields = {"reason_code", "severity", "recommended_action"}
+    if any(
+        not isinstance(item, dict) or set(item) != rule_fields
+        for item in raw_rules
+    ):
+        raise ValueError("invalid_quality_policy")
+    rules = tuple(QualityPolicyRule(**item) for item in raw_rules)
     seen: set[str] = set()
     for rule in rules:
+        if (
+            not isinstance(rule.reason_code, str)
+            or not rule.reason_code
+            or not isinstance(rule.severity, str)
+            or not rule.severity
+            or not isinstance(rule.recommended_action, str)
+            or not rule.recommended_action
+        ):
+            raise ValueError("invalid_quality_policy")
         if rule.reason_code not in REASON_CODE_REGISTRY:
             raise ValueError(f"unknown_reason_code:{rule.reason_code}")
         if rule.reason_code in seen:
@@ -86,6 +121,8 @@ def load_quality_policy(path: Path | None) -> QualityPolicy:
                 f"unsupported_quality_action:{rule.recommended_action}"
             )
         seen.add(rule.reason_code)
+    if seen != set(REASON_CODE_REGISTRY):
+        raise ValueError("incomplete_quality_policy")
     base = {
         key: payload[key]
         for key in ("schema_version", "policy_id", "policy_version", "mode")

@@ -46,6 +46,9 @@ REASON_CODE_REGISTRY: dict[str, ReasonCodeDefinition] = {
     "document.integrity.document_version_mismatch": ReasonCodeDefinition(
         "document", "fatal", "block_document", True
     ),
+    "document.integrity.duplicate_evidence_id": ReasonCodeDefinition(
+        "document", "error", "block_document", True
+    ),
     "document.parse.failed": ReasonCodeDefinition(
         "document", "fatal", "block_document", True
     ),

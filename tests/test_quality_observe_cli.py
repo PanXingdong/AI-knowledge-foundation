@@ -177,7 +177,7 @@ def test_evaluate_quality_cli_rejects_invalid_policy(tmp_path: Path, capsys):
     )
 
     assert exit_code == 2
-    assert "unsupported_quality_policy_schema" in capsys.readouterr().err
+    assert "invalid_quality_policy" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

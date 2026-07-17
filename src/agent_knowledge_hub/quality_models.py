@@ -55,8 +55,23 @@ class ObservedQualitySignal:
         if "signal_id" in values:
             raise ValueError("signal_id_is_generated")
         payload = dict(values)
+        for field in (
+            "reason_code",
+            "scope",
+            "object_id",
+            "document_version_id",
+        ):
+            value = payload.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"invalid_quality_signal:{field}")
+        raw_evidence_ids = payload.pop("evidence_ids", ())
+        if any(
+            not isinstance(item, str) or not item.strip()
+            for item in raw_evidence_ids
+        ):
+            raise ValueError("invalid_quality_signal:evidence_ids")
         evidence_ids = tuple(
-            sorted(str(item) for item in payload.pop("evidence_ids", ()))
+            sorted(set(raw_evidence_ids))
         )
         signal_id = stable_id(
             "signal",

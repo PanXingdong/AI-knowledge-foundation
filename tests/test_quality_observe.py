@@ -326,6 +326,76 @@ def test_ingest_failure_fingerprint_ignores_absolute_file_path(tmp_path: Path):
     )
 
 
+def test_reingest_same_semantics_ignores_paths_and_generation_times(
+    tmp_path: Path,
+):
+    first_ingest = _ingest(
+        tmp_path / "first",
+        "same",
+        "# Same\n\nSemantically identical content.",
+    )
+    second_ingest = _ingest(
+        tmp_path / "second",
+        "same",
+        "# Same\n\nSemantically identical content.",
+    )
+    for filename in (
+        "canonical-document.json",
+        "processing-record.json",
+        "quality-record.json",
+    ):
+        path = second_ingest.output_dir / filename
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        def rewrite_run_fields(value):
+            if isinstance(value, dict):
+                return {
+                    key: (
+                        f"changed:{key}"
+                        if key
+                        in {
+                            "file_path",
+                            "source_path",
+                            "processed_dir",
+                            "output_dir",
+                            "manifest_path",
+                            "document_json_path",
+                            "chunks_jsonl_path",
+                            "created_at",
+                            "updated_at",
+                            "generated_at",
+                        }
+                        else rewrite_run_fields(item)
+                    )
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [rewrite_run_fields(item) for item in value]
+            return value
+
+        payload = rewrite_run_fields(payload)
+        if filename == "processing-record.json":
+            payload["processing_run_id"] = "changed-run"
+            payload["canonical_sha256"] = "1" * 64
+            payload["chunks_sha256"] = "2" * 64
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    first = evaluate_processed_dir_observe(tmp_path / "first" / "processed")
+    second = evaluate_processed_dir_observe(tmp_path / "second" / "processed")
+
+    assert first.report.artifact_fingerprint == second.report.artifact_fingerprint
+    assert first.report.determinism_fingerprint == second.report.determinism_fingerprint
+    assert [item.to_dict() for item in first.report.signals] == [
+        item.to_dict() for item in second.report.signals
+    ]
+    assert [item.to_dict() for item in first.report.decisions] == [
+        item.to_dict() for item in second.report.decisions
+    ]
+
+
 def test_failed_input_identity_cannot_block_real_document_with_same_raw_id(
     tmp_path: Path,
 ):
@@ -359,6 +429,42 @@ def test_failed_input_identity_cannot_block_real_document_with_same_raw_id(
     assert parse_signal.object_id != healthy.document_version_id
     assert not (
         chunk_ids & set(result.publication_preview.would_exclude_chunk_ids)
+    )
+
+
+def test_quarantined_evidence_does_not_cross_document_boundary(tmp_path: Path):
+    broken = _ingest(tmp_path, "broken", "# Broken\n\nShared evidence content.")
+    healthy = _ingest(tmp_path, "healthy", "# Healthy\n\nOther healthy content.")
+    broken_canonical = json.loads(
+        broken.document_json_path.read_text(encoding="utf-8")
+    )
+    healthy_canonical = json.loads(
+        healthy.document_json_path.read_text(encoding="utf-8")
+    )
+    shared_evidence_id = broken_canonical["evidence_spans"][0]["evidence_id"]
+    broken_canonical["evidence_spans"][0]["text_hash"] = "0" * 64
+    healthy_canonical["evidence_spans"][0]["evidence_id"] = shared_evidence_id
+    broken.document_json_path.write_text(
+        json.dumps(broken_canonical, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    healthy.document_json_path.write_text(
+        json.dumps(healthy_canonical, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    healthy_rows = _read_jsonl(healthy.chunks_jsonl_path)
+    healthy_rows[0]["evidence_ids"] = [shared_evidence_id]
+    _write_jsonl(healthy.chunks_jsonl_path, healthy_rows)
+    broken_chunk_id = str(_read_jsonl(broken.chunks_jsonl_path)[0]["chunk_id"])
+    healthy_chunk_id = str(healthy_rows[0]["chunk_id"])
+
+    result = evaluate_processed_dir_observe(tmp_path / "processed")
+
+    assert broken_chunk_id in result.publication_preview.would_exclude_chunk_ids
+    assert healthy_chunk_id not in result.publication_preview.would_exclude_chunk_ids
+    assert not any(
+        item["scope"] == "chunk" and item["object_id"] == healthy_chunk_id
+        for item in result.quarantine_preview.items
     )
 
 
@@ -612,6 +718,54 @@ def test_synthetic_empty_and_failed_reports_validate_schema(tmp_path: Path):
     validator.validate(
         evaluate_processed_dir_observe(failed_root).report.to_dict()
     )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"failed": {}},
+        {"failed": ["not-an-object"]},
+    ],
+)
+def test_structurally_invalid_ingest_summary_is_detector_error(
+    tmp_path: Path, payload
+):
+    (tmp_path / "ingest-summary.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    result = evaluate_processed_dir_observe(tmp_path)
+    signal = next(
+        item
+        for item in result.report.signals
+        if item.reason_code == "document.evaluator.detector_error"
+    )
+    decision = next(
+        item
+        for item in result.report.decisions
+        if item.signal_ids == (signal.signal_id,)
+    )
+
+    assert signal.object_id == "failed-input:ingest-summary"
+    assert signal.object_id
+    assert decision.recommended_action == "block_document"
+    assert decision.effective_action == "allow"
+
+
+@pytest.mark.parametrize("raw", [b"{", b"\xff"])
+def test_unreadable_ingest_summary_is_detector_error_not_exception(
+    tmp_path: Path, raw: bytes
+):
+    (tmp_path / "ingest-summary.json").write_bytes(raw)
+
+    result = evaluate_processed_dir_observe(tmp_path)
+
+    assert "document.evaluator.detector_error" in {
+        item.reason_code for item in result.report.signals
+    }
 
 
 def test_bundle_writes_each_file_through_same_directory_replace(
