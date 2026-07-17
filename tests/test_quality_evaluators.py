@@ -13,7 +13,12 @@ from agent_knowledge_hub.quality_evaluators import (
     load_document_artifacts,
 )
 from agent_knowledge_hub.quality_registry import REASON_CODE_REGISTRY
-from agent_knowledge_hub.utils import sha256_text, write_json
+from agent_knowledge_hub.utils import (
+    file_sha256,
+    sha256_text,
+    stable_id,
+    write_json,
+)
 
 
 def _ingest(tmp_path: Path):
@@ -673,3 +678,61 @@ def test_artifact_fingerprint_ignores_version_dir_path_and_mtime(tmp_path: Path)
     copied = artifact_fingerprint(load_document_artifacts(copied_dir))
 
     assert original == copied
+
+
+def test_invalid_canonical_identity_and_signals_are_path_independent(
+    tmp_path: Path,
+):
+    result = _ingest(tmp_path / "source")
+    result.document_json_path.write_text("{invalid", encoding="utf-8")
+    first_dir = tmp_path / "copies" / "first-name"
+    second_dir = tmp_path / "copies" / "second-name"
+    shutil.copytree(result.output_dir, first_dir)
+    shutil.copytree(result.output_dir, second_dir)
+
+    first = load_document_artifacts(first_dir)
+    second = load_document_artifacts(second_dir)
+    expected_id = stable_id(
+        "unresolved-docver",
+        file_sha256(first.canonical_path),
+        file_sha256(first.chunks_path),
+        file_sha256(first.processing_record_path),
+        file_sha256(first.quality_record_path),
+    )
+
+    assert first.document_version_id == second.document_version_id == expected_id
+    assert artifact_fingerprint(first) == artifact_fingerprint(second)
+    assert [
+        item.signal_id for item in evaluate_document_version(first_dir)
+    ] == [
+        item.signal_id for item in evaluate_document_version(second_dir)
+    ]
+
+
+def test_missing_canonical_identity_and_signals_are_path_independent(
+    tmp_path: Path,
+):
+    result = _ingest(tmp_path / "source")
+    result.document_json_path.unlink()
+    first_dir = tmp_path / "copies" / "first-name"
+    second_dir = tmp_path / "copies" / "second-name"
+    shutil.copytree(result.output_dir, first_dir)
+    shutil.copytree(result.output_dir, second_dir)
+
+    first = load_document_artifacts(first_dir)
+    second = load_document_artifacts(second_dir)
+    expected_id = stable_id(
+        "unresolved-docver",
+        "missing",
+        file_sha256(first.chunks_path),
+        file_sha256(first.processing_record_path),
+        file_sha256(first.quality_record_path),
+    )
+
+    assert first.document_version_id == second.document_version_id == expected_id
+    assert artifact_fingerprint(first) == artifact_fingerprint(second)
+    assert [
+        item.signal_id for item in evaluate_document_version(first_dir)
+    ] == [
+        item.signal_id for item in evaluate_document_version(second_dir)
+    ]

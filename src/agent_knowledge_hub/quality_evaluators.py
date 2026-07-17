@@ -39,6 +39,27 @@ class DocumentArtifacts:
     load_errors: tuple[str, ...]
 
 
+def _artifact_hash(path: Path) -> str:
+    return file_sha256(path) if path.exists() else "missing"
+
+
+def _artifact_hashes(
+    canonical_path: Path,
+    chunks_path: Path,
+    processing_record_path: Path,
+    quality_record_path: Path,
+) -> tuple[str, str, str, str]:
+    return tuple(
+        _artifact_hash(path)
+        for path in (
+            canonical_path,
+            chunks_path,
+            processing_record_path,
+            quality_record_path,
+        )
+    )
+
+
 def _load_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -94,13 +115,23 @@ def load_document_artifacts(version_dir: Path) -> DocumentArtifacts:
     if chunks_invalid:
         errors.append("chunks_invalid_json")
     canonical_version = (canonical or {}).get("document_version")
-    version_id = str(
-        (
-            canonical_version.get("document_version_id")
-            if isinstance(canonical_version, dict)
-            else None
+    raw_version_id = (
+        canonical_version.get("document_version_id")
+        if isinstance(canonical_version, dict)
+        else None
+    )
+    version_id = (
+        raw_version_id.strip()
+        if isinstance(raw_version_id, str) and raw_version_id.strip()
+        else stable_id(
+            "unresolved-docver",
+            *_artifact_hashes(
+                canonical_path,
+                chunks_path,
+                processing_path,
+                quality_path,
+            ),
         )
-        or root.name
     )
     return DocumentArtifacts(
         version_dir=root,
@@ -118,15 +149,13 @@ def load_document_artifacts(version_dir: Path) -> DocumentArtifacts:
 
 
 def artifact_fingerprint(artifacts: DocumentArtifacts) -> str:
-    parts = [artifacts.document_version_id]
-    for path in (
+    hashes = _artifact_hashes(
         artifacts.canonical_path,
         artifacts.chunks_path,
         artifacts.processing_record_path,
         artifacts.quality_record_path,
-    ):
-        parts.append(file_sha256(path) if path.exists() else "missing")
-    return stable_id("artifact", *parts)
+    )
+    return stable_id("artifact", artifacts.document_version_id, *hashes)
 
 
 def _signal(
