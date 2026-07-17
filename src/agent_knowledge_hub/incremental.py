@@ -2,13 +2,69 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 from agent_knowledge_hub.pipeline import _infer_supplier, _optional, _resolve_manifest_path, ingest_file
 from agent_knowledge_hub.parsers import DocumentParseError
 from agent_knowledge_hub.utils import file_sha256, is_placeholder, utc_now_iso, write_json
+
+# In-process lock protecting concurrent state-file reads/writes (e.g. watcher
+# and manifest ingest running in parallel threads).
+_STATE_FILE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _state_file_lock(state_path: Path) -> Generator[None, None, None]:
+    """Acquire in-process lock then an exclusive advisory file lock."""
+    lock_path = state_path.with_suffix(".lock")
+    with _STATE_FILE_LOCK:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = open(lock_path, "w")  # noqa: WPS515
+        try:
+            # POSIX exclusive lock; falls back to no-op on Windows.
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except ImportError:
+                pass
+            yield
+        finally:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except ImportError:
+                pass
+            lock_fd.close()
+
+
+def _write_state_atomic(state_path: Path, payload: dict) -> None:
+    """Write *payload* to *state_path* atomically via tmp-file + rename.
+
+    Guarantees:
+    - Readers never see a partial / truncated JSON file.
+    - ``os.fsync`` is called before rename so data survives a crash.
+    - Works on the same filesystem (rename is atomic on POSIX; on Windows
+      ``Path.replace`` is as close to atomic as the OS allows).
+    """
+    parent = state_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(dir=parent, suffix=".tmp", prefix=".state-")
+    tmp_path = Path(tmp_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp_path.replace(state_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 @dataclass(frozen=True)
@@ -205,7 +261,9 @@ def ingest_manifest_incremental(
     )
     output_root.mkdir(parents=True, exist_ok=True)
     write_json(output_root / "ingest-run-summary.json", summary.to_dict())
-    write_json(output_root / "ingest-state.json", {"documents": next_state})
+    state_path = output_root / "ingest-state.json"
+    with _state_file_lock(state_path):
+        _write_state_atomic(state_path, {"documents": next_state})
     _write_legacy_ingest_summary(output_root / "ingest-summary.json", summary)
     return summary
 
@@ -213,7 +271,13 @@ def ingest_manifest_incremental(
 def _load_state(path: Path) -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    with _state_file_lock(path):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            # Truncated / corrupted state (e.g. interrupted write before
+            # atomic rename was added).  Start clean rather than crashing.
+            return {}
     documents = payload.get("documents") or {}
     return {
         str(key): dict(value)
@@ -250,6 +314,13 @@ def _write_legacy_ingest_summary(path: Path, summary: IncrementalIngestSummary) 
     )
 
 
+def _make_sample_id_from_rel(rel: Path) -> str:
+    """Derive a stable sample_id from a relative path (mirrors code_manifest)."""
+    import hashlib
+    digest = hashlib.sha256(rel.as_posix().encode()).hexdigest()[:8]
+    return f"code-{digest}"
+
+
 def ingest_paths_incremental(
     *,
     paths: set[Path] | list[Path],
@@ -262,13 +333,12 @@ def ingest_paths_incremental(
     max_chunk_chars: int = 1600,
     max_tokens: int = 512,
     overlap_chars: int = 160,
+    deleted_paths: set[Path] | list[Path] | None = None,
+    watch_dir: Path | str | None = None,
 ) -> IncrementalIngestSummary:
     """
-    对一组文件路径做增量入库：哈希未变则跳过，已变则重新入库。
-
-    与 ingest_manifest_incremental 的区别：
-    - 直接接收 Path 集合，无需 CSV 清单文件。
-    - 适合文件监听器（code_watcher）触发的实时更新场景。
+    对一组文件路径做增量入库：哈希未变则跳过，已变则重新入库；
+    deleted_paths 中的路径会从状态和产物中清除（tombstone）。
 
     Parameters
     ----------
@@ -276,13 +346,37 @@ def ingest_paths_incremental(
         需要检查并按需重新入库的文件路径集合。
     out_dir:
         知识库产物输出目录（processed/）。
+    deleted_paths:
+        已从代码仓删除/移走的路径集合；状态条目和产物文件会被清理。
+    watch_dir:
+        代码仓根目录；用于计算相对路径以生成与 manifest 一致的 sample_id。
+        不提供时 sample_id 回退到文件 stem。
     project / owner / supplier / source_type / document_version:
         写入 chunk 元数据的字段，可按需覆盖。
     """
     output_root = Path(out_dir).resolve()
+    watch_root = Path(watch_dir).resolve() if watch_dir else None
     state_path = output_root / "ingest-state.json"
     state = _load_state(state_path)
     next_state = dict(state)
+
+    # ------------------------------------------------------------------
+    # Phase 0: tombstone deleted / moved-away paths
+    # ------------------------------------------------------------------
+    for del_path in sorted(deleted_paths or []):
+        del_path = del_path.resolve()
+        state_key = str(del_path)
+        prev = next_state.pop(state_key, None)
+        if prev:
+            # Remove output artefacts so stale chunks aren't recalled.
+            for field in ("document_json_path", "chunks_jsonl_path"):
+                artefact = prev.get(field)
+                if artefact:
+                    try:
+                        Path(artefact).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            logger.info("已清除已删除文件的知识库产物：%s", del_path)
 
     documents: list[IncrementalIngestDocument] = []
     failed: list[dict[str, str]] = []
@@ -292,6 +386,14 @@ def ingest_paths_incremental(
 
     for source_path in sorted(paths):
         source_path = source_path.resolve()
+        # Reject symlinks whose resolved target lies outside the watch root.
+        if source_path.is_symlink():
+            real = source_path.resolve()
+            if watch_root and not _is_within(real, watch_root):
+                logger.warning(
+                    "跳过仓库外 symlink：%s -> %s", source_path, real
+                )
+                continue
         if not source_path.is_file():
             continue
 
@@ -321,7 +423,15 @@ def ingest_paths_incremental(
             )
             continue
 
-        sample_id = source_path.stem
+        # Derive sample_id from relative path (mirrors code_manifest identity)
+        if watch_root:
+            try:
+                rel = source_path.relative_to(watch_root)
+                sample_id = _make_sample_id_from_rel(rel)
+            except ValueError:
+                sample_id = source_path.stem
+        else:
+            sample_id = source_path.stem
         try:
             result = ingest_file(
                 file_path=source_path,
@@ -385,9 +495,20 @@ def ingest_paths_incremental(
         failed=failed,
     )
     output_root.mkdir(parents=True, exist_ok=True)
-    write_json(output_root / "ingest-state.json", {"documents": next_state})
+    state_path = output_root / "ingest-state.json"
+    with _state_file_lock(state_path):
+        _write_state_atomic(state_path, {"documents": next_state})
     write_json(output_root / "ingest-run-summary.json", summary.to_dict())
     return summary
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """Return True if *child* is inside *parent* (both must be resolved)."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def _get(row: dict[str, str], key: str) -> str:

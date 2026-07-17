@@ -35,7 +35,7 @@ fi
 : "${LOCAL_API_BASE:=http://127.0.0.1:8789}"
 : "${PROCESSED_DIR:=$PROJECT_ROOT/.tmp_demo_processed}"
 : "${API_STARTUP_TIMEOUT:=300}"
-: "${SKIP_PREWARM:=1}"
+: "${KNOWLEDGE_HUB_SKIP_PREWARM:=1}"
 
 API_PORT=8789
 API_LOG="/tmp/uvicorn.log"
@@ -47,7 +47,7 @@ echo "=================================="
 echo "App ID: $FEISHU_APP_ID"
 echo "API端口: $API_PORT"
 echo "API启动超时: ${API_STARTUP_TIMEOUT}s"
-echo "跳过预热: $SKIP_PREWARM"
+echo "跳过预热: $KNOWLEDGE_HUB_SKIP_PREWARM"
 echo "Bot日志: $BOT_LOG"
 echo ""
 
