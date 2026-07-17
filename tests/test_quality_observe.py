@@ -391,6 +391,88 @@ def test_sidecar_only_directory_is_evaluated_as_document(
     assert len(result.report.document_version_ids) == 1
 
 
+def test_duplicate_sidecar_only_artifacts_are_one_deterministic_logical_document(
+    tmp_path: Path,
+):
+    processed = tmp_path / "processed"
+    first_dir = processed / "first-name" / "version"
+    first_dir.mkdir(parents=True)
+    (first_dir / "processing-record.json").write_text(
+        "{invalid",
+        encoding="utf-8",
+    )
+    single = evaluate_processed_dir_observe(processed)
+    second_dir = processed / "different-name" / "version"
+    second_dir.mkdir(parents=True)
+    (second_dir / "processing-record.json").write_text(
+        "{invalid",
+        encoding="utf-8",
+    )
+
+    duplicated = evaluate_processed_dir_observe(processed)
+    repeated = evaluate_processed_dir_observe(processed)
+
+    assert duplicated.report.to_dict() == single.report.to_dict()
+    assert duplicated.report.to_dict() == repeated.report.to_dict()
+    assert (
+        duplicated.publication_preview.to_dict()
+        == repeated.publication_preview.to_dict()
+    )
+    assert (
+        duplicated.quarantine_preview.to_dict()
+        == repeated.quarantine_preview.to_dict()
+    )
+    assert len(duplicated.report.document_version_ids) == 1
+    assert len(duplicated.report.signals) == len(
+        {item.signal_id for item in duplicated.report.signals}
+    )
+    assert len(duplicated.report.decisions) == len(
+        {item.decision_id for item in duplicated.report.decisions}
+    )
+    assert len(duplicated.publication_preview.decision_ids) == len(
+        set(duplicated.publication_preview.decision_ids)
+    )
+    assert len(duplicated.publication_preview.all_chunk_ids) == len(
+        set(duplicated.publication_preview.all_chunk_ids)
+    )
+
+    paths = write_quality_observation_bundle(tmp_path / "bundle", duplicated)
+    jsonschema = pytest.importorskip("jsonschema")
+    schema_root = (
+        Path(__file__).parents[1] / "schemas" / "knowledge-quality.v1"
+    )
+    for path_key, schema_name in (
+        ("report_json", "quality-report.schema.json"),
+        ("publication_preview", "publication-preview.schema.json"),
+        ("quarantine_preview", "quarantine-preview.schema.json"),
+    ):
+        payload = json.loads(paths[path_key].read_text(encoding="utf-8"))
+        schema = json.loads((schema_root / schema_name).read_text(encoding="utf-8"))
+        jsonschema.Draft202012Validator(schema).validate(payload)
+
+
+def test_unresolved_fallback_identity_uses_content_not_directory_names(
+    tmp_path: Path,
+):
+    import agent_knowledge_hub.quality_observe as observe
+
+    first = tmp_path / "first-name"
+    same = tmp_path / "different-name"
+    changed = tmp_path / "third-name"
+    for root, content in (
+        (first, "{invalid"),
+        (same, "{invalid"),
+        (changed, "{different"),
+    ):
+        root.mkdir()
+        (root / "processing-record.json").write_text(content, encoding="utf-8")
+
+    first_id = observe._unresolved_document_identity(first)
+
+    assert first_id == observe._unresolved_document_identity(same)
+    assert first_id != observe._unresolved_document_identity(changed)
+
+
 def test_malformed_document_does_not_block_other_document_report(tmp_path: Path):
     malformed = _ingest(tmp_path, "malformed", "# Bad\n\nMalformed content.")
     healthy = _ingest(tmp_path, "healthy", "# Good\n\nHealthy content.")
@@ -590,6 +672,26 @@ def test_determinism_fingerprint_covers_propagated_previews(
     assert (
         without_propagation.report.determinism_fingerprint
         != with_propagation.report.determinism_fingerprint
+    )
+
+
+def test_determinism_fingerprint_covers_all_bundle_schema_versions():
+    import agent_knowledge_hub.quality_observe as observe
+
+    payload = {"stable": "payload"}
+    current = observe._determinism_fingerprint(payload)
+
+    assert current != observe._determinism_fingerprint(
+        payload,
+        quality_report_schema_version="knowledge-quality-report.v2",
+    )
+    assert current != observe._determinism_fingerprint(
+        payload,
+        publication_preview_schema_version="knowledge-publication-preview.v2",
+    )
+    assert current != observe._determinism_fingerprint(
+        payload,
+        quarantine_preview_schema_version="knowledge-quarantine-preview.v2",
     )
 
 

@@ -23,7 +23,15 @@ from agent_knowledge_hub.quality_models import (
 )
 from agent_knowledge_hub.quality_policy import apply_quality_policy, load_quality_policy
 from agent_knowledge_hub.quality_registry import REASON_CODE_REGISTRY
-from agent_knowledge_hub.utils import sha256_text, stable_id, write_json
+from agent_knowledge_hub.utils import file_sha256, sha256_text, stable_id, write_json
+
+
+_ARTIFACT_FILENAMES = (
+    "canonical-document.json",
+    "chunks.jsonl",
+    "processing-record.json",
+    "quality-record.json",
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +51,58 @@ def _fingerprint_payload(payload: object) -> str:
         separators=(",", ":"),
     )
     return sha256_text(normalized)
+
+
+def _determinism_fingerprint(
+    payload: object,
+    *,
+    quality_report_schema_version: str = QUALITY_REPORT_SCHEMA_VERSION,
+    publication_preview_schema_version: str = PUBLICATION_PREVIEW_SCHEMA_VERSION,
+    quarantine_preview_schema_version: str = QUARANTINE_PREVIEW_SCHEMA_VERSION,
+) -> str:
+    return _fingerprint_payload(
+        {
+            "payload": payload,
+            "schema_versions": {
+                "publication_preview": publication_preview_schema_version,
+                "quality_report": quality_report_schema_version,
+                "quarantine_preview": quarantine_preview_schema_version,
+            },
+        }
+    )
+
+
+def _unresolved_document_identity(version_dir: Path) -> str:
+    hashes: list[str] = []
+    for filename in _ARTIFACT_FILENAMES:
+        path = version_dir / filename
+        if not path.exists():
+            hashes.append("missing")
+            continue
+        try:
+            hashes.append(file_sha256(path))
+        except OSError as exc:
+            hashes.append(f"unreadable:{type(exc).__name__}")
+    return stable_id("unresolved-docver", *hashes)
+
+
+def _ordered_unique(items: list[Any], id_attribute: str) -> tuple[Any, ...]:
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            str(getattr(item, id_attribute)),
+            json.dumps(
+                item.to_dict(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ),
+    )
+    unique: dict[str, Any] = {}
+    for item in ordered:
+        unique.setdefault(str(getattr(item, id_attribute)), item)
+    return tuple(unique[item_id] for item_id in sorted(unique))
 
 
 def _failed_input_object_id(failed: dict[str, Any], index: int) -> str:
@@ -129,18 +189,17 @@ def _evaluate_ingest_failures(
                 "reason_code": reason_code,
             }
         )
+    unique_identity_rows = {
+        (
+            item["object_id"],
+            item["reason_code"],
+            item["reason"],
+        ): item
+        for item in identity_rows
+    }
     return (
-        tuple(sorted(signals, key=lambda item: item.signal_id)),
-        tuple(
-            sorted(
-                identity_rows,
-                key=lambda item: (
-                    item["object_id"],
-                    item["reason_code"],
-                    item["reason"],
-                ),
-            )
-        ),
+        _ordered_unique(signals, "signal_id"),
+        tuple(unique_identity_rows[key] for key in sorted(unique_identity_rows)),
     )
 
 
@@ -258,32 +317,29 @@ def evaluate_processed_dir_observe(
         key=lambda path: path.as_posix(),
     )
     signals: list[ObservedQualitySignal] = []
-    document_ids: list[str] = []
-    all_chunk_ids: list[str] = []
-    artifact_parts: list[str] = []
-    loaded_artifacts = []
+    document_ids: set[str] = set()
+    all_chunk_ids: set[str] = set()
+    artifact_parts: set[str] = set()
+    loaded_artifacts: dict[tuple[str, str], Any] = {}
 
     ingest_signals, ingest_identity = _evaluate_ingest_failures(root)
     signals.extend(ingest_signals)
     if ingest_identity:
-        artifact_parts.append(_fingerprint_payload(ingest_identity))
+        artifact_parts.add(_fingerprint_payload(ingest_identity))
 
     for version_dir in version_dirs:
         try:
             artifacts = load_document_artifacts(version_dir)
         except Exception as exc:
-            object_id = stable_id(
-                "unresolved-docver",
-                *(path.name for path in sorted(version_dir.iterdir())),
-            )
-            document_ids.append(object_id)
+            object_id = _unresolved_document_identity(version_dir)
+            document_ids.add(object_id)
             signals.append(
                 _detector_error_signal(
                     document_version_id=object_id,
                     error=exc,
                 )
             )
-            artifact_parts.append(
+            artifact_parts.add(
                 _fingerprint_payload(
                     {
                         "document_version_id": object_id,
@@ -292,10 +348,14 @@ def evaluate_processed_dir_observe(
                 )
             )
             continue
-        loaded_artifacts.append(artifacts)
-        document_ids.append(artifacts.document_version_id)
-        artifact_parts.append(artifact_fingerprint(artifacts))
-        all_chunk_ids.extend(
+        artifact_fp = artifact_fingerprint(artifacts)
+        loaded_artifacts.setdefault(
+            (artifacts.document_version_id, artifact_fp),
+            artifacts,
+        )
+        document_ids.add(artifacts.document_version_id)
+        artifact_parts.add(artifact_fp)
+        all_chunk_ids.update(
             str(item.get("chunk_id"))
             for item in artifacts.chunks
             if item.get("chunk_id")
@@ -330,11 +390,16 @@ def evaluate_processed_dir_observe(
         )
 
     artifact_fp = _fingerprint_payload(sorted(artifact_parts))
-    ordered_signals = tuple(sorted(signals, key=lambda item: item.signal_id))
-    decisions = apply_quality_policy(
-        ordered_signals,
-        policy,
-        artifact_fingerprint=artifact_fp,
+    ordered_signals = _ordered_unique(signals, "signal_id")
+    decisions = _ordered_unique(
+        list(
+            apply_quality_policy(
+                ordered_signals,
+                policy,
+                artifact_fingerprint=artifact_fp,
+            )
+        ),
+        "decision_id",
     )
 
     would_exclude_docs = {
@@ -376,7 +441,8 @@ def evaluate_processed_dir_observe(
 
     propagated_chunk_decisions: dict[str, set[str]] = {}
     would_exclude_chunks = set(direct_exclude_chunks)
-    for artifacts in loaded_artifacts:
+    for artifacts_key in sorted(loaded_artifacts):
+        artifacts = loaded_artifacts[artifacts_key]
         for chunk in artifacts.chunks:
             chunk_id = str(chunk.get("chunk_id") or "")
             if not chunk_id:
@@ -444,7 +510,7 @@ def evaluate_processed_dir_observe(
         all_chunk_ids=tuple(sorted(all_chunk_ids)),
         would_exclude_document_version_ids=tuple(sorted(would_exclude_docs)),
         would_exclude_chunk_ids=tuple(sorted(would_exclude_chunks)),
-        decision_ids=tuple(sorted(item.decision_id for item in decisions)),
+        decision_ids=tuple(sorted({item.decision_id for item in decisions})),
     )
     quarantine = QuarantinePreview(
         schema_version=QUARANTINE_PREVIEW_SCHEMA_VERSION,
@@ -468,7 +534,7 @@ def evaluate_processed_dir_observe(
     }
     report = QualityReport(
         schema_version=QUALITY_REPORT_SCHEMA_VERSION,
-        determinism_fingerprint=_fingerprint_payload(pre_report),
+        determinism_fingerprint=_determinism_fingerprint(pre_report),
         document_version_ids=tuple(sorted(document_ids)),
         signals=ordered_signals,
         decisions=decisions,
