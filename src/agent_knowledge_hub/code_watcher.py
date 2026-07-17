@@ -31,17 +31,8 @@ WATCHABLE_EXTENSIONS: frozenset[str] = frozenset({
     ".md", ".txt",
 })
 
-# 默认排除的目录名（第三方库 / 体积过大）
-DEFAULT_EXCLUDE_DIRS: frozenset[str] = frozenset({
-    "KanziEngine",
-    "someip",
-    "ClusterHMIPrebuilts",
-    ".git",
-    "__pycache__",
-    "node_modules",
-    "build",
-    ".tmp",
-})
+# 默认排除的目录名，与 code_manifest.DEFAULT_EXCLUDE_DIRS 保持一致
+from agent_knowledge_hub.code_manifest import DEFAULT_EXCLUDE_DIRS  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
