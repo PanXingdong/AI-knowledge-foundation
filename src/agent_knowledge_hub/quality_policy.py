@@ -62,7 +62,12 @@ def build_default_observe_policy() -> QualityPolicy:
 def load_quality_policy(path: Path | None) -> QualityPolicy:
     if path is None:
         return build_default_observe_policy()
-    payload = json.loads(path.resolve().read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.resolve().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid_quality_policy") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_quality_policy")
     if payload.get("schema_version") != QUALITY_POLICY_SCHEMA_VERSION:
         raise ValueError("unsupported_quality_policy_schema")
     if payload.get("mode") != "observe":

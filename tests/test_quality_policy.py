@@ -281,6 +281,45 @@ def test_custom_policy_hash_ignores_path_time_and_display_fields(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("raw_policy", "case"),
+    [
+        (b"\xff", "invalid_utf8"),
+        (b"{", "malformed_json"),
+        (b"[]", "array"),
+        (b"null", "null"),
+        (b'"policy"', "string"),
+        (b"7", "number"),
+    ],
+)
+def test_load_quality_policy_normalizes_unreadable_or_non_object_input(
+    tmp_path,
+    raw_policy,
+    case,
+):
+    path = tmp_path / f"{case}.json"
+    path.write_bytes(raw_policy)
+
+    with pytest.raises(ValueError, match="^invalid_quality_policy$"):
+        load_quality_policy(path)
+
+
+def test_load_quality_policy_normalizes_os_read_error(tmp_path, monkeypatch):
+    path = tmp_path / "policy.json"
+    path.write_text("{}", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def fail_read_text(self, *args, **kwargs):
+        if self == path.resolve():
+            raise OSError("unstable platform detail")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_read_text)
+
+    with pytest.raises(ValueError, match="^invalid_quality_policy$"):
+        load_quality_policy(path)
+
+
+@pytest.mark.parametrize(
     ("payload", "error"),
     [
         (

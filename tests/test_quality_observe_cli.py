@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from agent_knowledge_hub.cli import main
 from agent_knowledge_hub.pipeline import ingest_file
 
@@ -176,6 +178,39 @@ def test_evaluate_quality_cli_rejects_invalid_policy(tmp_path: Path, capsys):
 
     assert exit_code == 2
     assert "unsupported_quality_policy_schema" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "raw_policy",
+    [
+        b"[]",
+        b"\xff",
+    ],
+    ids=["array", "invalid_utf8"],
+)
+def test_evaluate_quality_cli_normalizes_unreadable_policy(
+    tmp_path: Path,
+    capsys,
+    raw_policy: bytes,
+):
+    _ingest(tmp_path)
+    policy_path = tmp_path / "invalid-policy.json"
+    policy_path.write_bytes(raw_policy)
+
+    exit_code = main(
+        [
+            "evaluate-quality",
+            "--processed-dir",
+            str(tmp_path / "processed"),
+            "--output-dir",
+            str(tmp_path / "quality"),
+            "--policy-path",
+            str(policy_path),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "invalid_quality_policy" in capsys.readouterr().err
 
 
 def test_legacy_parse_quality_summary_cli_remains_compatible(
