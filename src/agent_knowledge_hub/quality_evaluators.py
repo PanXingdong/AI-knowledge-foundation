@@ -49,16 +49,25 @@ def _load_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _load_jsonl(path: Path) -> tuple[dict[str, Any], ...]:
+def _load_jsonl(
+    path: Path,
+) -> tuple[tuple[dict[str, Any], ...], bool]:
     if not path.exists():
-        return ()
+        return (), False
     rows: list[dict[str, Any]] = []
+    invalid = False
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
-            payload = json.loads(line)
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                invalid = True
+                continue
             if isinstance(payload, dict):
                 rows.append(payload)
-    return tuple(rows)
+            else:
+                invalid = True
+    return tuple(rows), invalid
 
 
 def load_document_artifacts(version_dir: Path) -> DocumentArtifacts:
@@ -73,10 +82,16 @@ def load_document_artifacts(version_dir: Path) -> DocumentArtifacts:
     errors: list[str] = []
     if canonical_path.exists() and canonical is None:
         errors.append("canonical_invalid_json")
+    if processing_path.exists() and processing_record is None:
+        errors.append("processing_record_invalid_json")
+    if quality_path.exists() and quality_record is None:
+        errors.append("quality_record_invalid_json")
     try:
-        chunks = _load_jsonl(chunks_path)
+        chunks, chunks_invalid = _load_jsonl(chunks_path)
     except (OSError, UnicodeError, json.JSONDecodeError):
         chunks = ()
+        chunks_invalid = True
+    if chunks_invalid:
         errors.append("chunks_invalid_json")
     canonical_version = (canonical or {}).get("document_version")
     version_id = str(
@@ -201,7 +216,27 @@ def _evidence_ids(items: tuple[dict[str, Any], ...]) -> tuple[str, ...]:
 def _evaluate_document(artifacts: DocumentArtifacts) -> list[ObservedQualitySignal]:
     signals: list[ObservedQualitySignal] = []
     version_id = artifacts.document_version_id
-    if not artifacts.canonical_path.exists() or artifacts.canonical is None:
+    invalid_reason_codes = {
+        "canonical_invalid_json": "document.integrity.canonical_invalid",
+        "chunks_invalid_json": "document.integrity.chunks_invalid",
+        "processing_record_invalid_json": (
+            "document.integrity.processing_record_invalid"
+        ),
+        "quality_record_invalid_json": "document.integrity.quality_record_invalid",
+    }
+    for load_error in artifacts.load_errors:
+        signals.append(
+            _signal(
+                invalid_reason_codes[load_error],
+                artifacts=artifacts,
+                object_id=version_id,
+                detector="document-integrity",
+                metric_name=f"{load_error.removesuffix('_json')}_valid",
+                actual_value=False,
+                threshold=True,
+            )
+        )
+    if not artifacts.canonical_path.exists():
         signals.append(
             _signal(
                 "document.integrity.canonical_missing",
@@ -213,6 +248,8 @@ def _evaluate_document(artifacts: DocumentArtifacts) -> list[ObservedQualitySign
                 threshold=True,
             )
         )
+        return signals
+    if artifacts.canonical is None:
         return signals
     if not artifacts.chunks_path.exists():
         signals.append(
@@ -226,7 +263,7 @@ def _evaluate_document(artifacts: DocumentArtifacts) -> list[ObservedQualitySign
                 threshold=True,
             )
         )
-    elif not artifacts.chunks:
+    elif "chunks_invalid_json" not in artifacts.load_errors and not artifacts.chunks:
         signals.append(
             _signal(
                 "document.integrity.no_chunks",
@@ -349,11 +386,19 @@ def _evaluate_pages(artifacts: DocumentArtifacts) -> list[ObservedQualitySignal]
             for page in evidence_ids_by_page
             if page > page_count
         }
+        block_evidence_ids_by_page: dict[int, set[str]] = {}
         for block in blocks:
+            block_id = str(block.get("block_id") or "")
+            block_evidence_ids = set(
+                _evidence_ids(evidence_by_block.get(block_id, ()))
+            )
             for key in ("page_start", "page_end"):
                 page = _positive_int(block.get(key))
                 if page is not None and page > page_count:
                     out_of_range_pages.add(page)
+                    block_evidence_ids_by_page.setdefault(page, set()).update(
+                        block_evidence_ids
+                    )
         for page in sorted(out_of_range_pages):
             signals.append(
                 _signal(
@@ -365,7 +410,12 @@ def _evaluate_pages(artifacts: DocumentArtifacts) -> list[ObservedQualitySignal]
                     actual_value=page,
                     threshold=page_count,
                     page=page,
-                    evidence_ids=tuple(sorted(evidence_ids_by_page.get(page, set()))),
+                    evidence_ids=tuple(
+                        sorted(
+                            evidence_ids_by_page.get(page, set())
+                            | block_evidence_ids_by_page.get(page, set())
+                        )
+                    ),
                 )
             )
 
@@ -471,10 +521,30 @@ def _evaluate_blocks(artifacts: DocumentArtifacts) -> list[ObservedQualitySignal
     evidence_by_block = _evidence_by_block(canonical)
     signals: list[ObservedQualitySignal] = []
     hashes: dict[str, list[str]] = {}
-    block_by_id: dict[str, dict[str, Any]] = {}
+    block_by_id = {
+        str(block.get("block_id") or f"block_{index}"): block
+        for index, block in enumerate(blocks)
+    }
+    for evidence in _dict_rows(canonical.get("evidence_spans")):
+        block_id = str(evidence.get("block_id") or "")
+        if block_id in block_by_id:
+            continue
+        evidence_id = str(evidence.get("evidence_id") or "")
+        signals.append(
+            _signal(
+                "block.evidence.block_reference_missing",
+                artifacts=artifacts,
+                object_id=block_id,
+                detector="block-evidence",
+                metric_name="block_reference_exists",
+                actual_value=False,
+                threshold=True,
+                block_id=block_id,
+                evidence_ids=(evidence_id,) if evidence_id else (),
+            )
+        )
     for index, block in enumerate(blocks):
         block_id = str(block.get("block_id") or f"block_{index}")
-        block_by_id[block_id] = block
         block_evidence = evidence_by_block.get(block_id, ())
         evidence_ids = _evidence_ids(block_evidence)
         text = str(block.get("text") or "")
@@ -561,6 +631,20 @@ def _evaluate_blocks(artifacts: DocumentArtifacts) -> list[ObservedQualitySignal
                         metric_name="text_hash",
                         actual_value=actual_hash,
                         threshold=expected_hash,
+                        block_id=block_id,
+                        evidence_ids=(evidence_id,) if evidence_id else (),
+                    )
+                )
+            if normalize_space(evidence_text) != normalize_space(text):
+                signals.append(
+                    _signal(
+                        "block.evidence.hash_mismatch",
+                        artifacts=artifacts,
+                        object_id=block_id,
+                        detector="block-evidence",
+                        metric_name="evidence_text_matches_block",
+                        actual_value=False,
+                        threshold=True,
                         block_id=block_id,
                         evidence_ids=(evidence_id,) if evidence_id else (),
                     )

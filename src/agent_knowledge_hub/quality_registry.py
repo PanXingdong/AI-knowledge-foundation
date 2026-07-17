@@ -16,7 +16,13 @@ REASON_CODE_REGISTRY: dict[str, ReasonCodeDefinition] = {
     "document.integrity.canonical_missing": ReasonCodeDefinition(
         "document", "fatal", "block_document", True
     ),
+    "document.integrity.canonical_invalid": ReasonCodeDefinition(
+        "document", "fatal", "block_document", True
+    ),
     "document.integrity.chunks_missing": ReasonCodeDefinition(
+        "document", "fatal", "block_document", True
+    ),
+    "document.integrity.chunks_invalid": ReasonCodeDefinition(
         "document", "fatal", "block_document", True
     ),
     "document.integrity.no_chunks": ReasonCodeDefinition(
@@ -25,7 +31,13 @@ REASON_CODE_REGISTRY: dict[str, ReasonCodeDefinition] = {
     "document.integrity.processing_record_missing": ReasonCodeDefinition(
         "document", "error", "block_document", True
     ),
+    "document.integrity.processing_record_invalid": ReasonCodeDefinition(
+        "document", "error", "block_document", True
+    ),
     "document.integrity.quality_record_missing": ReasonCodeDefinition(
+        "document", "error", "block_document", True
+    ),
+    "document.integrity.quality_record_invalid": ReasonCodeDefinition(
         "document", "error", "block_document", True
     ),
     "document.integrity.document_version_mismatch": ReasonCodeDefinition(
@@ -74,6 +86,9 @@ REASON_CODE_REGISTRY: dict[str, ReasonCodeDefinition] = {
         "block", "error", "quarantine", True
     ),
     "block.evidence.hash_mismatch": ReasonCodeDefinition(
+        "block", "error", "quarantine", True
+    ),
+    "block.evidence.block_reference_missing": ReasonCodeDefinition(
         "block", "error", "quarantine", True
     ),
     "block.content.too_long": ReasonCodeDefinition(

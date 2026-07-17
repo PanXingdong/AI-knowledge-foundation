@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 from agent_knowledge_hub.pipeline import ingest_file
@@ -7,10 +8,12 @@ from agent_knowledge_hub.quality_evaluators import (
     SOFT_MIN_CHUNK_CHARS,
     SOFT_MIN_PAGE_CHARS,
     SOFT_WARNING_COUNT,
+    artifact_fingerprint,
     evaluate_document_version,
+    load_document_artifacts,
 )
 from agent_knowledge_hub.quality_registry import REASON_CODE_REGISTRY
-from agent_knowledge_hub.utils import write_json
+from agent_knowledge_hub.utils import sha256_text, write_json
 
 
 def _ingest(tmp_path: Path):
@@ -69,14 +72,79 @@ def test_invalid_canonical_json_is_safe_document_hard_signal(tmp_path: Path):
     result = _ingest(tmp_path)
     result.document_json_path.write_text("{", encoding="utf-8")
 
-    assert "document.integrity.canonical_missing" in _reason_codes(result.output_dir)
+    artifacts = load_document_artifacts(result.output_dir)
+
+    assert artifacts.load_errors == ("canonical_invalid_json",)
+    assert "document.integrity.canonical_invalid" in _reason_codes(
+        result.output_dir
+    )
+    assert "document.integrity.canonical_missing" not in _reason_codes(
+        result.output_dir
+    )
 
 
 def test_invalid_chunks_json_is_safe_document_hard_signal(tmp_path: Path):
     result = _ingest(tmp_path)
     result.chunks_jsonl_path.write_text("{not-json}\n", encoding="utf-8")
 
-    assert "document.integrity.no_chunks" in _reason_codes(result.output_dir)
+    artifacts = load_document_artifacts(result.output_dir)
+
+    assert artifacts.load_errors == ("chunks_invalid_json",)
+    assert "document.integrity.chunks_invalid" in _reason_codes(result.output_dir)
+    assert "document.integrity.no_chunks" not in _reason_codes(result.output_dir)
+
+
+def test_partially_invalid_chunks_preserve_valid_rows_and_signal_invalid(
+    tmp_path: Path,
+):
+    result = _ingest(tmp_path)
+    original = result.chunks_jsonl_path.read_text(encoding="utf-8")
+    result.chunks_jsonl_path.write_text(
+        original + "{not-json}\n",
+        encoding="utf-8",
+    )
+
+    artifacts = load_document_artifacts(result.output_dir)
+    codes = _reason_codes(result.output_dir)
+
+    assert len(artifacts.chunks) == 1
+    assert artifacts.load_errors == ("chunks_invalid_json",)
+    assert "document.integrity.chunks_invalid" in codes
+    assert "document.integrity.no_chunks" not in codes
+
+
+def test_invalid_processing_record_is_document_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    result.processing_record_path.write_text("{", encoding="utf-8")
+
+    artifacts = load_document_artifacts(result.output_dir)
+
+    assert artifacts.load_errors == ("processing_record_invalid_json",)
+    assert (
+        "document.integrity.processing_record_invalid"
+        in _reason_codes(result.output_dir)
+    )
+    assert (
+        "document.integrity.processing_record_missing"
+        not in _reason_codes(result.output_dir)
+    )
+
+
+def test_invalid_quality_record_is_document_hard_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    result.quality_record_path.write_text("[]", encoding="utf-8")
+
+    artifacts = load_document_artifacts(result.output_dir)
+
+    assert artifacts.load_errors == ("quality_record_invalid_json",)
+    assert (
+        "document.integrity.quality_record_invalid"
+        in _reason_codes(result.output_dir)
+    )
+    assert (
+        "document.integrity.quality_record_missing"
+        not in _reason_codes(result.output_dir)
+    )
 
 
 def test_unknown_chunk_evidence_is_hard_signal_with_reference_id(tmp_path: Path):
@@ -530,3 +598,78 @@ def test_duplicate_chunks_without_ids_do_not_abort_evaluation(tmp_path: Path):
         and item.chunk_id == "chunk_1"
         for item in signals
     )
+
+
+def test_evidence_text_and_hash_coordinated_change_is_rejected(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    evidence = payload["evidence_spans"][0]
+    evidence["text"] = "coordinated tamper"
+    evidence["text_hash"] = sha256_text(evidence["text"])
+    write_json(result.document_json_path, payload)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "block.evidence.hash_mismatch"
+        and item.metric_name == "evidence_text_matches_block"
+    )
+
+    assert signal.object_id == evidence["block_id"]
+    assert signal.evidence_ids == (evidence["evidence_id"],)
+
+
+def test_orphan_evidence_is_block_reference_missing_signal(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    evidence = payload["evidence_spans"][0]
+    evidence["block_id"] = "block_missing"
+    write_json(result.document_json_path, payload)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "block.evidence.block_reference_missing"
+    )
+
+    assert signal.object_id == "block_missing"
+    assert signal.block_id == "block_missing"
+    assert signal.evidence_ids == (evidence["evidence_id"],)
+
+
+def test_out_of_range_block_propagates_evidence_from_another_page(tmp_path: Path):
+    result = _ingest(tmp_path)
+    payload = json.loads(result.document_json_path.read_text(encoding="utf-8"))
+    block = payload["blocks"][0]
+    evidence = next(
+        item
+        for item in payload["evidence_spans"]
+        if item["block_id"] == block["block_id"]
+    )
+    payload["parse_report"]["page_count"] = 1
+    block["page_start"] = 2
+    block["page_end"] = 2
+    evidence["page"] = 1
+    write_json(result.document_json_path, payload)
+
+    signal = next(
+        item
+        for item in evaluate_document_version(result.output_dir)
+        if item.reason_code == "page.integrity.reference_out_of_range"
+        and item.page == 2
+    )
+
+    assert evidence["evidence_id"] in signal.evidence_ids
+
+
+def test_artifact_fingerprint_ignores_version_dir_path_and_mtime(tmp_path: Path):
+    result = _ingest(tmp_path / "original")
+    copied_dir = tmp_path / "copied" / "different-name"
+    shutil.copytree(result.output_dir, copied_dir)
+    for path in copied_dir.iterdir():
+        path.touch()
+
+    original = artifact_fingerprint(load_document_artifacts(result.output_dir))
+    copied = artifact_fingerprint(load_document_artifacts(copied_dir))
+
+    assert original == copied

@@ -90,6 +90,52 @@ def test_default_policy_covers_every_registered_reason_code():
     )
 
 
+def test_integrity_review_reason_codes_have_exact_registry_contract():
+    expected = {
+        "document.integrity.canonical_invalid": (
+            "document",
+            "fatal",
+            "block_document",
+            True,
+        ),
+        "document.integrity.chunks_invalid": (
+            "document",
+            "fatal",
+            "block_document",
+            True,
+        ),
+        "document.integrity.processing_record_invalid": (
+            "document",
+            "error",
+            "block_document",
+            True,
+        ),
+        "document.integrity.quality_record_invalid": (
+            "document",
+            "error",
+            "block_document",
+            True,
+        ),
+        "block.evidence.block_reference_missing": (
+            "block",
+            "error",
+            "quarantine",
+            True,
+        ),
+    }
+
+    assert {
+        reason_code: (
+            definition.scope,
+            definition.severity,
+            definition.recommended_action,
+            definition.hard,
+        )
+        for reason_code, definition in REASON_CODE_REGISTRY.items()
+        if reason_code in expected
+    } == expected
+
+
 def test_default_policy_recommends_quarantine_but_observe_effectively_allows():
     policy = build_default_observe_policy()
     decisions = apply_quality_policy(
