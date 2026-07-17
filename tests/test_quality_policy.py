@@ -16,11 +16,16 @@ from agent_knowledge_hub.quality_policy import (
 from agent_knowledge_hub.quality_registry import REASON_CODE_REGISTRY
 
 
-def _signal(reason_code: str, *, severity: str | None = None) -> ObservedQualitySignal:
+def _signal(
+    reason_code: str,
+    *,
+    scope: str | None = None,
+    severity: str | None = None,
+) -> ObservedQualitySignal:
     definition = REASON_CODE_REGISTRY[reason_code]
     return ObservedQualitySignal.create(
         reason_code=reason_code,
-        scope=definition.scope,
+        scope=scope or definition.scope,
         object_id="chunk_1",
         detector="test",
         detector_version="1",
@@ -140,6 +145,28 @@ def test_unknown_reason_code_is_rejected():
 
     with pytest.raises(ValueError, match="^unknown_reason_code:chunk.unknown.rule$"):
         apply_quality_policy((unknown,), policy, artifact_fingerprint="artifact_1")
+
+
+def test_registered_signal_with_wrong_scope_is_rejected():
+    policy = build_default_observe_policy()
+    signal = _signal("chunk.content.too_short", scope="document")
+
+    with pytest.raises(
+        ValueError,
+        match="^signal_scope_mismatch:chunk.content.too_short$",
+    ):
+        apply_quality_policy((signal,), policy, artifact_fingerprint="artifact_1")
+
+
+def test_registered_signal_with_wrong_severity_is_rejected():
+    policy = build_default_observe_policy()
+    signal = _signal("chunk.content.too_short", severity="error")
+
+    with pytest.raises(
+        ValueError,
+        match="^signal_severity_mismatch:chunk.content.too_short$",
+    ):
+        apply_quality_policy((signal,), policy, artifact_fingerprint="artifact_1")
 
 
 def test_decisions_are_deterministically_sorted_and_ignore_display_message():

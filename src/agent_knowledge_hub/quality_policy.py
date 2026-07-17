@@ -105,9 +105,14 @@ def apply_quality_policy(
     for signal in sorted(signals, key=lambda item: item.signal_id):
         if signal.reason_code not in REASON_CODE_REGISTRY:
             raise ValueError(f"unknown_reason_code:{signal.reason_code}")
+        definition = REASON_CODE_REGISTRY[signal.reason_code]
+        if signal.scope != definition.scope:
+            raise ValueError(f"signal_scope_mismatch:{signal.reason_code}")
         rule = rules.get(signal.reason_code)
         if rule is None:
             raise ValueError(f"missing_policy_rule:{signal.reason_code}")
+        if signal.severity != rule.severity:
+            raise ValueError(f"signal_severity_mismatch:{signal.reason_code}")
         if rule.recommended_action not in QUALITY_ACTIONS:
             raise ValueError(
                 f"unsupported_quality_action:{rule.recommended_action}"
