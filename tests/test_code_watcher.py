@@ -120,6 +120,57 @@ class TestChangeBuffer:
         # After exceeding retries the path should be silently dropped
         assert path not in changed
 
+    def test_retry_counts_survive_drain(self):
+        """Retry counts must NOT be reset when drain() is called.
+
+        This is the core correctness property: if a path fails on every
+        attempt, the counter must accumulate across drain cycles so that the
+        path is eventually abandoned after exactly _MAX_RETRIES failures,
+        rather than restarting the count from 1 on every drain.
+        """
+        buf = _ChangeBuffer(debounce_seconds=0.0)
+        path = Path("/tmp/persistent_fail.cpp")
+
+        # Simulate _MAX_RETRIES failure cycles, each preceded by a drain
+        # (which is what _flush_loop does between re_enqueue_failed calls).
+        for attempt in range(1, _MAX_RETRIES + 1):
+            buf.re_enqueue_failed({path}, set())
+            time.sleep(0.05)
+            changed, _ = buf.drain()
+            # Path should still be in changed until the limit is reached.
+            assert path in changed, (
+                f"path should still be queued on attempt {attempt} of {_MAX_RETRIES}"
+            )
+
+        # One more failure — now over the limit.
+        buf.re_enqueue_failed({path}, set())
+        time.sleep(0.05)
+        changed, _ = buf.drain()
+        assert path not in changed, "path must be abandoned once retry limit is exceeded"
+
+    def test_mark_success_clears_retry_counts(self):
+        """mark_success() must reset the retry counter so a path that
+        eventually succeeds can start fresh if it fails again later."""
+        buf = _ChangeBuffer(debounce_seconds=0.0)
+        path = Path("/tmp/flaky.cpp")
+
+        # Fail once, then succeed.
+        buf.re_enqueue_failed({path}, set())
+        buf.mark_success({path}, set())
+
+        # After success the retry count should be zero; we should get
+        # _MAX_RETRIES more attempts before abandonment.
+        for attempt in range(1, _MAX_RETRIES + 1):
+            buf.re_enqueue_failed({path}, set())
+            time.sleep(0.05)
+            changed, _ = buf.drain()
+            assert path in changed, f"should still be queued on attempt {attempt}"
+
+        buf.re_enqueue_failed({path}, set())
+        time.sleep(0.05)
+        changed, _ = buf.drain()
+        assert path not in changed, "must be abandoned after _MAX_RETRIES post-success failures"
+
 
 # ---------------------------------------------------------------------------
 # CodeRepositoryWatcher — 过滤逻辑

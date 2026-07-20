@@ -73,7 +73,13 @@ class _ChangeBuffer:
             self._last_event_ts = time.monotonic()
 
     def re_enqueue_failed(self, paths: set[Path], deleted: set[Path]) -> None:
-        """将失败的路径重新入队（用于有限重试），超出次数则从缓冲移除并丢弃。"""
+        """将失败的路径重新入队（用于有限重试），超出次数则从缓冲移除并丢弃。
+
+        Note: retry_counts are intentionally NOT reset by ``drain()``.  Each
+        call here increments the *cumulative* failure count so that a path
+        that fails on every attempt is abandoned after exactly ``_MAX_RETRIES``
+        total failures, rather than resetting the counter between each drain.
+        """
         with self._lock:
             for p in paths:
                 cnt = self._pending.retry_counts.get(p, 0) + 1
@@ -99,12 +105,27 @@ class _ChangeBuffer:
             if paths or deleted:
                 self._last_event_ts = time.monotonic()
 
+    def mark_success(self, paths: set[Path], deleted: set[Path]) -> None:
+        """在一批事件成功处理后清除其重试计数。
+
+        只有真正成功处理的路径才会被清除计数，从而允许下一次入队时从零开始。
+        """
+        with self._lock:
+            for p in paths | deleted:
+                self._pending.retry_counts.pop(p, None)
+
     def drain(self, *, force: bool = False) -> tuple[set[Path], set[Path]]:
         """若防抖窗口已过（或 force=True），返回并清空待处理集合。
 
         Returns
         -------
         (changed, deleted)
+
+        Note: ``retry_counts`` are intentionally preserved across drains.
+        They are only cleared by ``mark_success()`` after a successful
+        callback, or reset to ``_MAX_RETRIES + 1`` by ``re_enqueue_failed()``
+        when the limit is exceeded.  Clearing them here would cause every
+        drain to reset the counter, allowing infinite "first retry" loops.
         """
         with self._lock:
             if not (self._pending.changed or self._pending.deleted):
@@ -116,7 +137,8 @@ class _ChangeBuffer:
             deleted = set(self._pending.deleted)
             self._pending.changed.clear()
             self._pending.deleted.clear()
-            self._pending.retry_counts.clear()
+            # Do NOT clear retry_counts — they track cumulative failures and
+            # must survive across drain/re-enqueue cycles.
             return changed, deleted
 
 
@@ -231,7 +253,15 @@ class CodeRepositoryWatcher:
             try:
                 self._on_change(changed, deleted)
             except Exception:
-                logger.exception("shutdown drain 回调异常")
+                # We are shutting down — there is nowhere to re-enqueue.
+                # Log the specific paths so operators can manually re-trigger
+                # ingestion for anything that was lost.
+                logger.exception(
+                    "shutdown drain 回调异常，以下事件将丢失（%d 个变更，%d 个删除）："
+                    "\n  changed: %s\n  deleted: %s",
+                    len(changed), len(deleted),
+                    sorted(changed), sorted(deleted),
+                )
 
         self._stop_event.set()
         if self._flush_thread is not None:
@@ -276,12 +306,27 @@ class CodeRepositoryWatcher:
         logger.debug("已入队变更：%s", path)
 
     def _enqueue_deleted(self, path: Path) -> None:
-        """入队一个删除/移走的路径（无需文件存在）。"""
-        resolved = path.resolve()
-        if resolved.suffix.lower() not in self._watchable_ext:
+        """入队一个删除/移走的路径（无需文件存在）。
+
+        Note: For deleted files ``path.resolve()`` may not follow the same
+        symlink chain as when the file existed (the symlink itself may already
+        be gone).  We therefore check extension and excluded dirs against the
+        *original* path parts rather than the resolved path to avoid false
+        negatives.  The resolved path is still used as the state key so it
+        matches the key written during ingestion.
+        """
+        # Check extension and excluded dirs on the raw path (file may be gone).
+        if path.suffix.lower() not in self._watchable_ext:
             return
-        if any(part in self._exclude_dirs for part in resolved.parts):
+        if any(part in self._exclude_dirs for part in path.parts):
             return
+        # Use resolve() for the state key to match the key stored at ingest time.
+        # For a deleted regular file, os.path.abspath gives the same result
+        # without following a (now-missing) symlink.
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path.absolute()
         self._buffer.add_deleted(resolved)
         logger.debug("已入队删除：%s", resolved)
 
@@ -298,6 +343,9 @@ class CodeRepositoryWatcher:
             )
             try:
                 self._on_change(changed, deleted)
+                # Clear retry counts only after a fully successful callback so
+                # that persistent failures accumulate toward the retry limit.
+                self._buffer.mark_success(changed, deleted)
             except Exception:
                 logger.exception("增量入库回调异常，将重新入队")
                 self._buffer.re_enqueue_failed(changed, deleted)
@@ -368,6 +416,20 @@ def run_watch_service(
 
     watch_root = Path(watch_dir).resolve()
     out_root = Path(out_dir).resolve()
+
+    # Warn early if out_dir sits inside watch_dir.  Watchdog would then pick
+    # up every index/state file write as a new change event, potentially
+    # triggering an infinite ingest → write → re-trigger loop.
+    try:
+        out_root.relative_to(watch_root)
+        logger.warning(
+            "out_dir (%s) 位于 watch_dir (%s) 内部。"
+            "建议将产物目录移到监听目录之外，否则每次入库写入都会触发新的变更事件。",
+            out_root, watch_root,
+        )
+    except ValueError:
+        pass  # out_root is outside watch_root — correct configuration
+
     doc_version = get_repo_version(watch_root)
 
     def _on_change(changed_paths: set[Path], deleted_paths: set[Path]) -> None:
@@ -388,28 +450,38 @@ def run_watch_service(
             len(deleted_paths),
         )
 
+        # Surface per-file parse/ingest failures as an exception so that the
+        # watcher's retry mechanism re-enqueues the failed paths.  Unchanged
+        # files are not re-enqueued (they were skipped by hash check anyway).
+        if summary.failed_count > 0:
+            failed_paths = {
+                f["file_path"] for f in summary.failed if "file_path" in f
+            }
+            raise RuntimeError(
+                f"入库失败 {summary.failed_count} 个文件，将由 Watcher 重试: "
+                + ", ".join(sorted(failed_paths))
+            )
+
         if not rebuild_indexes:
             return
 
-        # Release-aware index rebuild: write to candidate paths, then atomically
-        # replace production paths so in-flight readers are never exposed to a
-        # partially-built index.
-        if fts_index_path is not None:
-            _rebuild_index_atomic(
-                build_fn=lambda cand: build_fts_index(
-                    processed_dir=out_root, index_path=cand
-                ),
-                target=Path(fts_index_path),
-                label="FTS",
-            )
-        if vector_index_path is not None:
-            _rebuild_index_atomic(
-                build_fn=lambda cand: build_vector_index(
-                    processed_dir=out_root, index_path=cand
-                ),
-                target=Path(vector_index_path),
-                label="向量",
-            )
+        # Rebuild both FTS and vector indexes to candidate paths *before*
+        # touching either production path.  Only when both builds succeed are
+        # both candidates swapped into production back-to-back.  This minimises
+        # the window during which FTS and vector are inconsistent and ensures
+        # that a failed build leaves the production indexes untouched.
+        _rebuild_indexes_atomic(
+            build_fts_fn=(
+                (lambda cand: build_fts_index(processed_dir=out_root, index_path=cand))
+                if fts_index_path is not None else None
+            ),
+            build_vec_fn=(
+                (lambda cand: build_vector_index(processed_dir=out_root, index_path=cand))
+                if vector_index_path is not None else None
+            ),
+            fts_target=Path(fts_index_path) if fts_index_path is not None else None,
+            vector_target=Path(vector_index_path) if vector_index_path is not None else None,
+        )
 
     watcher = CodeRepositoryWatcher(
         watch_dir=watch_root,
@@ -431,36 +503,69 @@ def run_watch_service(
             print("\n[watch-repo] 收到中断信号，正在 flush 剩余事件并停止…")
 
 
-def _rebuild_index_atomic(
-    build_fn: Callable[[Path], object],
-    target: Path,
-    label: str,
-) -> None:
-    """Build an index to a candidate path, then atomically replace *target*.
-
-    This ensures production readers never see a partially-written index even
-    if the build fails halfway.
-    """
-    candidate = target.with_suffix(target.suffix + ".candidate")
+def _remove_candidate(path: Path) -> None:
+    """Remove a candidate index path (file or directory), ignoring errors."""
     try:
-        # Remove stale candidate from a previous interrupted run.
-        if candidate.exists():
-            if candidate.is_dir():
-                shutil.rmtree(candidate)
-            else:
-                candidate.unlink()
-        logger.info("重建 %s 索引（候选路径：%s）…", label, candidate)
-        build_fn(candidate)
-        # Atomic replace: readers see either the old or the complete new index.
-        candidate.replace(target)
-        logger.info("%s 索引已更新：%s", label, target)
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _rebuild_indexes_atomic(
+    *,
+    build_fts_fn: Callable[[Path], object] | None,
+    build_vec_fn: Callable[[Path], object] | None,
+    fts_target: Path | None,
+    vector_target: Path | None,
+) -> None:
+    """Build FTS and/or vector indexes then atomically swap both into production.
+
+    Both indexes are built to candidate paths *before* either production path
+    is touched.  Only when all requested builds succeed are the candidates
+    renamed into production back-to-back.  This minimises the inconsistency
+    window between FTS and vector (a reader would have to query between the
+    two ``replace()`` calls to see mismatched indexes, which is far shorter
+    than the full build time) and guarantees that a failed build leaves the
+    production indexes untouched.
+
+    If only one index type is requested (the other target is None) this
+    function degrades gracefully to a single-index atomic swap.
+    """
+    candidates: list[tuple[Path, Path]] = []  # (candidate, target) pairs to swap
+
+    try:
+        if build_fts_fn is not None and fts_target is not None:
+            fts_cand = fts_target.with_suffix(fts_target.suffix + ".candidate")
+            _remove_candidate(fts_cand)
+            logger.info("重建 FTS 索引（候选：%s）…", fts_cand)
+            build_fts_fn(fts_cand)
+            candidates.append((fts_cand, fts_target))
+
+        if build_vec_fn is not None and vector_target is not None:
+            vec_cand = vector_target.with_suffix(vector_target.suffix + ".candidate")
+            _remove_candidate(vec_cand)
+            logger.info("重建向量索引（候选：%s）…", vec_cand)
+            build_vec_fn(vec_cand)
+            candidates.append((vec_cand, vector_target))
+
+        # All builds succeeded — swap candidates into production back-to-back.
+        for cand, target in candidates:
+            cand.replace(target)
+        if candidates:
+            labels = [str(t.name) for _, t in candidates]
+            logger.info("索引已原子更新：%s", ", ".join(labels))
+
     except Exception:
-        logger.exception("%s 索引重建失败，生产索引未被修改", label)
-        if candidate.exists():
-            try:
-                if candidate.is_dir():
-                    shutil.rmtree(candidate)
-                else:
-                    candidate.unlink()
-            except OSError:
-                pass
+        logger.exception("索引重建失败，生产索引未被修改")
+        # Clean up any partially-built candidates.
+        for cand, _ in candidates:
+            _remove_candidate(cand)
+        # Also clean up candidates that were built but not yet in the list
+        # (build_vec_fn failed after build_fts_fn succeeded).
+        if build_vec_fn is not None and vector_target is not None:
+            vec_cand = vector_target.with_suffix(vector_target.suffix + ".candidate")
+            _remove_candidate(vec_cand)
+        raise
