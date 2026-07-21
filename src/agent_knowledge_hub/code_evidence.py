@@ -111,7 +111,18 @@ def create_evidence(
       - text = chunk.text（无脱敏）
       - text_hash = source_text_hash = sha256(chunk.text)
       - redactions = ()
+
+    不变量：chunk.snapshot_id 必须与 snapshot.snapshot_id 一致，
+    否则会产生跨 snapshot 的伪证据（commit_sha 来自 snapshot，
+    而 snapshot_id 来自 chunk，两者不匹配）。
     """
+    if chunk.snapshot_id != snapshot.snapshot_id:
+        raise ValueError(
+            f"chunk.snapshot_id {chunk.snapshot_id!r} 与 "
+            f"snapshot.snapshot_id {snapshot.snapshot_id!r} 不一致，"
+            "拒绝生成跨 snapshot 的伪证据。"
+        )
+
     text             = chunk.text
     text_hash        = sha256_text(text)
     source_text_hash = text_hash          # Phase A：无脱敏，两者相同

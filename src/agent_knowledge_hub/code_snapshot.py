@@ -19,7 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from agent_knowledge_hub.utils import file_sha256, utc_now_iso
+from agent_knowledge_hub.utils import file_sha256, sha256_text, utc_now_iso
 
 # ---------------------------------------------------------------------------
 # 版本常量
@@ -116,6 +116,34 @@ def resolve_remote_url(repo_dir: Path) -> str | None:
     return url
 
 
+def _git_file_bytes(repo_dir: Path, commit_sha: str, rel_posix: str) -> bytes | None:
+    """
+    从 git 对象库读取指定 commit 中某文件的字节内容。
+    不读取磁盘文件，避免脏工作树污染证据内容。
+    返回 None 表示文件在该 commit 中不存在或读取失败。
+    """
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{commit_sha}:{rel_posix}"],
+            cwd=repo_dir,
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            return result.stdout
+    except Exception:
+        pass
+    return None
+
+
+def _is_worktree_dirty(repo_dir: Path) -> bool:
+    """检查工作树是否有未提交的修改（包括暂存和未暂存的变更）。"""
+    output = _git(["status", "--porcelain"], repo_dir)
+    if output is None:
+        return False   # 无 git，按非脏处理（使用 no-git- 前缀）
+    return bool(output.strip())
+
+
 def resolve_submodule_commits(repo_dir: Path) -> dict[str, str]:
     """返回 {submodule_relative_path: commit_sha}；无 submodule 时返回 {}。"""
     output = _git(["submodule", "status", "--recursive"], repo_dir)
@@ -160,12 +188,17 @@ def compute_index_config_hash(
     exclude_dirs: frozenset[str],
     extensions: frozenset[str],
     parser_versions: dict[str, str],
+    chunk_params: dict[str, Any] | None = None,
 ) -> str:
-    """相同配置 → 相同哈希，确保不同配置产生不同 snapshot。"""
+    """
+    相同配置 → 相同哈希，确保不同配置产生不同 snapshot。
+    chunk_params 纳入哈希，防止分块策略变更后 snapshot_id 不变。
+    """
     obj = {
         "exclude_dirs":    sorted(exclude_dirs),
         "extensions":      sorted(extensions),
         "parser_versions": {k: parser_versions[k] for k in sorted(parser_versions)},
+        "chunk_params":    {k: chunk_params[k] for k in sorted(chunk_params)} if chunk_params else {},
     }
     return _sha256_of(obj)[:16]
 
@@ -372,12 +405,14 @@ def create_snapshot(
     exclude_dirs: frozenset[str],
     extensions: frozenset[str],
     parent_snapshot_id: str | None = None,
+    chunk_params: dict[str, Any] | None = None,
 ) -> RepositorySnapshot:
     """
     解析 git 元数据，生成处于 PLANNED 状态的 RepositorySnapshot。
 
     相同 repo_dir + 相同 commit + 相同配置 → 相同 snapshot_id。
     产物不含本机绝对路径。
+    chunk_params 纳入 index_config_hash，确保分块策略变更时 snapshot_id 也变化。
     """
     repo_dir = repo_dir.resolve()
     if not repo_dir.is_dir():
@@ -397,7 +432,7 @@ def create_snapshot(
 
     parser_versions: dict[str, str] = {"fallback": PARSER_VERSION_FALLBACK}
     index_config_hash = compute_index_config_hash(
-        exclude_dirs, extensions, parser_versions
+        exclude_dirs, extensions, parser_versions, chunk_params
     )
     snapshot_id = compute_snapshot_id(
         repo_id, commit_sha, submodule_commits, index_config_hash
@@ -435,17 +470,43 @@ def _detect_encoding(abs_path: Path) -> str | None:
     return None
 
 
+def _detect_encoding_from_bytes(data: bytes) -> str | None:
+    """从字节内容尝试常见编码，返回第一个成功的；全部失败返回 None。"""
+    for enc in ("utf-8", "utf-8-sig", "gbk", "gb18030", "latin-1"):
+        try:
+            data.decode(enc)
+            return enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return None
+
+
 def create_file_record(
     abs_path: Path,
     repo_dir: Path,
     snapshot: RepositorySnapshot,
+    *,
+    source_bytes: bytes | None = None,
 ) -> FileRecord:
     """
     为单个文件构建 FileRecord。
     abs_path 必须在 repo_dir 内部；relative_path 永远是 POSIX 相对路径。
+
+    source_bytes：若提供则使用该字节内容计算哈希和大小，而非读取磁盘文件。
+    用于脏工作树场景：通过 git show 读取 commit 版本内容，保证 Evidence 真实性。
     """
     abs_path = abs_path.resolve()
     repo_dir = repo_dir.resolve()
+
+    # Symlink 越界检测：拒绝指向 repo 外部的 symlink
+    if abs_path.is_symlink():
+        real = abs_path.resolve()
+        try:
+            real.relative_to(repo_dir)
+        except ValueError:
+            raise ValueError(
+                f"Symlink 越界：{abs_path} -> {real} 指向 repo 外部，拒绝索引"
+            )
 
     try:
         rel = abs_path.relative_to(repo_dir)
@@ -457,17 +518,28 @@ def create_file_record(
     relative_path = rel.as_posix()   # 关键：只用相对路径，不含绝对路径
     rel_parts     = rel.parts
 
-    content_hash = file_sha256(abs_path)
-    size_bytes   = abs_path.stat().st_size
-
-    # 二进制检测：先看扩展名，再尝试文本编码
     is_binary_ext = abs_path.suffix.lower() in _BINARY_EXTENSIONS
-    if is_binary_ext:
-        encoding = None
-        binary   = True
+
+    if source_bytes is not None:
+        # 使用 git 内容：哈希和大小来自 git 对象，不来自磁盘
+        content_hash = hashlib.sha256(source_bytes).hexdigest()
+        size_bytes   = len(source_bytes)
+        if is_binary_ext:
+            encoding = None
+            binary   = True
+        else:
+            encoding = _detect_encoding_from_bytes(source_bytes)
+            binary   = (encoding is None)
     else:
-        encoding = _detect_encoding(abs_path)
-        binary   = (encoding is None)
+        # 使用磁盘文件（需确保工作树干净）
+        content_hash = file_sha256(abs_path)
+        size_bytes   = abs_path.stat().st_size
+        if is_binary_ext:
+            encoding = None
+            binary   = True
+        else:
+            encoding = _detect_encoding(abs_path)
+            binary   = (encoding is None)
 
     language    = detect_language(abs_path) if not binary else "binary"
     parser_mode = _select_parser_mode(language, binary)

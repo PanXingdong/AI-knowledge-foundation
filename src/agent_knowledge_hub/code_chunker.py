@@ -199,6 +199,27 @@ class _RawBlock:
     kind:    ChunkKind
 
 
+def _sig_start(lines: list[str], open_brace_0: int) -> int:
+    """
+    从 { 所在行往前查找函数/类签名的起始行（0-indexed）。
+    向前扫描至多 8 行，遇到以下情况则停止，返回停止点的下一行（即签名开始行）：
+      - 空行（语句分隔符）
+      - 以 ; { } 结尾的行（上一语句结束）
+      - 预处理指令行（#include / #define 等）
+    这样多行签名（Allman 风格 / 多参数跨行）会被完整纳入块范围。
+    """
+    limit = max(0, open_brace_0 - 8)
+    for i in range(open_brace_0 - 1, limit - 1, -1):
+        stripped = lines[i].rstrip()
+        if not stripped:                          # 空行
+            return i + 1
+        if stripped.endswith((";", "{", "}")):    # 上一语句结束
+            return i + 1
+        if stripped.lstrip().startswith("#"):     # 预处理指令
+            return i + 1
+    return limit
+
+
 def _classify_block(lines: list[str], block_start_0: int) -> ChunkKind:
     """
     根据 block_start_0 前几行的关键字猜测块类型。
@@ -219,10 +240,17 @@ def _classify_block(lines: list[str], block_start_0: int) -> ChunkKind:
     return ChunkKind.FUNCTION
 
 
-def _find_structural_blocks(lines: list[str]) -> list[_RawBlock]:
+def _find_structural_blocks(
+    lines: list[str],
+    skip_lines: set[int] | None = None,
+) -> list[_RawBlock]:
     """
     用大括号跟踪识别顶层结构块（深度 0→1→0）。
     返回 _RawBlock 列表，不含宏块（宏块由 _find_macro_blocks 处理）。
+
+    skip_lines：已被宏块占用的行集合（0-indexed）。
+    跳过这些行，防止宏块与结构块重叠产生重复 Chunk。
+    block_start 会向前扩展至多行签名的起始行（_sig_start）。
     """
     blocks: list[_RawBlock] = []
     n = len(lines)
@@ -231,6 +259,10 @@ def _find_structural_blocks(lines: list[str]) -> list[_RawBlock]:
     in_block_comment = False
 
     for i, raw_line in enumerate(lines):
+        # 跳过已被宏块占用的行，防止重叠
+        if skip_lines and i in skip_lines:
+            continue
+
         # 多行宏不参与大括号跟踪
         if _MACRO_DEF_RE.match(raw_line):
             continue
@@ -239,7 +271,8 @@ def _find_structural_blocks(lines: list[str]) -> list[_RawBlock]:
         delta = _count_braces(stripped)
 
         if depth == 0 and delta > 0:
-            block_start = i
+            # 向前扩展：纳入多行签名（Allman 风格 / 跨行参数列表）
+            block_start = _sig_start(lines, i)
             depth += delta
         elif depth > 0:
             depth += delta
@@ -444,8 +477,13 @@ def chunk_source_file(
     use_brace_tracking = file_record.language in _BRACE_LANGUAGES
 
     if use_brace_tracking:
-        # --- 多行宏块 ---
-        for (ms, me) in _find_macro_blocks(lines):
+        # --- 多行宏块（先处理，占位后续结构块检测会跳过这些行）---
+        macro_ranges = _find_macro_blocks(lines)
+        macro_occupied: set[int] = set()
+        for (ms, me) in macro_ranges:
+            macro_occupied.update(range(ms, me + 1))
+
+        for (ms, me) in macro_ranges:
             for (ss, se) in _split_oversized(
                 lines,
                 _RawBlock(ms, me, ChunkKind.MACRO_BLOCK),
@@ -454,13 +492,11 @@ def chunk_source_file(
                 chunks.append(_make_chunk(lines, ss, se, ChunkKind.MACRO_BLOCK, file_record))
                 occupied.update(range(ss, se + 1))
 
-        # --- 结构块（函数/类/命名空间等）---
-        raw_blocks = _find_structural_blocks(lines)
+        # --- 结构块（函数/类/命名空间等），跳过宏块占用的行防止重叠 ---
+        raw_blocks = _find_structural_blocks(lines, skip_lines=macro_occupied)
         for rb in raw_blocks:
             for (ss, se) in _split_oversized(lines, rb, max_chunk_lines):
-                hint = None if rb.kind in (ChunkKind.CLASS, ChunkKind.STRUCT,
-                                            ChunkKind.UNION, ChunkKind.NAMESPACE) else None
-                chunks.append(_make_chunk(lines, ss, se, rb.kind, file_record, hint))
+                chunks.append(_make_chunk(lines, ss, se, rb.kind, file_record))
                 occupied.update(range(ss, se + 1))
 
     # --- 行窗口：填充空隙（或全文件，当非 C/C++ 时）---

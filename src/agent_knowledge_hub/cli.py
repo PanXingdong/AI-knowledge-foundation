@@ -337,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
                 DEFAULT_EXCLUDE_DIRS,
                 TARGET_EXTENSIONS,
                 scan_repo,
-                scan_repo_with_snapshot,
+                scan_repo_full,
                 write_csv,
                 write_snapshot_bundle,
             )
@@ -347,23 +347,35 @@ def main(argv: list[str] | None = None) -> int:
             ) | frozenset(args.exclude_dir or [])
 
             if args.snapshot_output:
-                # Phase A 新路径：输出 RepositorySnapshot + files.jsonl
-                snapshot, file_records = scan_repo_with_snapshot(
+                # Phase A 新路径：输出完整产物（Snapshot + FileRecord + Chunk + Evidence）
+                snapshot, file_records, chunks, evidences = scan_repo_full(
                     repo_dir, exclude_dirs, TARGET_EXTENSIONS
                 )
-                paths = write_snapshot_bundle(snapshot, file_records, args.snapshot_output)
+                paths = write_snapshot_bundle(
+                    snapshot, file_records, args.snapshot_output,
+                    chunks=chunks, evidences=evidences, force=True,
+                )
                 payload = {
-                    "snapshot_id":   snapshot.snapshot_id,
-                    "commit_sha":    snapshot.commit_sha,
-                    "scanned_files": len(file_records),
-                    "snapshot_json": str(paths["snapshot"]),
-                    "files_jsonl":   str(paths["files"]),
+                    "snapshot_id":     snapshot.snapshot_id,
+                    "commit_sha":      snapshot.commit_sha,
+                    "scanned_files":   len(file_records),
+                    "total_chunks":    len(chunks),
+                    "total_evidences": len(evidences),
+                    "snapshot_json":   str(paths["snapshot"]),
+                    "files_jsonl":     str(paths["files"]),
+                    "chunks_jsonl":    str(paths["chunks"]),
+                    "evidences_jsonl": str(paths["evidences"]),
                 }
-            else:
+            elif args.output:
                 # 旧路径：保持向后兼容，输出 CSV
                 rows = scan_repo(repo_dir, exclude_dirs, TARGET_EXTENSIONS)
                 write_csv(rows, args.output)
                 payload = {"scanned_files": len(rows), "output": str(args.output)}
+            else:
+                raise ValueError(
+                    "必须指定 --snapshot-output DIR（Phase A 产物）"
+                    " 或 --output FILE（CSV 旧格式），二者至少提供一个。"
+                )
         elif args.command == "serve-mcp":
             import os as _os
             import sys as _sys
@@ -767,8 +779,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="代码仓根目录（如 ClusterHMI）。",
     )
     manifest_gen_parser.add_argument(
-        "--output", required=True, type=Path,
-        help="输出 CSV 路径。",
+        "--output", required=False, default=None, type=Path,
+        help="输出 CSV 路径（旧格式）。与 --snapshot-output 互斥；至少提供一个。",
     )
     manifest_gen_parser.add_argument(
         "--exclude-dir", action="append", default=[],
