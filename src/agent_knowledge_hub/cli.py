@@ -35,6 +35,10 @@ from agent_knowledge_hub.quality import (
     build_parse_quality_summary,
     write_parse_quality_summary_bundle,
 )
+from agent_knowledge_hub.quality_observe import (
+    evaluate_processed_dir_observe,
+    write_quality_observation_bundle,
+)
 from agent_knowledge_hub.release_manifest import (
     activate_release,
     load_release_manifest,
@@ -180,6 +184,28 @@ def main(argv: list[str] | None = None) -> int:
                     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
                 )
+        elif args.command == "evaluate-quality":
+            try:
+                result = evaluate_processed_dir_observe(
+                    args.processed_dir,
+                    policy_path=args.policy_path,
+                )
+                paths = write_quality_observation_bundle(args.output_dir, result)
+            except (
+                FileNotFoundError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 2
+            payload = {
+                "schema_version": result.report.schema_version,
+                "policy_id": result.report.policy_id,
+                "policy_version": result.report.policy_version,
+                "mode": result.report.mode,
+                "determinism_fingerprint": result.report.determinism_fingerprint,
+                **{key: str(value) for key, value in paths.items()},
+            }
         elif args.command == "parse-quality-summary":
             summary = build_parse_quality_summary(args.processed_dir)
             if args.output_dir:
@@ -456,6 +482,14 @@ def _build_parser() -> argparse.ArgumentParser:
     trace_parser.add_argument("--evidence-id", required=True)
     trace_parser.add_argument("--release-manifest-path", type=Path)
     trace_parser.add_argument("--output-path", type=Path)
+
+    quality_observe_parser = subparsers.add_parser(
+        "evaluate-quality",
+        help="Evaluate processed artifacts in observe mode without changing publication.",
+    )
+    quality_observe_parser.add_argument("--processed-dir", required=True, type=Path)
+    quality_observe_parser.add_argument("--output-dir", required=True, type=Path)
+    quality_observe_parser.add_argument("--policy-path", type=Path)
 
     quality_parser = subparsers.add_parser(
         "parse-quality-summary",
