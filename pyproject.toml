@@ -10,6 +10,7 @@ dependencies = [
   "python-docx",
   "uvicorn",
   "lark-oapi",
+  "watchdog",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,9 @@ ocr = [
   "pymupdf",
   "rapidocr",
   "onnxruntime",
+]
+mcp = [
+  "mcp[cli]>=1.0",
 ]
 test = [
   "pytest",

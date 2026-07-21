@@ -36,8 +36,15 @@ _run_ingest.py
 qnx-knowledge/parse-quality-summary.json
 qnx-knowledge/parse-quality-summary.md
 qnx-knowledge/qnx-doc-manifest.csv
+qnx-knowledge/cluster-code-manifest.csv
 qnx-knowledge/ingest*.log
 qnx-knowledge/processed/
+qnx-knowledge/cluster-processed/
+qnx-knowledge/watch-repo.pid
+qnx-knowledge/watch-repo.log
+
+# Egg-info build artifacts
+src/*.egg-info/
 
 # Confidential or raw documents
 samples/raw/*

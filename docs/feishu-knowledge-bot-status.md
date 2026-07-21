@@ -259,6 +259,32 @@ scripts/run_real_query_regression.py
 
 当前 candidate facts 已能覆盖部分 Screen 工具 / demo / API feature。
 
+## One-shot Chain
+
+如果你已经把飞书机器人创建好，并且希望把“知识库预处理 -> 质量门禁 -> Layer2 冒烟 -> 飞书长连接启动”串成一条完整链路，推荐直接使用：
+
+```bash
+./scripts/run-feishu-knowledge-chain.sh \
+  --processed-dir "/mnt/d/AI Knowledge/AI-knowledge-foundation/qnx-knowledge/processed" \
+  --smoke-query "QNX 里有哪些可用的调试工具和 demo？"
+```
+
+这个入口会按下面顺序执行：
+
+```text
+inventory
+  -> manifest ingest
+  -> parse-quality-summary
+  -> validate-processed
+  -> layer2-run smoke check
+  -> start-context-pack API
+  -> start Feishu bot
+```
+
+如果不传参数，而仓库下已经存在 `qnx-knowledge/processed`，脚本会自动识别这份目录并跳过预处理。
+
+如果现成 processed 目录里存在少量无效文档版本，例如 `chunks.jsonl` 为空，脚本会自动生成一个过滤后的运行目录，保留其余有效文档继续完成 Layer2 冒烟和飞书启动。
+
 但还需要扩展：
 
 - memory carveout:

@@ -442,19 +442,43 @@ def build_chunks(
         if not block_text:
             continue
 
-        # --- Filter 1: noise sections ---
-        if _is_noise_block(block.section_path, block_text):
-            continue
-
-        # --- Filter 2: fragment blocks (page headers/footers, dates, etc.) ---
-        if _is_fragment_block(block_text):
-            continue
-
         block_type = block.block_type  # "paragraph" | "heading" | "table"
+        # Code blocks may carry synthetic section path "0" and identifier-like
+        # lines that look like fragments; keep them to preserve source retrieval.
+        if block_type != "code":
+            # --- Filter 1: noise sections ---
+            if _is_noise_block(block.section_path, block_text):
+                continue
+
+            # --- Filter 2: fragment blocks (page headers/footers, dates, etc.) ---
+            if _is_fragment_block(block_text):
+                continue
+
         block_evidence = evidence_by_block.get(block.block_id)
         section_changed = (
             bool(current_section_path) and block.section_path != current_section_path
         )
+
+        # --- Code blocks (atomic — never sentence-split) ---
+        # Code blocks arrive pre-sized from parse_source_code() (≤ _CODE_CHUNK_LINES
+        # lines each).  They are flushed individually so sentence-splitting logic
+        # never sees code text, preserving indentation, blank lines, and structure.
+        if block_type == "code":
+            if current_texts and (
+                section_changed or _over_budget(current_texts, block_text)
+            ):
+                flush(preserve_overlap=False)
+                if section_changed:
+                    _discard_pending_headings()
+            current_section_path = list(block.section_path)
+            _drain_pending_headings()
+            current_texts.append(block_text)
+            if block_evidence:
+                current_evidence.append(block_evidence)
+            _absorb_page(block.page_start, block.page_end)
+            # Flush immediately: each code block is its own chunk.
+            flush(preserve_overlap=False)
+            continue
 
         # --- Heading blocks ---
         # Headings are buffered in *pending_heading_texts* rather than appended

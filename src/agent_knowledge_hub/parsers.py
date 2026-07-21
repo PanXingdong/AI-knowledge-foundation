@@ -97,6 +97,28 @@ SUPPORTED_EXTENSIONS = {
     ".md",
     ".markdown",
     ".txt",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".inl",
+    ".py",
+    ".sh",
+    ".cmake",
+    ".mk",
+    ".java",
+    ".js",
+    ".ts",
+    ".rs",
+    ".proto",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
     ".html",
     ".htm",
     ".pdf",
@@ -112,6 +134,13 @@ SUPPORTED_EXTENSIONS = {
 }
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
+_CODE_EXTENSIONS = {
+    ".c", ".cc", ".cpp", ".cxx",
+    ".h", ".hh", ".hpp", ".hxx", ".inl",
+    ".py", ".sh", ".cmake", ".mk",
+    ".java", ".js", ".ts", ".rs", ".proto",
+    ".json", ".yaml", ".yml", ".xml",
+}
 
 _MIN_TRUSTED_PDF_TEXT_CHARS = 40
 _MIN_CJK_CHARS_FOR_MOJIBAKE_CHECK = 20
@@ -133,6 +162,8 @@ def parse_document(path: Path) -> ParsedDocument:
         return parse_markdown(path)
     if suffix == ".txt":
         return parse_text(path)
+    if suffix in _CODE_EXTENSIONS:
+        return parse_source_code(path)
     if suffix in {".html", ".htm"}:
         return parse_html(path)
     if suffix == ".pdf":
@@ -178,6 +209,140 @@ def parse_text(path: Path) -> ParsedDocument:
             source_format="text",
         ),
     )
+
+
+def parse_source_code(path: Path) -> ParsedDocument:
+    """Parse a source code file into line-preserving code blocks.
+
+    Each block keeps the original indentation and blank lines verbatim.
+    ``page_start`` / ``page_end`` carry 1-based line numbers so retrievers can
+    show precise file locations.  The file is never sentence-split; natural
+    split points (function / class boundaries) are used instead, with a
+    hard-capped window of ``_CODE_CHUNK_LINES`` lines as a fallback.
+    """
+    text = read_text_with_fallback(path)
+    # Normalise line endings only — do NOT strip indentation or blank lines.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.strip():
+        return ParsedDocument(
+            source_format="source_code",
+            parser_name="stdlib-code-parser",
+            page_count=None,
+            blocks=[],
+            quality_report=_build_generic_quality_report(
+                blocks=[], source_format="source_code"
+            ),
+        )
+
+    lines = normalized.split("\n")
+    blocks = _split_code_into_blocks(path, lines)
+    return ParsedDocument(
+        source_format="source_code",
+        parser_name="stdlib-code-parser",
+        page_count=None,
+        blocks=blocks,
+        quality_report=_build_generic_quality_report(
+            blocks=blocks,
+            source_format="source_code",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Code-aware block splitter
+# ---------------------------------------------------------------------------
+
+# Maximum lines per code block.  Larger units are split at this boundary
+# so they fit within the retriever's token budget.
+_CODE_CHUNK_LINES: int = 80
+
+# Python: top-level definition (no leading whitespace)
+_PY_TOPLEVEL_RE: re.Pattern[str] = re.compile(
+    r"^(?:def |async def |class |@)"
+)
+
+# C / C++ / Java / JS / TS / Rust: top-level opening brace on its own line
+# OR function-like definition: non-indented identifier followed by `(`.
+# We accept "}" on its own line as a potential split point after a definition.
+_C_FUNC_START_RE: re.Pattern[str] = re.compile(
+    r"^[A-Za-z_~][A-Za-z0-9_\s\*\&:<>]*\s+[A-Za-z_][A-Za-z0-9_]*\s*\("
+)
+
+
+def _find_code_split_points(suffix: str, lines: list[str]) -> list[int]:
+    """Return sorted 0-based line indices where a new code block should start.
+
+    Always includes index 0.  Language-specific heuristics find natural
+    boundaries; a hard-cap at ``_CODE_CHUNK_LINES`` adds extra splits when
+    no boundary is found within the window.
+    """
+    natural: list[int] = [0]
+    n = len(lines)
+
+    if suffix == ".py":
+        for i, line in enumerate(lines):
+            if i == 0:
+                continue
+            if _PY_TOPLEVEL_RE.match(line):
+                natural.append(i)
+    elif suffix in {
+        ".c", ".cc", ".cpp", ".cxx",
+        ".h", ".hh", ".hpp", ".hxx", ".inl",
+        ".java", ".js", ".ts", ".rs",
+    }:
+        # Non-indented lines that look like function signatures
+        for i, line in enumerate(lines):
+            if i == 0:
+                continue
+            if line and not line[0].isspace() and _C_FUNC_START_RE.match(line):
+                natural.append(i)
+
+    # Enforce hard cap: if the gap between split points exceeds the budget,
+    # insert intermediate breaks every _CODE_CHUNK_LINES lines.
+    result: list[int] = []
+    prev = 0
+    for sp in sorted(set(natural)):
+        while sp - prev > _CODE_CHUNK_LINES:
+            prev += _CODE_CHUNK_LINES
+            result.append(prev)
+        result.append(sp)
+        prev = sp
+    # Handle tail beyond last natural split
+    while n - prev > _CODE_CHUNK_LINES:
+        prev += _CODE_CHUNK_LINES
+        result.append(prev)
+
+    return sorted(set(result))
+
+
+def _split_code_into_blocks(path: Path, lines: list[str]) -> list[ParsedBlock]:
+    """Split *lines* into ``ParsedBlock`` objects with preserved text.
+
+    ``page_start`` and ``page_end`` store 1-based line numbers so consumers
+    (MCP tools, evidence tracer) can report exact file locations.
+    """
+    suffix = path.suffix.lower()
+    split_points = _find_code_split_points(suffix, lines)
+    n = len(lines)
+    # Append sentinel
+    boundaries = split_points + [n]
+
+    blocks: list[ParsedBlock] = []
+    for idx in range(len(boundaries) - 1):
+        start = boundaries[idx]
+        end = boundaries[idx + 1]
+        chunk_text = "\n".join(lines[start:end]).rstrip("\n")
+        if not chunk_text.strip():
+            continue
+        blocks.append(
+            ParsedBlock(
+                block_type="code",
+                text=chunk_text,
+                page_start=start + 1,   # 1-based, inclusive
+                page_end=end,           # 1-based, inclusive
+            )
+        )
+    return blocks
 
 
 def parse_html(path: Path) -> ParsedDocument:

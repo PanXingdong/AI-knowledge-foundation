@@ -344,6 +344,113 @@ def main(argv: list[str] | None = None) -> int:
                 eval_run_dir=args.eval_run_dir,
             )
             payload = summary.to_dict()
+        elif args.command == "watch-repo":
+            from agent_knowledge_hub.code_watcher import run_watch_service
+            run_watch_service(
+                watch_dir=args.watch_dir,
+                out_dir=args.out_dir,
+                project=args.project,
+                owner=args.owner,
+                fts_index_path=args.fts_index_path,
+                vector_index_path=args.vector_index_path,
+                exclude_dirs=set(args.exclude_dir) if args.exclude_dir else None,
+                debounce_seconds=args.debounce_seconds,
+                rebuild_indexes=not args.no_rebuild_indexes,
+            )
+            return 0
+        elif args.command == "generate-code-manifest":
+            from agent_knowledge_hub.code_manifest import (
+                DEFAULT_EXCLUDE_DIRS,
+                TARGET_EXTENSIONS,
+                scan_repo,
+                scan_repo_full,
+                write_csv,
+                write_snapshot_bundle,
+            )
+            repo_dir = args.repo_dir.resolve()
+            exclude_dirs = (
+                frozenset[str]() if args.no_default_excludes else DEFAULT_EXCLUDE_DIRS
+            ) | frozenset(args.exclude_dir or [])
+
+            if args.snapshot_output:
+                # Phase A 新路径：输出完整产物（Snapshot + FileRecord + Chunk + Evidence）
+                snapshot, file_records, chunks, evidences = scan_repo_full(
+                    repo_dir, exclude_dirs, TARGET_EXTENSIONS
+                )
+                paths = write_snapshot_bundle(
+                    snapshot, file_records, args.snapshot_output,
+                    chunks=chunks, evidences=evidences, force=True,
+                )
+                payload = {
+                    "snapshot_id":     snapshot.snapshot_id,
+                    "commit_sha":      snapshot.commit_sha,
+                    "scanned_files":   len(file_records),
+                    "total_chunks":    len(chunks),
+                    "total_evidences": len(evidences),
+                    "snapshot_json":   str(paths["snapshot"]),
+                    "files_jsonl":     str(paths["files"]),
+                    "chunks_jsonl":    str(paths["chunks"]),
+                    "evidences_jsonl": str(paths["evidences"]),
+                }
+            elif args.output:
+                # 旧路径：保持向后兼容，输出 CSV
+                rows = scan_repo(repo_dir, exclude_dirs, TARGET_EXTENSIONS)
+                write_csv(rows, args.output)
+                payload = {"scanned_files": len(rows), "output": str(args.output)}
+            else:
+                raise ValueError(
+                    "必须指定 --snapshot-output DIR（Phase A 产物）"
+                    " 或 --output FILE（CSV 旧格式），二者至少提供一个。"
+                )
+        elif args.command == "serve-mcp":
+            import os as _os
+            import sys as _sys
+            import time as _time
+            from agent_knowledge_hub.mcp_server import (
+                create_mcp_server,
+                create_mcp_server_with_repos,
+            )
+            from agent_knowledge_hub.retrieval import prewarm as _prewarm
+            code_dir = args.code_processed_dir or (
+                Path(_os.environ["CLUSTER_CODE_PROCESSED_DIR"])
+                if "CLUSTER_CODE_PROCESSED_DIR" in _os.environ
+                else None
+            )
+            docs_dir = args.docs_processed_dir or (
+                Path(_os.environ["QNX_DOCS_PROCESSED_DIR"])
+                if "QNX_DOCS_PROCESSED_DIR" in _os.environ
+                else None
+            )
+            if code_dir or docs_dir:
+                server = create_mcp_server_with_repos(
+                    code_processed_dir=code_dir,
+                    docs_processed_dir=docs_dir,
+                    host=args.host,
+                    port=args.port,
+                    streamable_http_path=args.streamable_http_path,
+                )
+            else:
+                server = create_mcp_server(
+                    host=args.host,
+                    port=args.port,
+                    streamable_http_path=args.streamable_http_path,
+                )
+            # Pre-warm retrieval caches before the HTTP server starts.
+            # Without this, the first MCP tool call loads ~44k chunks (~100s) and
+            # exceeds client timeouts (e.g. Tongyi Lingma / Qoder).
+            if _os.environ.get("KNOWLEDGE_HUB_SKIP_PREWARM", "") != "1":
+                for _pw_dir in [code_dir, docs_dir]:
+                    if _pw_dir:
+                        print(f"[mcp-prewarm] prewarming {_pw_dir} ...", file=_sys.stderr, flush=True)
+                        _t0 = _time.time()
+                        try:
+                            _prewarm(_pw_dir)
+                        except Exception as _exc:
+                            print(f"[mcp-prewarm] warning: prewarm failed for {_pw_dir}: {_exc}", file=_sys.stderr, flush=True)
+                        print(f"[mcp-prewarm] done in {_time.time()-_t0:.1f}s", file=_sys.stderr, flush=True)
+                print("[mcp-prewarm] caches ready — starting HTTP server", file=_sys.stderr, flush=True)
+            server.run(transport=args.transport)
+            return 0
         elif args.command == "dependency-check":
             report = check_runtime_dependencies()
             if args.output_dir:
@@ -668,6 +775,64 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     dependency_parser.add_argument("--output-dir", type=Path)
 
+    watch_parser = subparsers.add_parser(
+        "watch-repo",
+        help="监听代码仓目录，文件变更后自动增量入库并重建检索索引。",
+    )
+    watch_parser.add_argument(
+        "--watch-dir", required=True, type=Path,
+        help="要监听的代码仓根目录（如 ClusterHMI）。",
+    )
+    watch_parser.add_argument(
+        "--out-dir", required=True, type=Path,
+        help="知识库产物输出目录（processed/）。",
+    )
+    watch_parser.add_argument("--project", default="ClusterHMI")
+    watch_parser.add_argument("--owner", default="PATAC")
+    watch_parser.add_argument("--fts-index-path", type=Path)
+    watch_parser.add_argument("--vector-index-path", type=Path)
+    watch_parser.add_argument(
+        "--exclude-dir", action="append", default=[],
+        help="排除的目录名（可多次指定）。默认排除 KanziEngine/someip/ClusterHMIPrebuilts。",
+    )
+    watch_parser.add_argument(
+        "--debounce-seconds", type=float, default=3.0,
+        help="防抖等待时间（秒），连续变更会被合并处理，默认 3 秒。",
+    )
+    watch_parser.add_argument(
+        "--no-rebuild-indexes", action="store_true",
+        help="入库后不自动重建检索索引。",
+    )
+
+    manifest_gen_parser = subparsers.add_parser(
+        "generate-code-manifest",
+        help="扫描代码仓目录，生成知识库接入清单 CSV。",
+    )
+    manifest_gen_parser.add_argument(
+        "--repo-dir", required=True, type=Path,
+        help="代码仓根目录（如 ClusterHMI）。",
+    )
+    manifest_gen_parser.add_argument(
+        "--output", required=False, default=None, type=Path,
+        help="输出 CSV 路径（旧格式）。与 --snapshot-output 互斥；至少提供一个。",
+    )
+    manifest_gen_parser.add_argument(
+        "--exclude-dir", action="append", default=[],
+        help="排除的目录名（可多次指定）。",
+    )
+    manifest_gen_parser.add_argument(
+        "--no-default-excludes", action="store_true",
+        help="不使用默认排除列表。",
+    )
+    manifest_gen_parser.add_argument(
+        "--snapshot-output", type=Path, default=None,
+        metavar="DIR",
+        help=(
+            "（Phase A）若指定此目录，以 RepositorySnapshot + files.jsonl 格式输出，"
+            "产物不含绝对路径。与 --output (CSV) 互斥，优先级高于 --output。"
+        ),
+    )
+
     contract_parser = subparsers.add_parser(
         "validate-processed",
         help="Validate processed Layer1 outputs against the Layer1 -> Layer2 contract.",
@@ -679,6 +844,40 @@ def _build_parser() -> argparse.ArgumentParser:
         "--require-valid",
         action="store_true",
         help="Return a non-zero exit code when contract errors are found.",
+    )
+
+    mcp_parser = subparsers.add_parser(
+        "serve-mcp",
+        help="Run the MCP server for Claude Code / Claude Desktop integration.",
+    )
+    mcp_parser.add_argument(
+        "--transport",
+        default="streamable-http",
+        choices=("stdio", "sse", "streamable-http"),
+        help="MCP transport protocol (default: streamable-http).",
+    )
+    mcp_parser.add_argument("--host", default="127.0.0.1")
+    mcp_parser.add_argument("--port", type=int, default=8788)
+    mcp_parser.add_argument("--streamable-http-path", default="/mcp")
+    mcp_parser.add_argument(
+        "--code-processed-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the code repository processed/ dir. "
+            "Activates search_code_repo and get_code_context_pack tools. "
+            "Falls back to CLUSTER_CODE_PROCESSED_DIR env var if not set."
+        ),
+    )
+    mcp_parser.add_argument(
+        "--docs-processed-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the QNX documentation processed/ dir. "
+            "Activates search_docs tool. "
+            "Falls back to QNX_DOCS_PROCESSED_DIR env var if not set."
+        ),
     )
 
     return parser
