@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "code-index.v1/evidence-record",
+  "title": "EvidenceRecord",
+  "description": "代码证据，将 CodeChunk 锚定到 repo+commit+文件+行号范围。对应方案文档第14章、第27.8节。",
+  "type": "object",
+  "required": [
+    "evidence_id",
+    "snapshot_id",
+    "repo_id",
+    "commit_sha",
+    "relative_path",
+    "file_version_id",
+    "start_line",
+    "end_line",
+    "text",
+    "text_hash",
+    "source_text_hash",
+    "parser_mode",
+    "redactions"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "evidence_id": {
+      "type": "string",
+      "pattern": "^evid_[0-9a-f]{20}$",
+      "description": "证据唯一 ID，由 snapshot_id+file_version_id+start_line+end_line+text_hash 哈希生成。"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "pattern": "^snap_[0-9a-f]{24}$"
+    },
+    "repo_id": {
+      "type": "string",
+      "pattern": "^repo_[0-9a-f]{16}$"
+    },
+    "commit_sha": {
+      "type": "string",
+      "description": "完整 40 位 git commit SHA，或 no-git- 前缀的降级标识。"
+    },
+    "relative_path": {
+      "type": "string",
+      "description": "POSIX 相对路径，不含绝对路径。",
+      "pattern": "^[^/].*",
+      "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+    },
+    "file_version_id": {
+      "type": "string",
+      "pattern": "^fver_[0-9a-f]{16}$"
+    },
+    "symbol_id": {
+      "type": ["string", "null"],
+      "description": "对应 Symbol 的逻辑 ID。Phase A 为 null，Phase B 填充。"
+    },
+    "start_line": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "证据起始行（1-based，与 CodeChunk.start_line 一致）。"
+    },
+    "end_line": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "证据结束行（1-based，与 CodeChunk.end_line 一致，end_line >= start_line）。"
+    },
+    "start_column": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "起始列（0-based）。Phase A 为 null，Phase B 细化。"
+    },
+    "end_column": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "结束列（0-based）。Phase A 为 null，Phase B 细化。"
+    },
+    "text": {
+      "type": "string",
+      "description": "经安全处理的源码文本（Phase A 与原文相同；Phase D 脱敏后 secret 被占位符替换）。"
+    },
+    "text_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "sha256(text)。若发生脱敏则与 source_text_hash 不同。"
+    },
+    "source_text_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "snapshot 源文件对应范围原始文本的 sha256。Phase A 与 text_hash 相同。"
+    },
+    "parser_mode": {
+      "type": "string",
+      "enum": ["compiler_indexer", "tree_sitter", "dedicated", "fallback", "unsupported"],
+      "description": "产生此证据的 Parser 模式，与来源 FileRecord.parser_mode 一致。"
+    },
+    "redactions": {
+      "type": "array",
+      "description": "脱敏位置列表（Phase A 为空数组，Phase D 填充）。不存储 secret 原值。",
+      "items": {
+        "type": "object",
+        "required": ["start_line", "end_line", "secret_type", "placeholder"],
+        "properties": {
+          "start_line":   { "type": "integer", "minimum": 1 },
+          "end_line":     { "type": "integer", "minimum": 1 },
+          "start_column": { "type": ["integer", "null"], "minimum": 0 },
+          "end_column":   { "type": ["integer", "null"], "minimum": 0 },
+          "secret_type":  { "type": "string" },
+          "placeholder":  { "type": "string" }
+        }
+      }
+    }
+  }
+}

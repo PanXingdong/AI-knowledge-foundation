@@ -1,7 +1,10 @@
 """
-code_manifest.py — 扫描源码仓并生成知识库接入清单 CSV。
+code_manifest.py — 扫描源码仓并生成知识库接入清单。
 
-可作为模块导入，也可通过 CLI 的 generate-code-manifest 命令调用。
+提供两套接口：
+  - scan_repo() / write_csv()         旧接口，保持向后兼容
+  - scan_repo_with_snapshot()         新接口（Phase A），返回 RepositorySnapshot
+                                       + list[FileRecord]，产物不含绝对路径
 """
 from __future__ import annotations
 
@@ -9,6 +12,15 @@ import csv
 import hashlib
 import subprocess
 from pathlib import Path
+
+from agent_knowledge_hub.code_snapshot import (
+    FileRecord,
+    RepositorySnapshot,
+    SnapshotState,
+    create_file_record,
+    create_snapshot,
+)
+from agent_knowledge_hub.utils import write_json, write_jsonl
 
 # 默认排除的目录名（任意层级命中即跳过）
 # 与 code_watcher.DEFAULT_EXCLUDE_DIRS 保持一致，并额外排除 IDE/隐藏目录
@@ -160,3 +172,81 @@ def write_csv(rows: list[dict[str, str]], output_path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Phase A 新接口：返回 RepositorySnapshot + FileRecord 列表
+# ---------------------------------------------------------------------------
+
+def scan_repo_with_snapshot(
+    repo_dir: Path,
+    exclude_dirs: frozenset[str] | None = None,
+    extensions: frozenset[str] | None = None,
+    parent_snapshot_id: str | None = None,
+) -> tuple[RepositorySnapshot, list[FileRecord]]:
+    """
+    扫描 repo_dir，返回 (RepositorySnapshot, list[FileRecord])。
+
+    与旧 scan_repo() 的区别：
+      - 产物中不含本机绝对路径（relative_path 为 POSIX 相对路径）
+      - snapshot_id 由 repo+commit+config 哈希确定，相同输入必然相同
+      - FileRecord 携带 logical_file_id / file_version_id / language /
+        parser_mode / content_hash / generated / vendored 等结构化字段
+
+    扫描顺序确定（sorted），保证相同仓库产出顺序一致。
+    """
+    _exclude = exclude_dirs if exclude_dirs is not None else DEFAULT_EXCLUDE_DIRS
+    _exts    = extensions    if extensions    is not None else TARGET_EXTENSIONS
+
+    repo_dir = Path(repo_dir).resolve()
+    snapshot = create_snapshot(
+        repo_dir,
+        exclude_dirs=_exclude,
+        extensions=_exts,
+        parent_snapshot_id=parent_snapshot_id,
+    )
+
+    file_records: list[FileRecord] = []
+    for abs_path in sorted(repo_dir.rglob("*")):
+        if not abs_path.is_file():
+            continue
+        if abs_path.suffix.lower() not in _exts:
+            continue
+        rel_parts = abs_path.relative_to(repo_dir).parts
+        if _should_exclude(rel_parts, _exclude):
+            continue
+
+        file_records.append(create_file_record(abs_path, repo_dir, snapshot))
+
+    return snapshot, file_records
+
+
+def write_snapshot_bundle(
+    snapshot: RepositorySnapshot,
+    file_records: list[FileRecord],
+    output_dir: Path,
+) -> dict[str, Path]:
+    """
+    将 RepositorySnapshot 和 FileRecord 列表写入 output_dir。
+
+    输出结构：
+      <output_dir>/
+        <snapshot_id>/
+          repository-snapshot.json
+          files.jsonl
+
+    返回 {key: path} 方便调用方引用各文件路径。
+    """
+    snap_dir = Path(output_dir) / snapshot.snapshot_id
+    snap_dir.mkdir(parents=True, exist_ok=True)
+
+    snapshot_path = snap_dir / "repository-snapshot.json"
+    files_path    = snap_dir / "files.jsonl"
+
+    write_json(snapshot_path, snapshot.to_dict())
+    write_jsonl(files_path, [fr.to_dict() for fr in file_records])
+
+    return {
+        "snapshot": snapshot_path,
+        "files":    files_path,
+    }

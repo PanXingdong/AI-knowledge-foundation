@@ -1,0 +1,85 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "code-index.v1/repository-snapshot",
+  "title": "RepositorySnapshot",
+  "description": "代码库在某个 commit + 配置下的不可变快照标识。对应方案文档第5章、第27.1节。",
+  "type": "object",
+  "required": [
+    "snapshot_id",
+    "schema_version",
+    "repo_id",
+    "commit_sha",
+    "tree_hash",
+    "submodule_commits",
+    "index_config_hash",
+    "parser_versions",
+    "state",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "snapshot_id": {
+      "type": "string",
+      "pattern": "^snap_[0-9a-f]{24}$",
+      "description": "快照唯一 ID，由 repo_id+commit_sha+submodule_commits+index_config_hash 的哈希生成。branch 不参与计算。"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "code-index.v1"
+    },
+    "repo_id": {
+      "type": "string",
+      "pattern": "^repo_[0-9a-f]{16}$",
+      "description": "仓库逻辑身份，由规范化 remote URL 或路径哈希生成，不含本机绝对路径。"
+    },
+    "repo_remote": {
+      "type": ["string", "null"],
+      "description": "仓库 remote URL（不含凭据）。非 git 仓库时为 null。"
+    },
+    "branch": {
+      "type": ["string", "null"],
+      "description": "导入时的 branch 名，仅作追溯标注，不参与 snapshot_id 计算。detached HEAD 时为 null。"
+    },
+    "commit_sha": {
+      "type": "string",
+      "description": "完整 40 位 git commit SHA，或 no-git- 前缀的降级标识。"
+    },
+    "tree_hash": {
+      "type": ["string", "null"],
+      "description": "HEAD 对应 git tree hash，用于检测内容异常。非 git 仓库时为 null。"
+    },
+    "submodule_commits": {
+      "type": "object",
+      "description": "submodule 路径到 commit SHA 的映射，无 submodule 时为空对象。",
+      "additionalProperties": { "type": "string" }
+    },
+    "index_config_hash": {
+      "type": "string",
+      "description": "exclude_dirs + extensions + parser_versions 的规范化哈希前16位，相同配置必须产生相同值。"
+    },
+    "parser_versions": {
+      "type": "object",
+      "description": "parser 名称到版本字符串的映射，用于复现历史索引。",
+      "additionalProperties": { "type": "string" }
+    },
+    "parent_snapshot_id": {
+      "type": ["string", "null"],
+      "description": "增量构建的基线 snapshot_id，全量首次构建时为 null。"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "planned", "scanning", "parsing", "chunking",
+        "indexing", "validating", "ready", "active", "superseded",
+        "failed_plan", "failed_scan", "failed_parse",
+        "failed_chunk", "failed_index", "failed_validation"
+      ],
+      "description": "Snapshot 状态机当前状态，对应方案第4.6节。"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "创建时间（UTC ISO-8601），仅用于审计，不参与内容 ID。"
+    }
+  }
+}

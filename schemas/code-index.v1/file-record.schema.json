@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "code-index.v1/file-record",
+  "title": "FileRecord",
+  "description": "代码仓中单个文件在某个 snapshot 内的版本记录。对应方案文档第6章、第27.2节。",
+  "type": "object",
+  "required": [
+    "logical_file_id",
+    "file_version_id",
+    "snapshot_id",
+    "repo_id",
+    "relative_path",
+    "language",
+    "parser_mode",
+    "content_hash",
+    "size_bytes",
+    "generated",
+    "vendored",
+    "binary",
+    "ownership_ids",
+    "acl_tags",
+    "secret_status",
+    "diagnostics"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "logical_file_id": {
+      "type": "string",
+      "pattern": "^file_[0-9a-f]{16}$",
+      "description": "文件逻辑身份，由 repo_id + relative_path 生成，同一 repo 内跨 commit 稳定。"
+    },
+    "file_version_id": {
+      "type": "string",
+      "pattern": "^fver_[0-9a-f]{16}$",
+      "description": "文件版本身份，由 snapshot_id + relative_path + content_hash 生成，内容变化时必须变化。"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "pattern": "^snap_[0-9a-f]{24}$",
+      "description": "所属 RepositorySnapshot 的 ID。"
+    },
+    "repo_id": {
+      "type": "string",
+      "pattern": "^repo_[0-9a-f]{16}$",
+      "description": "所属仓库 ID。"
+    },
+    "relative_path": {
+      "type": "string",
+      "description": "相对 repo root 的 POSIX 路径。禁止以 / 开头，禁止包含 .. ，不得为绝对路径。",
+      "pattern": "^[^/].*",
+      "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+    },
+    "language": {
+      "type": "string",
+      "description": "检测到的语言标识，如 cpp、c_header、python、cmake、binary、unknown 等。"
+    },
+    "parser_mode": {
+      "type": "string",
+      "enum": ["compiler_indexer", "tree_sitter", "dedicated", "fallback", "unsupported"],
+      "description": "选用的解析模式。Phase A 非 binary 文件均为 fallback。"
+    },
+    "content_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "原始文件字节的 SHA-256（64 位十六进制）。"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "文件字节数。"
+    },
+    "encoding": {
+      "type": ["string", "null"],
+      "description": "成功识别的文本编码（如 utf-8、gbk）；binary 或无法识别时为 null。"
+    },
+    "generated": {
+      "type": "boolean",
+      "description": "是否为生成代码（路径含 generated/gen/moc_ 等标记）。"
+    },
+    "vendored": {
+      "type": "boolean",
+      "description": "是否为第三方/vendor 代码（路径含 vendor/someip/KanziEngine 等标记）。"
+    },
+    "binary": {
+      "type": "boolean",
+      "description": "是否为二进制文件。binary=true 时不得进入代码 Chunk。"
+    },
+    "ownership_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "关联 OwnershipACLRecord ID 列表。Phase A 为空数组，Phase D 填充。"
+    },
+    "acl_tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "下游权限过滤标签。Phase A 为空数组，Phase D 填充。"
+    },
+    "secret_status": {
+      "type": "string",
+      "enum": ["not_scanned", "clean", "redacted", "blocked"],
+      "description": "Secret 扫描状态。Phase A 默认 not_scanned，Phase D 执行扫描后更新。"
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "解析/编码诊断码列表，如 encoding_undetectable、language_unknown。"
+    }
+  }
+}

@@ -337,21 +337,42 @@ def main(argv: list[str] | None = None) -> int:
                 DEFAULT_EXCLUDE_DIRS,
                 TARGET_EXTENSIONS,
                 scan_repo,
+                scan_repo_with_snapshot,
                 write_csv,
+                write_snapshot_bundle,
             )
             repo_dir = args.repo_dir.resolve()
             exclude_dirs = (
                 frozenset[str]() if args.no_default_excludes else DEFAULT_EXCLUDE_DIRS
             ) | frozenset(args.exclude_dir or [])
-            rows = scan_repo(repo_dir, exclude_dirs, TARGET_EXTENSIONS)
-            write_csv(rows, args.output)
-            payload = {"scanned_files": len(rows), "output": str(args.output)}
+
+            if args.snapshot_output:
+                # Phase A 新路径：输出 RepositorySnapshot + files.jsonl
+                snapshot, file_records = scan_repo_with_snapshot(
+                    repo_dir, exclude_dirs, TARGET_EXTENSIONS
+                )
+                paths = write_snapshot_bundle(snapshot, file_records, args.snapshot_output)
+                payload = {
+                    "snapshot_id":   snapshot.snapshot_id,
+                    "commit_sha":    snapshot.commit_sha,
+                    "scanned_files": len(file_records),
+                    "snapshot_json": str(paths["snapshot"]),
+                    "files_jsonl":   str(paths["files"]),
+                }
+            else:
+                # 旧路径：保持向后兼容，输出 CSV
+                rows = scan_repo(repo_dir, exclude_dirs, TARGET_EXTENSIONS)
+                write_csv(rows, args.output)
+                payload = {"scanned_files": len(rows), "output": str(args.output)}
         elif args.command == "serve-mcp":
             import os as _os
+            import sys as _sys
+            import time as _time
             from agent_knowledge_hub.mcp_server import (
                 create_mcp_server,
                 create_mcp_server_with_repos,
             )
+            from agent_knowledge_hub.retrieval import prewarm as _prewarm
             code_dir = args.code_processed_dir or (
                 Path(_os.environ["CLUSTER_CODE_PROCESSED_DIR"])
                 if "CLUSTER_CODE_PROCESSED_DIR" in _os.environ
@@ -376,6 +397,20 @@ def main(argv: list[str] | None = None) -> int:
                     port=args.port,
                     streamable_http_path=args.streamable_http_path,
                 )
+            # Pre-warm retrieval caches before the HTTP server starts.
+            # Without this, the first MCP tool call loads ~44k chunks (~100s) and
+            # exceeds client timeouts (e.g. Tongyi Lingma / Qoder).
+            if _os.environ.get("KNOWLEDGE_HUB_SKIP_PREWARM", "") != "1":
+                for _pw_dir in [code_dir, docs_dir]:
+                    if _pw_dir:
+                        print(f"[mcp-prewarm] prewarming {_pw_dir} ...", file=_sys.stderr, flush=True)
+                        _t0 = _time.time()
+                        try:
+                            _prewarm(_pw_dir)
+                        except Exception as _exc:
+                            print(f"[mcp-prewarm] warning: prewarm failed for {_pw_dir}: {_exc}", file=_sys.stderr, flush=True)
+                        print(f"[mcp-prewarm] done in {_time.time()-_t0:.1f}s", file=_sys.stderr, flush=True)
+                print("[mcp-prewarm] caches ready — starting HTTP server", file=_sys.stderr, flush=True)
             server.run(transport=args.transport)
             return 0
         elif args.command == "dependency-check":
@@ -742,6 +777,14 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest_gen_parser.add_argument(
         "--no-default-excludes", action="store_true",
         help="不使用默认排除列表。",
+    )
+    manifest_gen_parser.add_argument(
+        "--snapshot-output", type=Path, default=None,
+        metavar="DIR",
+        help=(
+            "（Phase A）若指定此目录，以 RepositorySnapshot + files.jsonl 格式输出，"
+            "产物不含绝对路径。与 --output (CSV) 互斥，优先级高于 --output。"
+        ),
     )
 
     contract_parser = subparsers.add_parser(
