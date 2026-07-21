@@ -194,8 +194,6 @@ def main(argv: list[str] | None = None) -> int:
             except (
                 FileNotFoundError,
                 json.JSONDecodeError,
-                KeyError,
-                TypeError,
                 ValueError,
             ) as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)

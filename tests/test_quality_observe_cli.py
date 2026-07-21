@@ -213,6 +213,42 @@ def test_evaluate_quality_cli_normalizes_unreadable_policy(
     assert "invalid_quality_policy" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        KeyError("unexpected internal key"),
+        TypeError("unexpected internal type"),
+    ],
+    ids=["key_error", "type_error"],
+)
+def test_evaluate_quality_cli_treats_programming_errors_as_runtime_failures(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    error: Exception,
+):
+    def raise_programming_error(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        "agent_knowledge_hub.cli.evaluate_processed_dir_observe",
+        raise_programming_error,
+    )
+
+    exit_code = main(
+        [
+            "evaluate-quality",
+            "--processed-dir",
+            str(tmp_path / "processed"),
+            "--output-dir",
+            str(tmp_path / "quality"),
+        ]
+    )
+
+    assert exit_code == 1
+    assert str(error) in capsys.readouterr().err
+
+
 def test_legacy_parse_quality_summary_cli_remains_compatible(
     tmp_path: Path,
     capsys,
